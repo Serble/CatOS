@@ -1,0 +1,3 @@
+; Settings that can be tweaked but are assemble time
+#define KERNEL_STACK_PAGES, 4
+

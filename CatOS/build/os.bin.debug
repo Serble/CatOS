@@ -1,0 +1,292 @@
+{
+  "Symbols": [
+    {
+      "FilePos": 0,
+      "Line": 3,
+      "RawLine": "mov r1, 7878"
+    },
+    {
+      "FilePos": 6,
+      "Line": 4,
+      "RawLine": "int 0x90"
+    },
+    {
+      "FilePos": 8,
+      "Line": 5,
+      "RawLine": "jmp main"
+    },
+    {
+      "FilePos": 14,
+      "Line": 11,
+      "RawLine": "d8 1               ; one entry"
+    },
+    {
+      "FilePos": 15,
+      "Line": 12,
+      "RawLine": "d8 0               ; mem fault"
+    },
+    {
+      "FilePos": 16,
+      "Line": 13,
+      "RawLine": "d32 memcountithandler"
+    },
+    {
+      "FilePos": 20,
+      "Line": 16,
+      "RawLine": "mov r0, sp"
+    },
+    {
+      "FilePos": 23,
+      "Line": 17,
+      "RawLine": "add r0, 1          ; this will now point to the IP we\u0027re returning to"
+    },
+    {
+      "FilePos": 29,
+      "Line": 18,
+      "RawLine": "mov r1, [r0]       ; grab what that is"
+    },
+    {
+      "FilePos": 32,
+      "Line": 19,
+      "RawLine": "add r1, 3          ; 3 bytes to skip the mov rrp instruction"
+    },
+    {
+      "FilePos": 38,
+      "Line": 20,
+      "RawLine": "mov [r0], r1       ; update the spot we\u0027re jumping to"
+    },
+    {
+      "FilePos": 41,
+      "Line": 21,
+      "RawLine": "mov r0, 1          ; tell the macro that it was oob"
+    },
+    {
+      "FilePos": 47,
+      "Line": 22,
+      "RawLine": "iret"
+    },
+    {
+      "FilePos": 48,
+      "Line": 26,
+      "RawLine": "push r7            ; we\u0027ll save the existing IT here"
+    },
+    {
+      "FilePos": 50,
+      "Line": 27,
+      "RawLine": "push r6            ; high search (known invalid addr)"
+    },
+    {
+      "FilePos": 52,
+      "Line": 28,
+      "RawLine": "push r5            ; low search (known valid addr)"
+    },
+    {
+      "FilePos": 54,
+      "Line": 29,
+      "RawLine": "push r4            ; mid"
+    },
+    {
+      "FilePos": 56,
+      "Line": 30,
+      "RawLine": "getit r7           ; preserve it"
+    },
+    {
+      "FilePos": 58,
+      "Line": 31,
+      "RawLine": "setit memcountit   ; set so we can tell when we\u0027re out of bounds"
+    },
+    {
+      "FilePos": 63,
+      "Line": 34,
+      "RawLine": "mov r6, -1         ; the highest possible address"
+    },
+    {
+      "FilePos": 69,
+      "Line": 35,
+      "RawLine": "mov r5, 0          ; the lowest possible address"
+    },
+    {
+      "FilePos": 75,
+      "Line": 38,
+      "RawLine": "mov r4, r6"
+    },
+    {
+      "FilePos": 78,
+      "Line": 39,
+      "RawLine": "sub r4, 1"
+    },
+    {
+      "FilePos": 84,
+      "Line": 40,
+      "RawLine": "cmp r4, r5     ; is high == low \u002B 1"
+    },
+    {
+      "FilePos": 87,
+      "Line": 41,
+      "RawLine": "je .found      ; then we have the bounds"
+    },
+    {
+      "FilePos": 93,
+      "Line": 43,
+      "RawLine": "mov r4, r5"
+    },
+    {
+      "FilePos": 96,
+      "Line": 44,
+      "RawLine": "add r4, r6"
+    },
+    {
+      "FilePos": 99,
+      "Line": 45,
+      "RawLine": "shr r4, 1      ; mid = (low \u002B high) / 2"
+    },
+    {
+      "FilePos": 105,
+      "Line": 47,
+      "RawLine": "mcisaddroob r4 ; is this midpoint oob?"
+    },
+    {
+      "FilePos": 105,
+      "Line": 5,
+      "RawLine": "mov r0, 0"
+    },
+    {
+      "FilePos": 111,
+      "Line": 6,
+      "RawLine": "mov8 r1, [r4]"
+    },
+    {
+      "FilePos": 114,
+      "Line": 7,
+      "RawLine": "cmp r0, 1          ; je will now hit if the addr was oob"
+    },
+    {
+      "FilePos": 120,
+      "Line": 48,
+      "RawLine": "jne .inbounds"
+    },
+    {
+      "FilePos": 126,
+      "Line": 51,
+      "RawLine": "mov r6, r4"
+    },
+    {
+      "FilePos": 129,
+      "Line": 52,
+      "RawLine": "jmp .loop"
+    },
+    {
+      "FilePos": 135,
+      "Line": 55,
+      "RawLine": "mov r5, r4"
+    },
+    {
+      "FilePos": 138,
+      "Line": 56,
+      "RawLine": "jmp .loop"
+    },
+    {
+      "FilePos": 144,
+      "Line": 59,
+      "RawLine": "mov r0, r5"
+    },
+    {
+      "FilePos": 147,
+      "Line": 61,
+      "RawLine": "setit r7           ; restore the existing table"
+    },
+    {
+      "FilePos": 149,
+      "Line": 62,
+      "RawLine": "pop r4"
+    },
+    {
+      "FilePos": 151,
+      "Line": 63,
+      "RawLine": "pop r5"
+    },
+    {
+      "FilePos": 153,
+      "Line": 64,
+      "RawLine": "pop r6"
+    },
+    {
+      "FilePos": 155,
+      "Line": 65,
+      "RawLine": "pop r7"
+    },
+    {
+      "FilePos": 157,
+      "Line": 66,
+      "RawLine": "ret"
+    },
+    {
+      "FilePos": 158,
+      "Line": 9,
+      "RawLine": "ret"
+    },
+    {
+      "FilePos": 159,
+      "Line": 12,
+      "RawLine": "mov r1, 7676"
+    },
+    {
+      "FilePos": 165,
+      "Line": 13,
+      "RawLine": "int 0x90"
+    },
+    {
+      "FilePos": 167,
+      "Line": 14,
+      "RawLine": "di                           ; we don\u0027t want interrupts right now, we\u0027re still getting setup"
+    },
+    {
+      "FilePos": 168,
+      "Line": 15,
+      "RawLine": "call countmem"
+    },
+    {
+      "FilePos": 174,
+      "Line": 17,
+      "RawLine": "mov r1, r0                   ; debug print the mem size"
+    },
+    {
+      "FilePos": 177,
+      "Line": 18,
+      "RawLine": "int 0x90"
+    },
+    {
+      "FilePos": 179,
+      "Line": 20,
+      "RawLine": "mov r1, r0"
+    },
+    {
+      "FilePos": 182,
+      "Line": 21,
+      "RawLine": "mov r2, osend"
+    },
+    {
+      "FilePos": 188,
+      "Line": 22,
+      "RawLine": "call allocinit"
+    },
+    {
+      "FilePos": 194,
+      "Line": 25,
+      "RawLine": "jmp loop"
+    }
+  ],
+  "Labels": {
+    "memcountit": 14,
+    "memcountithandler": 20,
+    "countmem": 48,
+    "__LOCAL_countmem__loop": 75,
+    "__LOCAL_countmem__inbounds": 135,
+    "__LOCAL_countmem__found": 144,
+    "PAGE_SIZE": 1024,
+    "allocinit": 158,
+    "main": 159,
+    "loop": 194,
+    "osend": 200
+  }
+}

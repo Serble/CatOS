@@ -1,0 +1,70 @@
+; This file exists simply to count the amount of memory the current system has
+; by trying to access memory until it gets a memory fault.
+; To improve performance we're using a binary sort.
+#macro mcisaddroob, 1
+    mov r0, 0
+    mov8 r1, [$1]
+    cmp r0, 1          ; je will now hit if the addr was oob
+#endmacro
+
+memcountit:
+    d8 1               ; one entry
+    d8 0               ; mem fault
+    d32 memcountithandler
+
+memcountithandler:
+    mov r0, sp
+    add r0, 1          ; this will now point to the IP we're returning to
+    mov r1, [r0]       ; grab what that is
+    add r1, 3          ; 3 bytes to skip the mov rrp instruction
+    mov [r0], r1       ; update the spot we're jumping to
+    mov r0, 1          ; tell the macro that it was oob
+    iret
+
+; this is the actual method, call this and highest valid mem addr will be returned in r0
+countmem:
+    push r7            ; we'll save the existing IT here
+    push r6            ; high search (known invalid addr)
+    push r5            ; low search (known valid addr)
+    push r4            ; mid
+    getit r7           ; preserve it
+    setit memcountit   ; set so we can tell when we're out of bounds
+    
+    ; init
+    mov r6, -1         ; the highest possible address
+    mov r5, 0          ; the lowest possible address
+    
+    .loop:
+        mov r4, r6
+        sub r4, 1
+        cmp r4, r5     ; is high == low + 1
+        je .found      ; then we have the bounds
+        
+        mov r4, r5
+        add r4, r6
+        shr r4, 1      ; mid = (low + high) / 2
+
+        mcisaddroob r4 ; is this midpoint oob?
+        jne .inbounds
+
+        ; oob
+        mov r6, r4
+        jmp .loop
+
+        .inbounds:
+            mov r5, r4
+            jmp .loop
+
+    .found:
+        mov r0, r5
+
+    setit r7           ; restore the existing table
+    pop r4
+    pop r5
+    pop r6
+    pop r7
+    ret
+
+
+
+

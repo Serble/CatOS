@@ -1,0 +1,248 @@
+; ==========================
+;   CatOS memory allocator
+; ==========================
+#define PAGE_SIZE, 512
+#define PAGE_SHIFT_FAC, 9      ; amount to shift right by to get pages from size
+
+syspagecount:
+    d32 0
+
+pagetableaddr:
+    d32 0
+
+; init function
+; r1 - last valid addr in memory
+; r2 - end of kernel addr (excluding kernel, first byte after kernel)
+allocinit:
+    push r7
+    push r6
+    push r5
+    push r4
+
+    add r1, 1                  ; count
+    shr r1, PAGE_SHIFT_FAC     ; number of pages (any mem cut off we just have to ignore)
+    
+    mov [syspagecount], r1     ; save it
+
+    ; so let's calculate how many pages are used for kernel code
+    mov r5, r2
+    add r5, PAGE_SIZE - 1
+    shr r5, PAGE_SHIFT_FAC
+
+    mov r2, r5
+    shl r2, PAGE_SHIFT_FAC
+    mov [pagetableaddr], r2
+
+    ; we can start using pages at that index
+    ; let's see how many pages we need for our page array
+    mov r4, r1
+    add r4, PAGE_SIZE - 1
+    shr r4, PAGE_SHIFT_FAC      ; we need one byte per page, so total pages / PAGE_SIZE
+
+    ; let's loop through and zero the page array
+    mov r6, r4                  ; keep r4 as pages in array, r6 is iterator
+    sub r6, 1
+    .pazloop:
+        mov r1, r5              ; this is base
+        add r1, r6
+        call zeropage
+
+        cmp r6, 0
+        je .pazdone
+
+        sub r6, 1
+        jmp .pazloop
+
+    .pazdone:
+    
+    ; zero kernel pages
+    mov r6, r5                   ; upper bound is kernel page count
+    mov r7, 0                    ; iterator
+    .sysloop:
+        mov r1, r7
+        mov r2, 1
+        call setpageused
+
+        add r7, 1
+        cmp r7, r6
+        jul .sysloop
+
+    ; all kernel pages are now marked as used
+    ; now for the page pages, the count is still in r4 and start index
+    ; is in r5 (kernel page count).
+    mov r6, r4                    ; pages in page array
+    add r6, r5                    ; add start index to get upper bound
+    mov r7, r5                    ; start index
+    .pmloop:
+        mov r1, r7
+        mov r2, 1
+        call setpageused
+
+        add r7, 1
+        cmp r7, r6
+        jul .pmloop
+
+    ; all used pages should now be zero
+    ; and the allocator is now safe to use.
+
+    pop r4
+    pop r5
+    pop r6
+    pop r7
+    ret
+
+; r1 - page index
+; r2 - 1 for used, 0 for free
+setpageused:
+    mov r3, [pagetableaddr]
+    add r3, r1                   ; this will make r3 the addr of the marker byte
+    mov8 [r3], r2
+    ret
+
+
+; r1 - page index
+ispageused:
+    mov r0, [pagetableaddr]
+    add r0, r1
+    mov8 r0, [r0]
+    ret
+
+
+; returns the address of the allocated page
+; in r0. not the index.
+; a result of 0 means we failed to allocate the page.
+allocpage:
+    ;di                           ; allocations are not interrupt safe
+    mov r1, [pagetableaddr]      ; keep track of the addr in the page array
+    mov r2, 0                    ; keep track of the page index
+    mov r3, [syspagecount]       ; we're gonna save page count for quick compare
+    .loop:
+        mov8 r0, [r1]
+        cmp r0, 0                ; is it free
+        je .foundfree
+
+        ; it wasn't free
+        add r2, 1
+        add r1, 1
+
+        cmp r2, r3
+        jul .loop
+
+    ; if we get here then we failed to allocate a page
+    mov r0, 0
+    ;ei ; TODO
+    ret
+
+    .foundfree:
+    mov8 [r1], 1                   ; mark used
+    mov r0, r2
+    shl r0, PAGE_SHIFT_FAC
+
+    ;ei
+    ret
+
+
+; returns the start address of the region. return of 0 means error
+; if arg is valid then out of memory.
+; r1 - page count (non zero)
+allocpages:
+    ;di                            ; allocations are no interrupt safe
+    push r4                       ; current page table addr
+    push r5                       ; current free in a row
+    push r6                       ; first page index in run
+
+    cmp r1, 0
+    je .fail                      ; r1 can't be zero
+
+    mov r4, [pagetableaddr]       ; start at the start
+    mov r5, 0
+    mov r6, -1
+    mov r2, 0                     ; current page index
+    mov r3, [syspagecount]        ; save page count for quick compare
+    
+    .loop:
+        mov8 r0, [r4]
+        cmp r0, 0                 ; is it free
+        je .free
+
+        ; not free
+        mov r5, 0
+        mov r6, -1
+        jmp .loopsuffix
+
+        .free:
+            add r5, 1
+            cmp r6, -1             ; is this set?
+            jne .inrun             ; if so don't mark as start
+            mov r6, r2             ; mark this as the start of the run
+            .inrun:
+            
+            cmp r5, r1             ; did we get the amount we need
+            juge .found            ; jump if we did
+
+            jmp .loopsuffix
+
+        .loopsuffix:
+        add r2, 1
+        add r4, 1
+        
+        ; check if there's no more pages
+        cmp r2, r3                 ; is the current addr equal to the length?
+        jul .loop
+
+        ; okay we ran out
+        .fail:
+        mov r0, 0
+        jmp .end
+
+    .found:
+    ; mark pages as used
+    mov r4, [pagetableaddr]
+    add r4, r6                      ; move to first page in region
+    mov r0, 0
+    .usedloop:
+        mov8 [r4], 1
+        add r4, 1
+        add r0, 1
+        cmp r0, r1
+        jul .usedloop
+
+    mov r0, r6
+    shl r0, PAGE_SHIFT_FAC
+
+    .end:
+    pop r6
+    pop r5
+    pop r4
+    ;ei
+    ret
+
+
+; gets the base memory address for a page
+; r1 - page index
+getpagebase:
+    mov r0, r1
+    shl r0, PAGE_SHIFT_FAC
+    ret
+
+
+; zero out a page
+; r1 - page index
+zeropage:
+    call getpagebase
+    mov r1, PAGE_SIZE / 4        ; number of mov ops
+    sub r1, 1
+
+    .loop:
+        mov [r0], 0
+        add r0, 4
+        
+        cmp r1, 0
+        je .done
+        
+        sub r1, 1
+        jmp .loop
+
+    .done:
+    ret
+

@@ -1,0 +1,44 @@
+; CatOS loader
+; =======================
+mov r1, 7878
+int 0x90
+jmp main
+
+#include "settings.cat"
+#include "memcount.cat"
+#include "alloc.cat"
+
+; to start let's work out how much memory we have
+main:
+mov r1, 7676
+int 0x90
+di                           ; we don't want interrupts right now, we're still getting setup
+call countmem
+
+mov r1, r0                   ; debug print the mem size
+int 0x90
+
+mov r1, r0
+mov r2, kend
+call allocinit
+
+; let's allocate a dedicated kernel memory space
+mov r1, KERNEL_STACK_PAGES
+call allocpages
+
+; move to start of page after our region
+add r0, KERNEL_STACK_PAGES * PAGE_SIZE
+
+; this can be our new stack
+; our old stack space is unsafe to use because it is
+; the end of memory by default, which is now owned by
+; our allocator.
+setksp r0
+mov sp, r0
+
+loop:
+jmp loop
+
+; marker for the end of kernel memory
+kend:
+
