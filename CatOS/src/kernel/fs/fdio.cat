@@ -1,0 +1,298 @@
+; ==========================
+;   CatOS file-descriptor I/O syscalls
+; ==========================
+; The file-facing half of the syscall surface: open/close/read/write/seek,
+; directory listing and node creation. User programs never touch VFS handles
+; directly - each process owns a small table of file descriptors (in its PCB)
+; that map small integers to VFS handle indices, so fds are private per process
+; and cleaned up on exit (proc_reap closes any left open).
+;
+; All user pointers are translated and bounds-checked against the caller's
+; segment (uaddr / copyinstr / copyoutstr in proc.cat) before the kernel touches
+; them. Buffers are handed straight to the VFS at their physical address - the
+; kernel is identity-mapped, so no bounce buffer is needed.
+;
+; Syscall argument convention here uses r2, r3 and r4 (all three survive the trap
+; live, since the CPU saves the full register set on entry). Handlers return via
+; `sysret` (patches the saved r0), and none of them switch tasks.
+
+
+; ---- fd-table helpers -------------------------------------------------------
+
+; Find a free descriptor slot in a process's fd table.
+; r1 - PCB pointer
+; returns r0 = fd index, or -1 if the table is full
+fd_alloc:
+    push r4                      ; cursor
+    push r5                      ; index
+    mov r4, r1
+    add r4, PCB_FDS
+    mov r5, 0
+    .loop:
+        cmp r5, MAX_FDS
+        juge .none
+        mov r0, [r4]
+        cmp r0, -1
+        je .found
+        add r4, 4
+        add r5, 1
+        jmp .loop
+    .found:
+    mov r0, r5
+    jmp .done
+    .none:
+    mov r0, -1
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Look up the VFS handle a descriptor refers to.
+; r1 - PCB pointer, r2 - fd
+; returns r0 = VFS handle index, or -1 if the fd is invalid / closed
+fd_handle:
+    cmp r2, 0
+    jil .bad
+    cmp r2, MAX_FDS
+    juge .bad
+    mov r0, r2
+    shl r0, 2
+    add r0, PCB_FDS
+    add r0, r1
+    mov r0, [r0]
+    ret
+    .bad:
+    mov r0, -1
+    ret
+
+
+; Store a value into a descriptor slot.
+; r1 - PCB pointer, r2 - fd, r3 - value (VFS handle index, or -1 to free)
+fd_set:
+    push r4
+    mov r4, r2
+    shl r4, 2
+    add r4, PCB_FDS
+    add r4, r1
+    mov [r4], r3
+    pop r4
+    ret
+
+
+; ---- syscall handlers -------------------------------------------------------
+
+; SYS_OPEN: r2 = path (user), r3 = mode (O_* bits). Opens the path, binds a fresh
+; descriptor to the resulting VFS handle. Returns the fd, or -1.
+sys_open_h:
+    mov r4, r3                   ; save mode (copyinstr clobbers r3)
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, spawn_pathbuf
+    mov r2, r4                   ; mode
+    call vfsopen                 ; r0 = handle or -1
+    cmp r0, -1
+    je .fail
+    mov r5, r0                   ; handle
+    mov r1, [curproc]
+    call fd_alloc                ; r0 = fd or -1
+    cmp r0, -1
+    je .failclose
+    mov r6, r0                   ; fd
+    mov r1, [curproc]
+    mov r2, r6
+    mov r3, r5
+    call fd_set
+    mov r0, r6
+    jmp sysret
+    .failclose:
+    mov r1, r5
+    call vfsclose
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_CLOSE: r2 = fd. Releases the VFS handle and frees the slot.
+sys_close_h:
+    mov r1, [curproc]
+    call fd_handle               ; r0 = handle (r2 = fd, preserved)
+    cmp r0, -1
+    je .fail
+    mov r5, r0                   ; handle
+    mov r1, [curproc]
+    mov r3, -1
+    call fd_set                  ; free the slot (r2 still = fd)
+    mov r1, r5
+    call vfsclose
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_READ: r2 = fd, r3 = buf (user), r4 = len. Returns bytes read, or -1.
+sys_read_h:
+    mov r5, r3                   ; user buffer
+    mov r6, r4                   ; length
+    mov r7, r2                   ; fd
+    mov r1, r5                   ; translate + bounds-check the buffer
+    mov r2, r6
+    call uaddr
+    cmp r0, 0
+    je .fail
+    push r0                      ; physical buffer
+    mov r1, [curproc]
+    mov r2, r7
+    call fd_handle               ; r0 = handle
+    cmp r0, -1
+    je .failpop
+    mov r1, r0
+    pop r2                       ; physical buffer
+    mov r3, r6
+    call vfsread                 ; r0 = bytes read, or -2 if it would block
+    cmp r0, -2
+    je .block
+    jmp sysret
+    .failpop:
+    add sp, 4                    ; drop the pushed buffer
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+    ; A char device (e.g. the console) has no data yet. Rewind the saved ip so
+    ; the syscall re-runs on wake, then block on the node until input arrives
+    ; (the input backend wakes this channel). sp still points at the trap frame.
+    .block:
+    mov r0, sp
+    add r0, FRM_IP
+    mov r1, [r0]
+    sub r1, 1
+    mov [r0], r1
+    mov r1, [curproc]           ; resolve the fd's node = wake channel
+    mov r2, r7
+    call fd_handle
+    mov r1, r0
+    call vfshandleaddr          ; r0 = handle slot; H_NODE (offset 0) = node
+    mov r0, [r0]
+    mov r4, [curproc]
+    vstore r4, PCB_CHAN, r0, r1
+    mov r1, sp
+    vstore r4, PCB_SAVEDSP, r1, r2
+    mov r0, PROC_BLOCKED
+    mov [r4], r0
+    call sched_pick
+    mov r1, r0
+    jmp sched_resume
+
+
+; SYS_WRITE: r2 = fd, r3 = buf (user), r4 = len. Returns bytes written, or -1.
+sys_write_h:
+    mov r5, r3
+    mov r6, r4
+    mov r7, r2
+    mov r1, r5
+    mov r2, r6
+    call uaddr
+    cmp r0, 0
+    je .fail
+    push r0
+    mov r1, [curproc]
+    mov r2, r7
+    call fd_handle
+    cmp r0, -1
+    je .failpop
+    mov r1, r0
+    pop r2
+    mov r3, r6
+    call vfswrite                ; r0 = bytes written
+    jmp sysret
+    .failpop:
+    add sp, 4
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_SEEK: r2 = fd, r3 = offset, r4 = whence. Returns the new cursor, or -1.
+sys_seek_h:
+    mov r5, r3                   ; offset
+    mov r6, r4                   ; whence
+    mov r1, [curproc]
+    call fd_handle               ; r0 = handle (r2 = fd)
+    cmp r0, -1
+    je .fail
+    mov r1, r0
+    mov r2, r5
+    mov r3, r6
+    call vfsseek                 ; r0 = new cursor
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_READDIR: r2 = fd (an open directory), r3 = buf (user), r4 = buflen.
+; Copies the next entry's name into buf. Returns 1 if an entry was returned,
+; 0 at the end of the directory, or -1 on error.
+sys_readdir_h:
+    mov r5, r3                   ; user buffer
+    mov r6, r4                   ; buffer length
+    mov r7, r2                   ; fd
+    mov r1, [curproc]
+    mov r2, r7
+    call fd_handle               ; r0 = handle
+    cmp r0, -1
+    je .fail
+    mov r1, r0
+    call vfsreaddir              ; r0 = child node (ref taken), or 0 at the end
+    cmp r0, 0
+    je .end
+    push r0                      ; child node
+    vload r1, r0, NODE_NAME      ; kernel name string
+    mov r2, r5                   ; user destination
+    mov r3, r6                   ; capacity
+    call copyoutstr              ; r0 = 0 ok / -1 fault
+    pop r1                       ; child node
+    push r0                      ; save the copyout result across the unref
+    call vfsnodeunref
+    pop r0
+    cmp r0, 0
+    jne .fail                    ; the name did not fit / faulted
+    mov r0, 1
+    jmp sysret
+    .end:
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_CREATE: r2 = path (user), r3 = type (NODE_FILE / NODE_DIR). Creates the
+; node via its parent directory's driver. Returns 0 on success, -1 on failure.
+sys_create_h:
+    mov r4, r3                   ; type (copyinstr clobbers r3)
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, spawn_pathbuf
+    mov r2, r4
+    call vfscreate               ; r0 = node (ref taken) or 0
+    cmp r0, 0
+    je .fail
+    mov r1, r0                   ; drop the reference; the entry persists on disk
+    call vfsnodeunref
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret

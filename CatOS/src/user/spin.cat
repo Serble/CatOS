@@ -1,0 +1,10 @@
+; A background CPU hog spawned by init and never waited on. It prints once, then
+; spins forever without a single syscall. If other processes still make progress
+; after this starts, the timer is preempting it - proving spawn coexists with
+; preemptive scheduling.
+#include "sys.cat"
+
+    sys_print 0xF1
+spin:
+    add r3, 1
+    jmp spin

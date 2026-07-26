@@ -1,0 +1,648 @@
+; ef - a tiny line-oriented file editor.
+;
+; Usage:
+;   ef <file> append <text...>        add <text> as a new line at the end
+;   ef <file> replace <n> <text...>   replace line <n> (1-based) with <text>
+;   ef <file> delete <n>              remove line <n>
+;   ef <file> print                   show the file with line numbers
+;
+; There is no cwd, so <file> is an absolute path. Lines are separated by '\n'.
+; The whole file is read into a buffer, so it can only edit files up to EF_INBUF
+; bytes; larger files are refused rather than truncated. append creates the file
+; if it does not exist; replace/delete/print require it to exist.
+#include "sys.cat"
+
+#define EF_INBUF, 4096               ; largest file we will load/edit
+#define EF_OUTBUF, 4608              ; room for the rewritten file (+ slack)
+#define EF_TEXTBUF, 512              ; joined replacement/append text
+#define EF_NUMBUF, 16                ; decimal line number when printing
+
+
+; ==========================
+;   Entry + command dispatch
+; ==========================
+main:
+    mov [g_argc], r1
+    mov [g_argv], r2
+    cmp r1, 3                        ; need at least: ef <file> <command>
+    jul usage_exit
+
+    mov r1, 2                        ; argv[2] = command
+    call getarg
+    mov r7, r0                       ; command pointer (survives calls)
+
+    mov r1, r7
+    mov r2, cmd_append
+    call streq
+    cmp r0, 1
+    je do_append
+
+    mov r1, r7
+    mov r2, cmd_replace
+    call streq
+    cmp r0, 1
+    je do_replace
+
+    mov r1, r7
+    mov r2, cmd_delete
+    call streq
+    cmp r0, 1
+    je do_delete
+
+    mov r1, r7
+    mov r2, cmd_print
+    call streq
+    cmp r0, 1
+    je do_print
+
+    jmp badcmd_exit
+
+
+; ==========================
+;   Commands
+; ==========================
+
+; append: join argv[3..] into one line and write it (plus a newline) at the end
+; of the file, creating the file if it does not exist.
+do_append:
+    mov r0, [g_argc]
+    cmp r0, 4
+    jul usage_exit
+    mov r1, 3
+    call buildtext                   ; textbuf = "<args...>\n", g_textlen set
+    mov r1, 1
+    call getarg
+    mov r6, r0                       ; path (survives syscalls)
+    sys_open r6, O_RDWR + O_CREATE
+    cmp r0, -1
+    je open_err
+    mov r5, r0                       ; fd
+    sys_seek r5, 0, SEEK_END
+    mov r4, [g_textlen]              ; write the new line at the end
+    mov r3, textbuf
+    mov r2, r5
+    mov r1, SYS_WRITE
+    syscall
+    sys_close r5
+    sys_exit 0
+
+; replace: swap line <n> for the joined argv[4..] text.
+do_replace:
+    mov r0, [g_argc]
+    cmp r0, 5
+    jul usage_exit
+    mov r1, 3                        ; parse the line number
+    call getarg
+    mov r1, r0
+    call atoi
+    cmp r0, 0
+    je bad_line
+    mov [g_n], r0
+    mov r1, 4                        ; build the replacement line
+    call buildtext
+    mov r1, 1                        ; load the file
+    call getarg
+    mov r1, r0
+    call readfile
+    cmp r0, 0
+    jne read_err_dispatch
+    mov r1, 1                        ; mode 1 = replace
+    mov r2, [g_n]
+    call editlines
+    cmp r0, 1
+    jne no_such_line
+    mov r1, 1                        ; write it back
+    call getarg
+    mov r1, r0
+    call writefile
+    cmp r0, 0
+    jne write_err
+    sys_exit 0
+
+; delete: drop line <n>.
+do_delete:
+    mov r0, [g_argc]
+    cmp r0, 4
+    jul usage_exit
+    mov r1, 3
+    call getarg
+    mov r1, r0
+    call atoi
+    cmp r0, 0
+    je bad_line
+    mov [g_n], r0
+    mov r1, 1
+    call getarg
+    mov r1, r0
+    call readfile
+    cmp r0, 0
+    jne read_err_dispatch
+    mov r1, 0                        ; mode 0 = delete
+    mov r2, [g_n]
+    call editlines
+    cmp r0, 1
+    jne no_such_line
+    mov r1, 1
+    call getarg
+    mov r1, r0
+    call writefile
+    cmp r0, 0
+    jne write_err
+    sys_exit 0
+
+; print: dump the file with 1-based line numbers.
+do_print:
+    mov r1, 1
+    call getarg
+    mov r1, r0
+    call readfile
+    cmp r0, 0
+    jne read_err_dispatch
+    mov r5, 0                        ; read cursor (survives syscalls)
+    mov r6, 1                        ; line number (survives syscalls)
+    .pl:
+        mov r0, [g_insize]
+        cmp r5, r0
+        juge .pdone
+        mov r1, r6                   ; "<n>: "
+        mov r2, numbuf
+        call itoa                    ; r0 = digit count
+        mov r4, r0
+        mov r3, numbuf
+        mov r2, 1
+        mov r1, SYS_WRITE
+        syscall
+        sys_write 1, colon, 2
+        mov r1, r5                   ; find end of this line
+    .pscan:
+        mov r0, [g_insize]
+        cmp r1, r0
+        juge .pscanend
+        mov r2, inbuf
+        add r2, r1
+        mov8 r2, [r2]
+        cmp r2, 10
+        je .pscanend
+        add r1, 1
+        jmp .pscan
+    .pscanend:
+        mov r7, r1                   ; end index (survives the write)
+        mov r4, r7                   ; write the line body
+        sub r4, r5
+        mov r3, inbuf
+        add r3, r5
+        mov r2, 1
+        mov r1, SYS_WRITE
+        syscall
+        sys_write 1, newline, 1
+        mov r5, r7                   ; advance past the line (and its newline)
+        mov r0, [g_insize]
+        cmp r5, r0
+        juge .pnl
+        add r5, 1
+    .pnl:
+        add r6, 1
+        jmp .pl
+    .pdone:
+    sys_exit 0
+
+
+; ==========================
+;   Line editing core
+; ==========================
+; Rebuild the file in outbuf, replacing or deleting the target line.
+; r1 = mode (0 = delete, 1 = replace), r2 = target line number (1-based).
+; For replace, textbuf/g_textlen must already hold the new line (incl. its '\n').
+; Sets g_outsize. Returns r0 = 1 if the line existed, else 0.
+editlines:
+    push r4                          ; read cursor i
+    push r5                          ; write cursor o
+    push r6                          ; current line number
+    push r7                          ; mode
+    mov [g_n], r2
+    mov r0, 0
+    mov [g_found], r0
+    mov r4, 0
+    mov r5, 0
+    mov r6, 1
+    mov r7, r1
+    .el:
+        mov r0, [g_insize]
+        cmp r4, r0
+        juge .eldone
+        mov r1, r4                   ; scan to the end of this line (j in r1)
+    .scan:
+        mov r0, [g_insize]
+        cmp r1, r0
+        juge .scanend
+        mov r2, inbuf
+        add r2, r1
+        mov8 r2, [r2]
+        cmp r2, 10
+        je .scanend
+        add r1, 1
+        jmp .scan
+    .scanend:
+        mov r0, [g_n]                ; is this the target line?
+        cmp r6, r0
+        jne .copyline
+        mov r0, 1                    ; mark it found
+        mov [g_found], r0
+        cmp r7, 1
+        jne .advance                 ; delete: emit nothing
+        mov r0, 0                    ; replace: emit textbuf
+    .remit:
+        mov r2, [g_textlen]
+        cmp r0, r2
+        juge .advance
+        mov r3, textbuf
+        add r3, r0
+        mov8 r3, [r3]
+        mov r2, outbuf
+        add r2, r5
+        mov8 [r2], r3
+        add r5, 1
+        add r0, 1
+        jmp .remit
+    .copyline:
+        mov r0, r4                   ; copy inbuf[i..j-1] into outbuf
+    .cpl:
+        cmp r0, r1
+        juge .cpld
+        mov r2, inbuf
+        add r2, r0
+        mov8 r2, [r2]
+        mov r3, outbuf
+        add r3, r5
+        mov8 [r3], r2
+        add r5, 1
+        add r0, 1
+        jmp .cpl
+    .cpld:
+        mov r0, [g_insize]           ; keep the newline if the line had one
+        cmp r1, r0
+        juge .advance
+        mov r2, outbuf
+        add r2, r5
+        mov8 [r2], 10
+        add r5, 1
+    .advance:
+        mov r4, r1                   ; move past the line and its newline
+        mov r0, [g_insize]
+        cmp r4, r0
+        juge .noskip
+        add r4, 1
+    .noskip:
+        add r6, 1
+        jmp .el
+    .eldone:
+    mov [g_outsize], r5
+    mov r0, [g_found]
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   File I/O helpers
+; ==========================
+; readfile(r1 = path): load the whole file into inbuf and set g_insize.
+; Returns r0 = 0 on success, -1 if it cannot be opened, -2 if it is too big.
+readfile:
+    push r5                          ; fd
+    push r6                          ; size
+    push r7                          ; bytes read so far
+    sys_open r1, O_READ
+    cmp r0, -1
+    je .fail
+    mov r5, r0
+    sys_seek r5, 0, SEEK_END
+    mov r6, r0
+    cmp r6, EF_INBUF
+    jug .toobig
+    sys_seek r5, 0, SEEK_SET
+    mov r7, 0
+    .rl:
+        cmp r7, r6
+        juge .rdone
+        mov r4, r6                   ; len = size - total
+        sub r4, r7
+        mov r3, inbuf                ; buf = inbuf + total
+        add r3, r7
+        mov r2, r5
+        mov r1, SYS_READ
+        syscall
+        cmp r0, 0
+        jile .rdone
+        add r7, r0
+        jmp .rl
+    .rdone:
+    mov [g_insize], r7
+    sys_close r5
+    mov r0, 0
+    jmp .ret
+    .toobig:
+    sys_close r5
+    mov r0, -2
+    jmp .ret
+    .fail:
+    mov r0, -1
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    ret
+
+; writefile(r1 = path): truncate the file and write g_outsize bytes from outbuf.
+; Returns r0 = 0 on success, -1 on failure.
+writefile:
+    push r5                          ; fd
+    push r6                          ; total to write
+    push r7                          ; bytes written so far
+    sys_open r1, O_WRITE + O_CREATE + O_TRUNC
+    cmp r0, -1
+    je .fail
+    mov r5, r0
+    mov r6, [g_outsize]
+    mov r7, 0
+    .wl:
+        cmp r7, r6
+        juge .wdone
+        mov r4, r6
+        sub r4, r7
+        mov r3, outbuf
+        add r3, r7
+        mov r2, r5
+        mov r1, SYS_WRITE
+        syscall
+        cmp r0, 0
+        jile .werr
+        add r7, r0
+        jmp .wl
+    .wdone:
+    sys_close r5
+    mov r0, 0
+    jmp .ret
+    .werr:
+    sys_close r5
+    .fail:
+    mov r0, -1
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    ret
+
+
+; ==========================
+;   Small utilities
+; ==========================
+; getarg(r1 = index) -> r0 = pointer to argv[index]. Leaves other registers alone.
+getarg:
+    shl r1, 2
+    mov r0, [g_argv]
+    add r1, r0
+    mov r0, [r1]
+    ret
+
+; buildtext(r1 = start index): join argv[start..argc-1] with single spaces into
+; textbuf, append a newline and a null terminator, and set g_textlen to the byte
+; count (including the newline, excluding the null).
+buildtext:
+    push r4                          ; argv index
+    push r5                          ; write offset
+    push r6                          ; argc
+    push r7                          ; source pointer
+    mov r4, r1
+    mov r5, 0
+    mov r6, [g_argc]
+    .bt:
+        cmp r4, r6
+        juge .btend
+        cmp r5, 0                    ; a space before every word but the first
+        je .nospace
+        mov r0, textbuf
+        add r0, r5
+        mov8 [r0], 32
+        add r5, 1
+    .nospace:
+        mov r1, r4
+        call getarg
+        mov r7, r0
+    .btcpy:
+        mov8 r0, [r7]
+        cmp r0, 0
+        je .btnext
+        mov r1, textbuf
+        add r1, r5
+        mov8 [r1], r0
+        add r5, 1
+        add r7, 1
+        jmp .btcpy
+    .btnext:
+        add r4, 1
+        jmp .bt
+    .btend:
+    mov r0, textbuf                  ; trailing newline
+    add r0, r5
+    mov8 [r0], 10
+    add r5, 1
+    mov r0, textbuf                  ; null terminator
+    add r0, r5
+    mov8 [r0], 0
+    mov [g_textlen], r5
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+; atoi(r1 = string) -> r0 = unsigned decimal value (stops at the first non-digit).
+atoi:
+    push r4
+    push r5
+    mov r0, 0
+    mov r4, r1
+    .al:
+        mov8 r5, [r4]
+        cmp r5, 48
+        jul .ad
+        cmp r5, 57
+        jug .ad
+        umul r0, 10
+        sub r5, 48
+        add r0, r5
+        add r4, 1
+        jmp .al
+    .ad:
+    pop r5
+    pop r4
+    ret
+
+; itoa(r1 = value, r2 = dest buffer) -> r0 = number of digits written.
+itoa:
+    push r4                          ; value
+    push r5                          ; dest
+    push r6                          ; digit count
+    push r7                          ; copy index
+    mov r4, r1
+    mov r5, r2
+    mov r6, 0
+    cmp r4, 0
+    jne .gen
+    mov8 [r5], 48                    ; "0"
+    mov r0, 1
+    jmp .id
+    .gen:
+    .gl:                             ; push digit chars (least significant first)
+        cmp r4, 0
+        je .emit
+        mov r0, r4
+        mov r1, 10
+        udiv r0, r1                  ; r0 = quotient, r1 = remainder
+        add r1, 48
+        push r1
+        add r6, 1
+        mov r4, r0
+        jmp .gl
+    .emit:
+        mov r7, 0
+    .ol:                             ; pop them back out in order
+        cmp r7, r6
+        juge .idn
+        pop r1
+        mov r0, r5
+        add r0, r7
+        mov8 [r0], r1
+        add r7, 1
+        jmp .ol
+    .idn:
+    mov r0, r6
+    .id:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+; streq(r1, r2) -> r0 = 1 if the null-terminated strings match, else 0.
+streq:
+    push r4
+    push r5
+    mov r4, r1
+    mov r5, r2
+    .cmp:
+        mov8 r0, [r4]
+        mov8 r3, [r5]
+        cmp r0, r3
+        jne .ne
+        cmp r0, 0
+        je .yes
+        add r4, 1
+        add r5, 1
+        jmp .cmp
+    .yes:
+    mov r0, 1
+    jmp .done
+    .ne:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Error exits
+; ==========================
+usage_exit:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+badcmd_exit:
+    sys_write 1, badmsg, badmsg_end - badmsg
+    sys_exit 1
+open_err:
+    sys_write 1, openmsg, openmsg_end - openmsg
+    sys_exit 1
+toobig_err:
+    sys_write 1, bigmsg, bigmsg_end - bigmsg
+    sys_exit 1
+no_such_line:
+    sys_write 1, nolinemsg, nolinemsg_end - nolinemsg
+    sys_exit 1
+bad_line:
+    sys_write 1, badlinemsg, badlinemsg_end - badlinemsg
+    sys_exit 1
+write_err:
+    sys_write 1, writemsg, writemsg_end - writemsg
+    sys_exit 1
+read_err_dispatch:
+    cmp r0, -2
+    je toobig_err
+    jmp open_err
+
+
+; ==========================
+;   Data
+; ==========================
+cmd_append:
+    dstr "append\0"
+cmd_replace:
+    dstr "replace\0"
+cmd_delete:
+    dstr "delete\0"
+cmd_print:
+    dstr "print\0"
+
+colon:
+    dstr ": "
+newline:
+    dstr "\n"
+
+usage:
+    dstr "usage: ef <file> append <text...>\n       ef <file> replace <n> <text...>\n       ef <file> delete <n>\n       ef <file> print\n"
+usage_end:
+badmsg:
+    dstr "ef: unknown command\n"
+badmsg_end:
+openmsg:
+    dstr "ef: cannot open file\n"
+openmsg_end:
+bigmsg:
+    dstr "ef: file too large to edit\n"
+bigmsg_end:
+nolinemsg:
+    dstr "ef: no such line\n"
+nolinemsg_end:
+badlinemsg:
+    dstr "ef: invalid line number\n"
+badlinemsg_end:
+writemsg:
+    dstr "ef: write failed\n"
+writemsg_end:
+
+g_argc:
+    d32 0
+g_argv:
+    d32 0
+g_textlen:
+    d32 0
+g_insize:
+    d32 0
+g_outsize:
+    d32 0
+g_n:
+    d32 0
+g_found:
+    d32 0
+
+numbuf:
+    res8 EF_NUMBUF
+textbuf:
+    res8 EF_TEXTBUF
+inbuf:
+    res8 EF_INBUF
+outbuf:
+    res8 EF_OUTBUF

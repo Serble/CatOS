@@ -1,0 +1,378 @@
+; ==========================
+;   CatOS Raylib PPU driver (display + keyboard)
+; ==========================
+; A backend for the device-agnostic console (console.cat). It drives the
+; CatMachine Raylib PPU as both the text display and the keyboard input source.
+; The console never names this driver directly - it registers through
+; console_set_display / console_input_char - so a different display (a serial
+; terminal, a real framebuffer, ...) can replace it without touching the console
+; or the rest of the OS.
+;
+;
+; -- Display: the tiled PPU mode ---------------------------------------------
+;
+; The PPU's Tiled512X384 mode (0x11) is a 16x16, 4bpp, palette-indexed tile
+; engine with a 34-wide tile map (32x24 visible cells). We use it as a text
+; mode: the font is uploaded once into the tile set (glyph N -> tile N), and
+; drawing a character is just writing its code into a tile-map cell. The whole
+; framebuffer is one 34,868-byte region in guest RAM whose layout is:
+;
+;   +0      clear colour (BGRX word)
+;   +4      palette: 8 palettes x 16 colours x 4 bytes (BGRA)
+;   +516    tile set: 256 tiles x 128 bytes (16x16 @ 4bpp, 2px/byte, hi nibble
+;           = left pixel; nibble value = palette colour index)
+;   +33284  scroll (x,y bytes)
+;   +33286  tile map: 34 cols x 26 rows, 1 byte = tile number
+;   +34170  per-cell palette (packed, we leave it 0 = palette 0)
+;   +34612  sprites (we leave them disabled)
+;
+; We build glyphs with colour index 1 (foreground) on 0 (background); palette 0
+; is set to white-on-black.
+;
+;
+; -- Input: the keyboard ------------------------------------------------------
+;
+; The keyboard device raises interrupt 0x70 and exposes (eventType, keycode)
+; pairs read with `in`. The ISR drains them, maps key-down Raylib keycodes to
+; ASCII, and feeds them to the console line discipline.
+
+#define GFX_TYPE, 0xFF64BEF9     ; PPU graphics device type
+#define KBD_TYPE, 0x2EB3AD76     ; PPU keyboard device type
+#define INT_KBD, 0x70            ; keyboard input interrupt
+
+#define GFX_CMD_UPDATE, 1        ; UpdateDisplay command
+#define GFX_CMD_SETMODE, 2       ; ChangeDisplayMode command
+#define RPPU_MODE, 0x11          ; Tiled512X384
+
+#define FB_PALETTE, 4
+#define FB_TILESET, 516
+#define FB_TILEMAP, 33286
+#define FB_MAPBYTES, 884         ; 34 * 26
+#define FB_PAGES, 69             ; ceil(34868 / 512)
+
+#define MAP_STRIDE, 34           ; tile-map row stride
+#define TILE_COLS, 32            ; visible columns
+#define TILE_ROWS, 24            ; visible rows
+#define TILE_BYTES, 128          ; bytes per 16x16 4bpp tile
+#define TILE_ROW_BYTES, 8        ; bytes per tile row (16px @ 4bpp)
+#define GLYPH_BYTES, 16          ; bytes per glyph in font.bin (8x16 @ 1bpp)
+#define FONT_GLYPHS, 129         ; glyphs the converted font provides
+
+
+; ---- state ----
+rppu_gfxport:
+    d32 0
+rppu_kbdport:
+    d32 0
+rppu_fb:
+    d32 0                        ; framebuffer base (guest physical address)
+
+
+; ==========================
+;   Display backend
+; ==========================
+
+; Bind the graphics device: allocate the framebuffer, upload the font, set the
+; tiled display mode, and register as the console's display.
+; r1 = port, r2 = unit index
+rppu_gfx_bind:
+    push r4                      ; framebuffer
+    push r5                      ; scratch
+    mov [rppu_gfxport], r1
+
+    mov r1, FB_PAGES
+    call allocpages
+    cmp r0, 0
+    je .done
+    mov r4, r0
+    mov [rppu_fb], r4
+
+    mov r1, r4                   ; zero the whole framebuffer
+    mov r2, FB_PAGES * PAGE_SIZE
+    call proc_memzero
+
+    ; palette 0: colour 0 = black background (BGRA 00 00 00 FF), colour 1 =
+    ; white foreground (FF FF FF FF)
+    mov r5, r4
+    add r5, FB_PALETTE
+    mov [r5], 0xFF000000
+    add r5, 4
+    mov [r5], 0xFFFFFFFF
+
+    call rppu_load_font          ; glyph N -> tile N
+    call rppu_clear              ; fill the tile map with spaces
+
+    mov r1, [rppu_gfxport]       ; enable the tiled display mode
+    mov r2, RPPU_MODE
+    mov r3, r4
+    call rppu_setmode
+
+    mov r1, rppu_disp_ops        ; hand ourselves to the console
+    mov r2, TILE_COLS
+    mov r3, TILE_ROWS
+    call console_set_display
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ChangeDisplayMode(port, mode, bufferAddr). Returns the device status in r0
+; (0 = ok).
+; r1 = port, r2 = mode, r3 = buffer address
+rppu_setmode:
+    out r1, GFX_CMD_SETMODE
+    out r1, r2
+    out r1, r3
+    in r0, r1
+    ret
+
+
+; DISP_PRESENT: flush the framebuffer to the window (blocks until rendered).
+rppu_present:
+    mov r1, [rppu_gfxport]
+    out r1, GFX_CMD_UPDATE
+    ret
+
+
+; DISP_CLEAR: fill the whole tile map with spaces (blank glyph).
+rppu_clear:
+    push r4
+    mov r0, [rppu_fb]
+    add r0, FB_TILEMAP
+    mov r4, FB_MAPBYTES
+    .loop:
+        mov8 [r0], 32
+        add r0, 1
+        sub r4, 1
+        cmp r4, 0
+        jne .loop
+    pop r4
+    ret
+
+
+; DISP_PUTC: place a glyph in a cell -> write its code into the tile map.
+; r1 = col, r2 = row, r3 = char
+rppu_putc:
+    mov r0, r2
+    umul r0, MAP_STRIDE          ; row * 34
+    add r0, r1                   ; + col
+    mov r2, [rppu_fb]
+    add r0, r2
+    add r0, FB_TILEMAP
+    mov8 [r0], r3
+    ret
+
+
+; DISP_SCROLL: shift every visible row up one, blank the last row.
+rppu_scroll:
+    push r4                      ; row
+    push r5                      ; tile-map base
+    mov r5, [rppu_fb]
+    add r5, FB_TILEMAP
+    mov r4, 0
+    .rowloop:
+        cmp r4, TILE_ROWS - 1
+        juge .clearlast
+        mov r0, r4               ; dest = base + row*34
+        umul r0, MAP_STRIDE
+        add r0, r5
+        mov r1, r4               ; src = base + (row+1)*34
+        add r1, 1
+        umul r1, MAP_STRIDE
+        add r1, r5
+        cpy r1, MAP_STRIDE
+        add r4, 1
+        jmp .rowloop
+    .clearlast:
+    mov r0, TILE_ROWS - 1        ; blank the now-duplicated last row
+    umul r0, MAP_STRIDE
+    add r0, r5
+    mov r4, MAP_STRIDE
+    .clrloop:
+        mov8 [r0], 32
+        add r0, 1
+        sub r4, 1
+        cmp r4, 0
+        jne .clrloop
+    pop r5
+    pop r4
+    ret
+
+
+; Expand one 8-bit font row (1bpp, MSB = left) into 4 tile bytes (4bpp, 2px per
+; byte, high nibble = left pixel; nibble 1 = foreground, 0 = background).
+; r1 = font byte, r2 = destination address (writes [r2 .. r2+3])
+rppu_expand_byte:
+    push r4                      ; byte value
+    push r5                      ; destination
+    push r6                      ; byte index 0..3
+    push r7                      ; assembled byte
+    mov r4, r1
+    mov r5, r2
+    mov r6, 0
+    .loop:
+        cmp r6, 4
+        juge .done
+        mov r0, r6               ; high-pixel bit index = 7 - r6*2
+        umul r0, 2
+        mov r1, 7
+        sub r1, r0
+        mov r7, r4               ; high nibble
+        shr r7, r1
+        and r7, 1
+        shl r7, 4
+        sub r1, 1                ; low-pixel bit index
+        mov r0, r4
+        shr r0, r1
+        and r0, 1
+        or r7, r0
+        mov r0, r5               ; store the byte
+        add r0, r6
+        mov8 [r0], r7
+        add r6, 1
+        jmp .loop
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Upload the whole font into the tile set: glyph N becomes tile N, drawn in the
+; left 8 columns of the 16x16 cell (right 8 columns stay background).
+rppu_load_font:
+    push r4                      ; glyph index
+    push r5                      ; row index
+    push r6                      ; source font byte address
+    push r7                      ; tile row destination
+    mov r4, 0
+    .glyph:
+        cmp r4, FONT_GLYPHS
+        juge .done
+        mov r5, 0
+        .row:
+            cmp r5, GLYPH_BYTES
+            juge .nextglyph
+            mov r6, r4           ; font byte at rppu_font + g*16 + row
+            umul r6, GLYPH_BYTES
+            add r6, r5
+            add r6, rppu_font
+            mov8 r6, [r6]
+
+            mov r7, r4           ; tile row at fb + FB_TILESET + g*128 + row*8
+            umul r7, TILE_BYTES
+            mov r0, r5
+            umul r0, TILE_ROW_BYTES
+            add r7, r0
+            mov r0, [rppu_fb]
+            add r7, r0
+            add r7, FB_TILESET
+
+            mov r1, r6           ; expand the 8 glyph bits into 4 tile bytes
+            mov r2, r7
+            call rppu_expand_byte
+
+            add r5, 1
+            jmp .row
+        .nextglyph:
+        add r4, 1
+        jmp .glyph
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+rppu_disp_ops:
+    d32 rppu_putc                ; DISP_PUTC
+    d32 rppu_scroll              ; DISP_SCROLL
+    d32 rppu_clear               ; DISP_CLEAR
+    d32 rppu_present             ; DISP_PRESENT
+
+
+; ==========================
+;   Keyboard backend
+; ==========================
+
+; Bind the keyboard device: route its interrupt to our ISR.
+; r1 = port, r2 = unit index
+rppu_kbd_bind:
+    mov [rppu_kbdport], r1
+    mov r1, INT_KBD
+    mov r2, rppu_kbd_isr
+    call intregister
+    ret
+
+
+; Map a Raylib key-down keycode to an ASCII byte, or 0 to ignore it. Raylib's
+; printable keycodes already equal ASCII (uppercase for letters); we fold
+; letters to lower case and translate the few control keys we care about.
+; r1 = keycode -> r0 = ascii (0 = ignore)
+rppu_keymap:
+    cmp r1, 65                   ; 'A'
+    jil .notalpha
+    cmp r1, 90                   ; 'Z'
+    jig .notalpha
+    mov r0, r1                   ; letter -> lower case
+    add r0, 32
+    ret
+    .notalpha:
+    cmp r1, 32                   ; space .. '`' are already ASCII
+    jil .control
+    cmp r1, 96
+    jig .control
+    mov r0, r1
+    ret
+    .control:
+    cmp r1, 257                  ; Enter
+    je .enter
+    cmp r1, 259                  ; Backspace
+    je .backspace
+    cmp r1, 258                  ; Tab
+    je .tab
+    mov r0, 0
+    ret
+    .enter:
+    mov r0, 10
+    ret
+    .backspace:
+    mov r0, 8
+    ret
+    .tab:
+    mov r0, 9
+    ret
+
+
+; Interrupt 0x70 handler: drain (type, keycode) pairs, feed key-downs to the
+; console. Preempts kernel code, so it saves/restores everything.
+rppu_kbd_isr:
+    int_prologue
+    mov r4, [rppu_kbdport]
+    .drain:
+        in r0, r4                ; event type (0xFFFFFFFF = queue empty)
+        cmp r0, -1
+        je .done
+        mov r5, r0
+        in r6, r4                ; keycode (consume it either way)
+        cmp r5, 1                ; only act on key-down
+        jne .drain
+        mov r1, r6
+        call rppu_keymap
+        cmp r0, 0
+        je .drain
+        mov r1, r0
+        call console_input_char
+        jmp .drain
+    .done:
+    int_epilogue
+
+
+; ---- the adapted font (converted from the x86 testos 8x16 font to 1bpp) ----
+rppu_font:
+    ; the build script generates build/font.bin; this path is relative to this
+    ; source file (src/kernel/drivers/) up to the repo's build/ directory
+    dfile "../../../build/font.bin"

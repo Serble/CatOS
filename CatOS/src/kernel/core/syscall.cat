@@ -1,0 +1,133 @@
+; ==========================
+;   CatOS system calls
+; ==========================
+; The controlled entry point from a task into the kernel. User code runs the
+; `syscall` instruction, which raises interrupt 0x10; this dispatcher (which
+; registers itself with the interrupt manager) decodes the request and returns
+; a result. It is the mechanism the future process system will build on for
+; things like yielding, spawning and I/O.
+;
+;
+; -- Convention -------------------------------------------------------------
+;
+;   in : r1 = syscall number, r2 / r3 = arguments
+;   out: r0 = result
+;   r1-r3 are clobbered, r4-r7 are preserved (same split as a normal call).
+;
+;
+; -- Returning a value across iret ------------------------------------------
+;
+; How the result gets back to the caller depends on the caller's privilege
+; when `syscall` ran, because the CPU builds a different interrupt frame for
+; each and `iret` undoes exactly what was built:
+;
+;   * Kernel caller: the frame holds only ip (+ marker); iret restores nothing
+;     else, so the live r0 we set simply survives. This is the path exercised
+;     today, before any user-mode processes exist.
+;
+;   * User / supervisor caller: the frame holds the full register set and iret
+;     reloads r0-r7 from it, so a live r0 would be overwritten. We instead
+;     write the result into the frame's saved r0 slot.
+;
+; The CPU pushes the user frame low->high address as: marker(1 byte), ip(4),
+; sp(4), fl(4), mbase(4), mlen(4), then r7,r6,r5,r4,r3,r2,r1,r0 (4 each). On
+; handler entry sp points at the marker, so the saved r0 sits 1 + 4*12 = 49
+; bytes above sp.
+
+#define INT_SYSCALL, 0x10        ; interrupt raised by the `syscall` instruction
+
+#define FRAME_KERNEL, 0          ; interrupt-frame marker for a kernel-mode frame
+#define SYSFRAME_R0, 49          ; offset of saved r0 in a user-mode frame
+
+; ---- syscall numbers (keep in sync with user/sys.cat) ----
+#define SYS_TEST, 0              ; returns 7, purely to prove the path works
+#define SYS_YIELD, 1            ; give up the CPU (proc-mgmt, sched.cat)
+#define SYS_EXIT, 2            ; terminate the caller (proc-mgmt, sched.cat)
+#define SYS_GETPID, 3          ; return the caller's pid (proc-mgmt, sched.cat)
+#define SYS_WAIT, 4            ; wait for a child to exit (proc-mgmt, sched.cat)
+#define SYS_PRINT, 5           ; debug: print r2 as a number (temporary)
+#define SYS_SPAWN, 6          ; load a program by path and run it (exec.cat)
+#define SYS_OPEN, 7           ; open a path -> fd (fdio.cat)
+#define SYS_CLOSE, 8          ; close an fd
+#define SYS_READ, 9           ; read from an fd
+#define SYS_WRITE, 10         ; write to an fd
+#define SYS_SEEK, 11          ; move an fd's cursor
+#define SYS_READDIR, 12       ; read the next directory entry name
+#define SYS_CREATE, 13        ; create a file or directory
+#define SYS_SIGNAL, 14        ; install a signal disposition (signal.cat)
+#define SYS_KILL, 15          ; send a signal to a process (signal.cat)
+
+
+; Register the syscall dispatcher. Call once at boot, after intinit.
+; returns r0 = 0 on success, -1 if the interrupt table was full
+syscallinit:
+    mov r1, INT_SYSCALL
+    mov r2, syscall_handler
+    call intregister
+    ret
+
+
+; Deliver a result to the caller across iret and return. r0 = value; requires
+; sp to still point at the caller's frame (so reach it with `jmp sysret`, never
+; `call`). Handles both kernel callers (live r0 survives) and user callers (the
+; saved r0 in the frame is patched). A user caller then passes through
+; sysret_user (signal.cat) so any signal that came due during the syscall is
+; delivered on the way back out to user mode.
+sysret:
+    mov8 r2, [sp]                ; frame marker (nothing pushed, so sp = frame)
+    cmp r2, FRAME_KERNEL
+    je .k                        ; kernel caller: keep the live r0
+    mov r2, sp                   ; user caller: patch the saved r0
+    add r2, SYSFRAME_R0
+    mov [r2], r0
+    jmp sysret_user              ; deliver pending signals, then iret / switch
+    .k:
+    iret
+
+
+; The syscall dispatcher (interrupt 0x10 handler). Decodes r1. Process-control
+; calls jump to their handlers in sched.cat with the frame still at sp; the rest
+; compute r0 and jump to sysret.
+syscall_handler:
+    cmp r1, SYS_YIELD
+    je sys_yield_h
+    cmp r1, SYS_EXIT
+    je sys_exit_h
+    cmp r1, SYS_WAIT
+    je sys_wait_h
+    cmp r1, SYS_GETPID
+    je sys_getpid_h
+    cmp r1, SYS_SPAWN
+    je sys_spawn_h
+    cmp r1, SYS_OPEN
+    je sys_open_h
+    cmp r1, SYS_CLOSE
+    je sys_close_h
+    cmp r1, SYS_READ
+    je sys_read_h
+    cmp r1, SYS_WRITE
+    je sys_write_h
+    cmp r1, SYS_SEEK
+    je sys_seek_h
+    cmp r1, SYS_READDIR
+    je sys_readdir_h
+    cmp r1, SYS_CREATE
+    je sys_create_h
+    cmp r1, SYS_SIGNAL
+    je sys_signal_h
+    cmp r1, SYS_KILL
+    je sys_kill_h
+    cmp r1, SYS_PRINT
+    je .print
+    cmp r1, SYS_TEST
+    je .test
+    mov r0, -1                   ; unknown syscall number
+    jmp sysret
+    .test:
+    mov r0, 7
+    jmp sysret
+    .print:                      ; debug output until /dev/console exists
+    mov r1, r2
+    int 0x90
+    mov r0, 0
+    jmp sysret

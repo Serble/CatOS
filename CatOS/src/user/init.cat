@@ -1,0 +1,14 @@
+; ==========================
+;   init - the first process
+; ==========================
+; The kernel bootstraps this process directly; it launches the rest of userland
+; from the filesystem and supervises it. Here it runs the interactive shell,
+; relaunching it if it ever exits. init itself never exits.
+#include "sys.cat"
+
+init_loop:
+    sys_spawnwait sh_path
+    jmp init_loop
+
+sh_path:
+    dstr "/bin/sh\0"

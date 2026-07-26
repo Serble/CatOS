@@ -1,0 +1,41 @@
+; ==========================
+;   sigdemo - signals & fault handling
+; ==========================
+; Proves two things the kernel now guarantees:
+;   1. A user program can install a signal handler, be sent a signal, run the
+;      handler, and cleanly resume where it left off (SIGUSR1 here).
+;   2. A program that faults no longer takes down the machine - it is killed with
+;      exit code 128+signal, which its parent collects with wait(). We demonstrate
+;      the *catchable* side here by catching SIGSEGV, printing, and (because a
+;      handler that returns to a faulting instruction would just re-fault) exiting.
+;
+; Numbers are reported with sys_print so the demo works headless (no console).
+#include "sys.cat"
+
+    ; install handlers for SIGUSR1 and SIGSEGV
+    sys_signal SIGUSR1, on_usr1
+    sys_signal SIGSEGV, on_segv
+
+    ; send ourselves SIGUSR1: the handler runs, then we continue past the kill
+    mov r1, SYS_GETPID               ; r0 = our pid
+    syscall
+    mov r5, r0                       ; r5 survives syscalls
+    sys_kill r5, SIGUSR1
+    sys_print 0xDDDD                 ; reached only if the handler returned cleanly
+
+    ; now trigger a real segmentation fault by writing out of bounds. Without the
+    ; kernel's fault handling this would halt the VM; instead SIGSEGV is delivered.
+    mov r0, 0x7FFFFFF0
+    mov [r0], 0xBADF00D              ; boom -> SIGSEGV -> on_segv
+
+    sys_exit 0                        ; not reached
+
+; void on_usr1(int signum) - r1 holds the signal number on entry.
+on_usr1:
+    sys_print 0xADEADED0
+    ret                              ; resume the interrupted program
+
+; void on_segv(int signum)
+on_segv:
+    sys_print 0x5E65E65E
+    sys_exit 0x5B                     ; 91 - can't safely resume a faulting write

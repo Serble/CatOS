@@ -1,0 +1,43 @@
+; ==========================
+;   CatOS raw-partition filesystem (rawfs)
+; ==========================
+; Presents a raw disk partition as a single read/write file. Mounting it makes
+; the whole partition appear at one path (we use it for /sys, backed by the
+; kernel's raw-data partition). The mount root IS the file: resolving the mount
+; path yields a file node you open, seek, read and write directly.
+;
+; It has no directory structure of its own - it just wraps a block-backed-file
+; descriptor (see disk.cat) with blkfile_ops. The descriptor to expose is passed
+; as the mount's "device" argument.
+;
+;   mov r1, syspath          ; "/sys"
+;   mov r2, rawfs_name
+;   mov r3, [sys_bf]         ; block-backed-file descriptor from bootdev_probe
+;   call vfsmount
+;
+; Requires: disk.cat (blkfile_ops, BF_* layout, BLOCK_SHIFT), vfs.cat.
+
+
+; mountfn(r1=descriptor) -> r0 = a single file node spanning the partition
+rawfs_mount:
+    push r4                      ; descriptor
+    mov r4, r1
+    mov r1, NODE_FILE
+    mov r2, 0
+    mov r3, 0
+    call vfsnodenew
+    cmp r0, 0
+    je .done
+    vstore r0, NODE_OPS, blkfile_ops, r1
+    vstore r0, NODE_FSDATA, r4, r1
+    push r0                      ; NODE_SIZE = blockCount * 512
+    vload r1, r4, BF_COUNT
+    shl r1, BLOCK_SHIFT
+    pop r0
+    vstore r0, NODE_SIZE, r1, r2
+    .done:
+    pop r4
+    ret
+
+rawfs_name:
+    dstr "rawfs\0"

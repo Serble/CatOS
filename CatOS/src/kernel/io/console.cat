@@ -1,0 +1,386 @@
+; ==========================
+;   CatOS console (device-agnostic text terminal)
+; ==========================
+; The generic text console. It owns the cursor, newline/scroll behaviour, and a
+; line-disciplined input buffer, and it publishes /dev/console (a char device)
+; so reads and writes go through the ordinary VFS + syscalls.
+;
+; It is NOT tied to any particular display hardware. Rendering goes through a
+; small "display driver" vtable that a backend registers via console_set_display;
+; input comes in through console_input_char, which any input backend can call.
+; The Raylib PPU (raylibppu.cat) is one such backend - a serial-terminal or a
+; different framebuffer could be dropped in without touching this file.
+;
+;
+; -- Display driver vtable --------------------------------------------------
+;
+; A backend supplies a table of four routines and its screen dimensions in
+; character cells. The console calls them; none of them return anything.
+;
+;   DISP_PUTC   putc(r1=col, r2=row, r3=char)  draw one glyph in a cell
+;   DISP_SCROLL scroll()                        move everything up one row
+;   DISP_CLEAR  clear()                         blank the whole screen
+;   DISP_PRESENT present()                       flush the backbuffer to screen
+
+#define DISP_PUTC, 0
+#define DISP_SCROLL, 4
+#define DISP_CLEAR, 8
+#define DISP_PRESENT, 12
+
+#define CON_LINE_MAX, 255        ; longest editable input line
+#define CON_RING_SIZE, 512       ; completed-input byte ring capacity
+
+
+; ---- state ----
+console_disp:
+    d32 0                        ; display vtable, 0 = no display yet
+console_cols:
+    d32 0
+console_rows:
+    d32 0
+console_col:
+    d32 0                        ; cursor column
+console_row:
+    d32 0                        ; cursor row
+console_node:
+    d32 0                        ; the /dev/console node (wakeup channel)
+console_linelen:
+    d32 0                        ; chars in the line being edited
+console_rhead:
+    d32 0                        ; input ring read cursor
+console_rtail:
+    d32 0                        ; input ring write cursor
+console_line:
+    res8 CON_LINE_MAX + 1
+console_ring:
+    res8 CON_RING_SIZE
+
+consolepath:
+    dstr "/dev/console\0"
+
+
+; ==========================
+;   Display vtable wrappers
+; ==========================
+; Each loads the registered backend and dispatches, or does nothing if no
+; display is registered. Args are passed straight through.
+
+disp_putc:                       ; r1=col, r2=row, r3=char
+    mov r0, [console_disp]
+    cmp r0, 0
+    je .none
+    mov r0, [r0]                 ; DISP_PUTC (offset 0)
+    call r0
+    .none:
+    ret
+
+disp_scroll:
+    mov r0, [console_disp]
+    cmp r0, 0
+    je .none
+    add r0, DISP_SCROLL
+    mov r0, [r0]
+    call r0
+    .none:
+    ret
+
+disp_clear:
+    mov r0, [console_disp]
+    cmp r0, 0
+    je .none
+    add r0, DISP_CLEAR
+    mov r0, [r0]
+    call r0
+    .none:
+    ret
+
+disp_present:
+    mov r0, [console_disp]
+    cmp r0, 0
+    je .none
+    add r0, DISP_PRESENT
+    mov r0, [r0]
+    call r0
+    .none:
+    ret
+
+
+; Register a display backend and its size in character cells. Clears the screen.
+; r1 - display vtable, r2 - columns, r3 - rows
+console_set_display:
+    mov [console_disp], r1
+    mov [console_cols], r2
+    mov [console_rows], r3
+    mov r0, 0
+    mov [console_col], r0
+    mov [console_row], r0
+    call disp_clear
+    call disp_present
+    ret
+
+
+; ==========================
+;   Output
+; ==========================
+
+; Emit one character at the cursor, handling newline, carriage return,
+; backspace and wrapping/scrolling. Does not present (callers batch).
+; r1 - character
+console_putc:
+    push r4
+    mov r4, r1
+    cmp r4, 10                   ; \n
+    je .newline
+    cmp r4, 13                   ; \r -> ignore
+    je .ret
+    cmp r4, 8                    ; backspace
+    je .backspace
+
+    mov r1, [console_col]        ; draw the glyph at the cursor
+    mov r2, [console_row]
+    mov r3, r4
+    call disp_putc
+    mov r0, [console_col]
+    add r0, 1
+    mov [console_col], r0
+    mov r1, [console_cols]
+    cmp r0, r1
+    jul .ret
+    jmp .newline                 ; wrapped past the last column
+
+    .backspace:
+    mov r0, [console_col]
+    cmp r0, 0
+    je .ret                      ; already at column 0
+    sub r0, 1
+    mov [console_col], r0
+    mov r1, r0                   ; erase by drawing a space
+    mov r2, [console_row]
+    mov r3, 32
+    call disp_putc
+    jmp .ret
+
+    .newline:
+    mov r0, 0
+    mov [console_col], r0
+    mov r0, [console_row]
+    add r0, 1
+    mov r1, [console_rows]
+    cmp r0, r1
+    jul .setrow
+    call disp_scroll             ; off the bottom -> scroll, stay on last row
+    mov r0, [console_rows]
+    sub r0, 1
+    .setrow:
+    mov [console_row], r0
+
+    .ret:
+    pop r4
+    ret
+
+
+; /dev/console write(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes written.
+; buf is a physical (kernel) address supplied by the syscall layer.
+console_write:
+    push r4                      ; buffer
+    push r5                      ; remaining
+    push r6                      ; total (return)
+    push r7                      ; len slot
+    mov r4, r3
+    mov r7, sp
+    add r7, 20
+    mov r5, [r7]                 ; len
+    mov r6, r5
+    .loop:
+        cmp r5, 0
+        je .done
+        mov8 r1, [r4]
+        call console_putc
+        add r4, 1
+        sub r5, 1
+        jmp .loop
+    .done:
+    call disp_present            ; flush once for the whole write
+    mov r0, r6
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Input
+; ==========================
+
+; Push one byte into the completed-input ring (drops it if the ring is full).
+; Single-producer/single-consumer: the input backend only advances rtail and
+; the reader only advances rhead, so no locking is needed.
+; r1 - byte
+console_ring_push:
+    mov r0, [console_rtail]
+    mov r2, r0
+    add r2, 1
+    cmp r2, CON_RING_SIZE
+    jul .nowrap
+    mov r2, 0
+    .nowrap:
+    mov r3, [console_rhead]
+    cmp r2, r3
+    je .full                     ; would collide with the reader -> drop
+    mov r3, console_ring
+    add r3, r0
+    mov8 [r3], r1
+    mov [console_rtail], r2
+    .full:
+    ret
+
+
+; Feed one input character through the line discipline. Printable characters are
+; echoed and buffered; backspace edits the line; Enter commits the whole line
+; (with a trailing newline) to the ring and wakes any blocked reader. Called by
+; an input backend (e.g. the keyboard ISR).
+; r1 - character (ASCII)
+console_input_char:
+    push r4
+    mov r4, r1
+    cmp r4, 10                   ; Enter
+    je .enter
+    cmp r4, 13                   ; treat CR as Enter
+    je .enter
+    cmp r4, 8                    ; Backspace
+    je .backspace
+
+    mov r0, [console_linelen]    ; printable: buffer + echo
+    cmp r0, CON_LINE_MAX
+    juge .ret
+    mov r1, console_line
+    add r1, r0
+    mov8 [r1], r4
+    add r0, 1
+    mov [console_linelen], r0
+    mov r1, r4
+    call console_putc
+    call disp_present
+    jmp .ret
+
+    .backspace:
+    mov r0, [console_linelen]
+    cmp r0, 0
+    je .ret
+    sub r0, 1
+    mov [console_linelen], r0
+    mov r1, 8
+    call console_putc
+    call disp_present
+    jmp .ret
+
+    .enter:
+    mov r1, 10                   ; echo the newline
+    call console_putc
+    call disp_present
+    mov r0, 0                    ; copy the line into the ring
+    .commit:
+        mov r1, [console_linelen]
+        cmp r0, r1
+        juge .commitnl
+        push r0
+        mov r1, console_line
+        add r1, r0
+        mov8 r1, [r1]
+        call console_ring_push
+        pop r0
+        add r0, 1
+        jmp .commit
+    .commitnl:
+    mov r1, 10                   ; terminate the line with a newline
+    call console_ring_push
+    mov r0, 0
+    mov [console_linelen], r0
+    mov r1, [console_node]       ; wake anyone blocked reading the console
+    call proc_wakeup
+
+    .ret:
+    pop r4
+    ret
+
+
+; /dev/console read(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes read, or
+; CON_EAGAIN (-2) if no input is ready. The syscall layer turns -2 into a block.
+; buf is a physical (kernel) address.
+console_read:
+    push r4                      ; buffer
+    push r5                      ; capacity
+    push r6                      ; count
+    push r7                      ; len slot
+    mov r4, r3
+    mov r7, sp
+    add r7, 20
+    mov r5, [r7]
+
+    mov r0, [console_rhead]
+    mov r1, [console_rtail]
+    cmp r0, r1
+    je .empty                    ; nothing buffered -> ask the caller to block
+
+    mov r6, 0
+    .loop:
+        cmp r6, r5
+        juge .done
+        mov r0, [console_rhead]
+        mov r1, [console_rtail]
+        cmp r0, r1
+        je .done                 ; ring drained
+        mov r1, console_ring
+        add r1, r0
+        mov8 r1, [r1]
+        mov r2, r4
+        add r2, r6
+        mov8 [r2], r1
+        add r0, 1
+        cmp r0, CON_RING_SIZE
+        jul .nowrap
+        mov r0, 0
+        .nowrap:
+        mov [console_rhead], r0
+        add r6, 1
+        jmp .loop
+    .done:
+    mov r0, r6
+    jmp .ret
+    .empty:
+    mov r0, -2                   ; CON_EAGAIN
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Publish /dev/console. Call after devfs is mounted; records the node so readers
+; can be woken on it. Returns r0 = node, or 0 on failure.
+console_init:
+    mov r1, consolename
+    mov r2, NODE_CHARDEV
+    mov r3, console_ops
+    push 0                       ; fsdata (none)
+    call devfs_add
+    add sp, 4
+    mov [console_node], r0
+    ret
+
+
+console_ops:
+    d32 0                        ; OP_LOOKUP
+    d32 console_read             ; OP_READ
+    d32 console_write            ; OP_WRITE
+    d32 0                        ; OP_CREATE
+    d32 0                        ; OP_REMOVE
+    d32 0                        ; OP_READDIR
+    d32 0                        ; OP_TRUNCATE
+    d32 0                        ; OP_STAT
+    d32 0                        ; OP_SYNC
+
+consolename:
+    dstr "console\0"

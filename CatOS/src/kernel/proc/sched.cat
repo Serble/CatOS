@@ -1,0 +1,265 @@
+; ==========================
+;   CatOS scheduler
+; ==========================
+; A round-robin scheduler over the process table (proc.cat). It runs when:
+;
+;   * the hardware timer preempts a running user process (sched_tick), or
+;   * a process voluntarily traps into the kernel to yield, exit or wait
+;     (the sys_*_h handlers below, reached from the syscall dispatcher).
+;
+;
+; -- The context switch -------------------------------------------------------
+;
+; A suspended process is captured entirely by its SAVED_SP: the top of its
+; interrupt frame on its own kernel stack. Resuming any process is therefore
+; uniform (see sched_resume):
+;
+;     Sp = next.SAVED_SP        ; drop whatever transient kernel stack we had
+;     setksp next.KSP           ; the next trap from this proc lands here
+;     iret                      ; pops next's frame -> runs it in user mode
+;
+; A brand-new process (proc.cat) is given a hand-built frame and a SAVED_SP that
+; points at it, so first-start and resume share this one path.
+;
+;
+; -- Non-preemptible kernel ---------------------------------------------------
+;
+; The timer only switches when it interrupted *user* mode (frame marker
+; FRAME_USER). If it interrupted the kernel, the frame is a lightweight
+; kernel frame and we simply return: kernel code runs to its next drop-to-user.
+; This sidesteps switching away from a half-finished kernel operation and keeps
+; the switch logic to a single case.
+;
+;
+; -- Blocking is restartable --------------------------------------------------
+;
+; When a syscall must block (wait() with no dead child yet), we rewind the saved
+; user ip by one byte so that, once resumed, the process re-executes its
+; `syscall` instruction and the handler runs again. Blocking handlers must
+; therefore be idempotent on retry.
+
+
+; ==========================
+;   Core switch primitives
+; ==========================
+
+; Choose the next runnable process, round-robin starting after curproc.
+; Always returns something runnable (falls back to the idle process).
+; returns r0 = PCB pointer
+sched_pick:
+    push r4                      ; cursor
+    push r5                      ; slots examined
+    push r6                      ; table end
+    mov r6, proctable
+    add r6, MAX_PROCS * PCB_STRUCT
+    mov r4, [curproc]
+    cmp r4, 0
+    jne .havecur
+    mov r4, proctable
+    sub r4, PCB_STRUCT           ; so the first step lands on slot 0
+    .havecur:
+    mov r5, 0
+    .loop:
+        add r4, PCB_STRUCT
+        cmp r4, r6
+        jul .nowrap
+        mov r4, proctable        ; wrap to the start of the table
+        .nowrap:
+        mov r0, [r4]             ; PCB_STATE
+        cmp r0, PROC_READY
+        je .found
+        add r5, 1
+        cmp r5, MAX_PROCS
+        jul .loop
+    mov r0, [idleproc]           ; nothing ready -> idle
+    jmp .done
+    .found:
+    mov r0, r4
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Resume a process. Does not return; enters the process via iret. Before entering
+; user mode it runs sig_dispatch (signal.cat) against the process's saved frame:
+; this is the single choke point every resume passes through, so it is where
+; pending signals are delivered or acted on. If the process is terminated by a
+; signal we pick another and resume that instead.
+; r1 - PCB pointer to run
+sched_resume:
+    mov [curproc], r1
+    push r1                      ; sig_dispatch clobbers r1-r3
+    call sig_dispatch            ; r0 = 1 runnable, 0 terminated
+    pop r1
+    cmp r0, 0
+    je .terminated
+    mov r0, PROC_RUNNING
+    mov [r1], r0
+    vload r0, r1, PCB_KSP
+    setksp r0
+    vload r0, r1, PCB_SAVEDSP
+    mov sp, r0
+    ei                           ; keep interrupts on so preemption continues
+    iret
+    .terminated:
+    call sched_pick              ; the zombie is skipped; idle is the backstop
+    mov r1, r0
+    jmp sched_resume
+
+
+; ==========================
+;   Timer preemption
+; ==========================
+; Registered as the interrupt 0x71 handler by sched_start. On entry the CPU has
+; already pushed a frame (full user frame, or a lightweight kernel frame).
+sched_tick:
+    di                           ; serialise against other interrupts
+    int_prologue                 ; save fl + r0-r7 (9 words = 36 bytes)
+
+    mov r2, [timer_port]         ; drain the id the device emitted
+    in r0, r2
+    call timer_arm               ; re-arm for the next tick
+
+    mov r0, sp                   ; the pushed frame's marker now sits at sp+36
+    add r0, 36
+    mov8 r0, [r0]
+    cmp r0, FRAME_USER
+    jne .noswitch                ; preempted the kernel -> never switch
+
+    mov r4, [curproc]
+    cmp r4, 0
+    je .noswitch                 ; no current process (shouldn't happen)
+
+    mov r0, sp                   ; SAVED_SP = frame base (sp+36)
+    add r0, 36
+    vstore r4, PCB_SAVEDSP, r0, r1
+    mov r0, PROC_READY
+    mov [r4], r0
+
+    call sched_pick              ; r0 = next
+    cmp r0, r4
+    je .same                     ; same process -> resume it (still via sched_resume,
+                                 ; so a signal that arrived for it is delivered)
+    mov r1, r0
+    jmp sched_resume             ; different -> switch (drops our int_prologue)
+
+    .same:
+    mov r1, r4
+    jmp sched_resume
+    .noswitch:
+    ei
+    int_epilogue                 ; restore fl + r0-r7 and iret
+
+
+; Start preemptive scheduling: locate the timer, install sched_tick as the tick
+; handler, enable interrupts and arm the first tick. Reuses timer.cat's device
+; helpers.
+; r1 - tick interval in milliseconds
+; returns r0 = 0 on success, -1 if no timer device was found / table full
+sched_start:
+    push r4
+    mov r4, r1
+    call timer_find
+    cmp r0, -1
+    je .fail
+    mov [timer_port], r0
+    mov [timer_interval], r4
+    mov r0, TIMER_TICK_ID
+    mov [timer_id], r0
+
+    mov r1, INT_TIMER
+    mov r2, sched_tick
+    call intregister
+    cmp r0, 0
+    jne .fail
+
+    ei
+    call timer_arm
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, -1
+    .done:
+    pop r4
+    ret
+
+
+; ==========================
+;   Process syscalls
+; ==========================
+; These are reached from syscall_handler (syscall.cat) with sp pointing exactly
+; at the caller's interrupt frame (marker at [sp]), so a running process's own
+; frame is its resume point.
+
+; SYS_YIELD: give up the CPU, stay runnable.
+sys_yield_h:
+    mov r4, [curproc]
+    mov r0, sp
+    vstore r4, PCB_SAVEDSP, r0, r1
+    mov r0, PROC_READY
+    mov [r4], r0
+    call sched_pick              ; resume via sched_resume even when we pick ourselves,
+    mov r1, r0                   ; so any pending signal is delivered on the way back
+    jmp sched_resume
+
+
+; SYS_EXIT: r2 = exit code. Become a zombie, wake any waiter, run someone else.
+sys_exit_h:
+    mov r4, [curproc]
+    vstore r4, PCB_EXIT, r2, r0
+    mov r0, PROC_ZOMBIE
+    mov [r4], r0
+    vload r1, r4, PCB_PID        ; waiters block on the child's pid
+    call proc_wakeup
+    call sched_pick
+    mov r1, r0
+    jmp sched_resume
+
+
+; SYS_GETPID: return the caller's pid.
+sys_getpid_h:
+    mov r0, [curproc]
+    vload r0, r0, PCB_PID
+    jmp sysret
+
+
+; SYS_WAIT: r2 = pid to wait for. If it has already exited, reap it and return
+; its exit code; otherwise block until it does, then retry.
+sys_wait_h:
+    mov r4, [curproc]
+    mov r5, proctable
+    mov r6, 0
+    .scan:
+        cmp r6, MAX_PROCS
+        juge .block
+        mov r0, [r5]             ; PCB_STATE
+        cmp r0, PROC_ZOMBIE
+        jne .next
+        vload r0, r5, PCB_PID
+        cmp r0, r2
+        jne .next
+        vload r7, r5, PCB_EXIT   ; found the dead child -> reap + return code
+        mov r1, r5
+        call proc_reap
+        mov r0, r7
+        jmp sysret
+        .next:
+        add r5, PCB_STRUCT
+        add r6, 1
+        jmp .scan
+    .block:
+    mov r0, sp                   ; rewind ip so the syscall re-runs on wake
+    add r0, FRM_IP
+    mov r1, [r0]
+    sub r1, 1                    ; `syscall` is a 1-byte instruction
+    mov [r0], r1
+    mov r0, sp
+    vstore r4, PCB_SAVEDSP, r0, r1
+    vstore r4, PCB_CHAN, r2, r0
+    mov r0, PROC_BLOCKED
+    mov [r4], r0
+    call sched_pick
+    mov r1, r0
+    jmp sched_resume

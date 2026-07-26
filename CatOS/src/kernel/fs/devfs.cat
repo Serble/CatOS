@@ -1,0 +1,163 @@
+; ==========================
+;   CatOS device filesystem (devfs)
+; ==========================
+; The filesystem mounted at /dev. It holds the device nodes that drivers
+; publish during the hardware scan. Each device node carries its *driver's*
+; vtable in NODE_OPS (not devfs's), so reads and writes on /dev/xxx dispatch
+; straight into the driver; devfs itself only implements directory lookup and
+; enumeration.
+;
+; There is a single devfs instance, so its directory contents live in the
+; module-global list `devfs_children` (a dirent list, reusing ramfs's DENT_*
+; layout). Each dirent adopts one reference on its node, keeping it alive.
+;
+; Drivers publish a node with devfs_add; the OS mounts devfs with the usual
+; vfsregister/vfsmount using devfs_name + devfs_mount.
+
+devfs_root:
+    d32 0                        ; the /dev directory node
+devfs_children:
+    d32 0                        ; head of the device dirent list
+
+
+; mountfn(r1=device) -> r0 = /dev root directory node
+devfs_mount:
+    mov r1, NODE_DIR
+    mov r2, 0
+    mov r3, 0
+    call vfsnodenew
+    cmp r0, 0
+    je .done
+    vstore r0, NODE_OPS, devfs_ops, r1
+    mov [devfs_root], r0
+    .done:
+    ret
+
+
+; Publish a device node under /dev.
+; r1 - name string (duplicated by vfsnodenew)
+; r2 - node type (NODE_CHARDEV / NODE_BLOCKDEV / ...)
+; r3 - driver vtable for this node
+; [sp] - fsdata (driver-private, e.g. a block-backed-file descriptor)
+; returns r0 = the node (borrowed - devfs keeps the owning reference), or 0
+devfs_add:
+    push r4                      ; name, then node
+    push r5                      ; type, then dirent
+    push r6                      ; ops
+    push r7                      ; fsdata
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    mov r7, sp                   ; 4th arg: 4 pushes (16) + return addr (4)
+    add r7, 20
+    mov r7, [r7]
+
+    mov r1, r5                   ; vfsnodenew(type, name, devfs_root)
+    mov r2, r4
+    mov r3, [devfs_root]
+    call vfsnodenew
+    cmp r0, 0
+    je .fail
+    mov r4, r0                   ; r4 = node
+
+    vstore r4, NODE_OPS, r6, r1
+    vstore r4, NODE_FSDATA, r7, r1
+
+    mov r1, DENT_STRUCT           ; wrap in a dirent, adopting the node's ref
+    call heapalloc
+    cmp r0, 0
+    je .failnode
+    mov r5, r0                   ; r5 = dirent
+    vstore r5, DENT_NODE, r4, r1
+    mov r0, [devfs_children]
+    vstore r5, DENT_NEXT, r0, r1
+    mov [devfs_children], r5
+
+    mov r0, r4                   ; borrowed node
+    jmp .done
+    .failnode:
+    mov r1, r4
+    call vfsnodeunref
+    .fail:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; lookup(r1=dir, r2=name) -> r0 = child node (ref taken) or 0
+devfs_lookup:
+    push r4                      ; name
+    push r5                      ; dirent
+    push r6                      ; child
+    mov r4, r2
+    mov r5, [devfs_children]
+    .loop:
+        cmp r5, 0
+        je .none
+        vload r6, r5, DENT_NODE
+        vload r1, r6, NODE_NAME
+        mov r2, r4
+        call vfsstreq
+        cmp r0, 0
+        jne .found
+        vload r5, r5, DENT_NEXT
+        jmp .loop
+    .found:
+    mov r1, r6
+    call vfsnoderef
+    mov r0, r6
+    jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; readdir(r1=dir, r2=index) -> r0 = child node (ref taken) or 0 past the end
+devfs_readdir:
+    push r4                      ; index
+    push r5                      ; dirent
+    mov r4, r2
+    mov r5, [devfs_children]
+    .loop:
+        cmp r5, 0
+        je .none
+        cmp r4, 0
+        je .found
+        sub r4, 1
+        vload r5, r5, DENT_NEXT
+        jmp .loop
+    .found:
+    vload r0, r5, DENT_NODE
+    mov r1, r0
+    call vfsnoderef
+    vload r0, r5, DENT_NODE       ; reload (vfsnoderef clobbered r0)
+    jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+devfs_ops:
+    d32 devfs_lookup             ; OP_LOOKUP
+    d32 0                        ; OP_READ
+    d32 0                        ; OP_WRITE
+    d32 0                        ; OP_CREATE
+    d32 0                        ; OP_REMOVE
+    d32 devfs_readdir            ; OP_READDIR
+    d32 0                        ; OP_TRUNCATE
+    d32 0                        ; OP_STAT
+    d32 0                        ; OP_SYNC
+
+devfs_name:
+    dstr "devfs\0"

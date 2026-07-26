@@ -1,0 +1,205 @@
+; CatOS loader
+; =======================
+mov [bootdiskport], r2       ; firmware leaves the boot disk port in r2 - save it
+                             ; before anything clobbers it
+mov r1, 7878
+int 0x90
+jmp main
+
+#include "core/settings.cat"
+#include "core/panic.cat"
+#include "core/memcount.cat"
+#include "core/alloc.cat"
+#include "core/heapalloc.cat"
+#include "core/ints.cat"
+#include "core/syscall.cat"
+#include "fs/vfs.cat"
+#include "drivers/hwman.cat"
+#include "fs/ramfs.cat"
+#include "fs/devfs.cat"
+#include "drivers/disk.cat"
+#include "fs/catfs.cat"
+#include "fs/rawfs.cat"
+#include "fs/bootdev.cat"
+#include "core/timer.cat"
+#include "proc/proc.cat"
+#include "proc/sched.cat"
+#include "proc/signal.cat"
+#include "proc/exec.cat"
+#include "fs/fdio.cat"
+#include "io/console.cat"
+#include "drivers/raylibppu.cat"
+
+; to start let's work out how much memory we have
+main:
+mov r1, 7676
+int 0x90
+di                           ; we don't want interrupts right now, we're still getting setup
+call countmem
+
+mov r1, r0                   ; debug print the mem size
+int 0x90
+
+mov r1, r0
+mov r2, kend
+call allocinit
+
+; let's allocate a dedicated kernel memory space
+mov r1, KERNEL_STACK_PAGES
+call allocpages
+
+; move to start of page after our region
+add r0, KERNEL_STACK_PAGES * PAGE_SIZE
+
+; this can be our new stack
+; our old stack space is unsafe to use because it is
+; the end of memory by default, which is now owned by
+; our allocator.
+setksp r0
+mov sp, r0
+
+; bring up the kernel heap so we can allocate sequential bytes
+call heapinit
+
+; bring up the interrupt manager (owns the shared interrupt table)
+call intinit
+
+; register the system-call dispatcher
+call syscallinit
+
+; claim the CPU-exception vectors so a faulting user program is signalled/killed
+; instead of halting the whole machine
+call siginit
+
+; bring up the virtual file system
+call vfsinit
+
+; panic codes for the boot-time bring-up
+#define PANIC_ROOT_FAILED, 0x01
+#define PANIC_MOUNT_FAILED, 0x02
+#define PANIC_BOOTDEV_FAILED, 0x05
+#define PANIC_PROC, 0x07
+#define SCHED_TICK_MS, 20            ; preempt every 20ms
+
+; Disk first: the root filesystem is the on-disk CatFS, so the disk has to be
+; up and its partitions located before we can mount root. Register the disk
+; completion ISR, enable interrupts, and probe the boot disk's partition table
+; (fills sys_bf for the kernel partition and catfs_bf for the CatFS one).
+call diskinit
+ei
+call bootdev_probe
+cmp r0, 0
+je .bootok
+kpanic PANIC_BOOTDEV_FAILED
+.bootok:
+
+; Mount the on-disk journaling CatFS as the root "/". The first successful mount
+; becomes the root filesystem, so /dev, /sys and /bin all resolve into CatFS
+; from here (those directories are created on the disk by the host tools).
+mov r1, catfs_name
+mov r2, catfs_mount
+call vfsregister
+mov r1, rootpath
+mov r2, catfs_name
+mov r3, [catfs_bf]
+call vfsmount
+cmp r0, 0
+jne .rootok
+kpanic PANIC_ROOT_FAILED
+.rootok:
+
+; mount the kernel's raw partition read/write at /sys
+mov r1, rawfs_name
+mov r2, rawfs_mount
+call vfsregister
+mov r1, syspath
+mov r2, rawfs_name
+mov r3, [sys_bf]
+call vfsmount
+cmp r0, 0
+jne .sysfsok
+kpanic PANIC_MOUNT_FAILED
+.sysfsok:
+
+; mount devfs at /dev, register the disk driver, then scan + bind hardware so
+; /dev/disk0 appears
+mov r1, devfs_name
+mov r2, devfs_mount
+call vfsregister
+mov r1, devpath
+mov r2, devfs_name
+mov r3, 0
+call vfsmount
+cmp r0, 0
+jne .devfsok
+kpanic PANIC_MOUNT_FAILED
+.devfsok:
+
+; publish /dev/console, then register the device drivers and scan hardware. The
+; Raylib PPU binds during the scan: its graphics device becomes the console
+; display and its keyboard becomes the console input source. Any other display
+; backend would register with the console the same way.
+call console_init
+
+mov r1, DISK_TYPE
+mov r2, disk_bind
+call drvregister
+mov r1, GFX_TYPE
+mov r2, rppu_gfx_bind
+call drvregister
+mov r1, KBD_TYPE
+mov r2, rppu_kbd_bind
+call drvregister
+call hwscan
+call devscan
+
+; ==========================
+;   Process system bring-up
+; ==========================
+; Build the initial processes and hand control to the scheduler. Every program
+; lives on the disk under /bin; the kernel bootstraps idle and init from there
+; directly (there is no parent process yet to spawn them), and init launches
+; everything else. From here the kernel only runs inside trap handlers - the
+; boot thread itself is abandoned and the scheduler runs the machine.
+call procinit
+
+; idle: always runnable so the CPU never has nothing to do (pid 1)
+mov r1, idlepath
+call proc_spawn
+cmp r0, 0
+je .procfail
+mov [idleproc], r0
+
+; init: the first real process - it spawns the rest of userland from /bin (pid 2)
+mov r1, initpath
+call proc_spawn
+cmp r0, 0
+je .procfail
+
+; enable preemption, then enter the first process (never returns)
+mov r1, SCHED_TICK_MS
+call sched_start
+cmp r0, 0
+jne .procfail
+
+call sched_pick
+mov r1, r0
+jmp sched_resume
+
+.procfail:
+kpanic PANIC_PROC
+
+; ---- boot-time path strings ----
+rootpath:
+    dstr "/\0"
+devpath:
+    dstr "/dev\0"
+syspath:
+    dstr "/sys\0"
+idlepath:
+    dstr "/bin/idle\0"
+initpath:
+    dstr "/bin/init\0"
+
+; marker for the end of kernel memory
+kend:

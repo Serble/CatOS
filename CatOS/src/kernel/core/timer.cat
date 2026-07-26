@@ -1,0 +1,174 @@
+; ==========================
+;   CatOS hardware timer driver
+; ==========================
+; Drives the hardware timer device (type 0xB1F91A0C) so the kernel can receive
+; a periodic interrupt. This is the heartbeat the future process system will
+; use to preempt the running task and switch to another one.
+;
+;
+; -- How the device works ---------------------------------------------------
+;
+; The timer is a command based serial device. It is one-shot: you send it the
+; "new timer" command (1) followed by a duration in milliseconds and a timer
+; id, and after that many milliseconds it raises interrupt 0x71 and makes the
+; id readable back from its serial port. To get a *periodic* tick we simply
+; re-arm the timer from inside the interrupt handler.
+;
+; The device is assigned an arbitrary free port, so we discover it at runtime
+; by asking the hardware manager (port 0 by convention) to list the devices
+; and matching on the timer's type.
+;
+;
+; -- Interrupt handling -----------------------------------------------------
+;
+; The tick handler is registered with the interrupt manager (see ints.cat),
+; which owns the shared interrupt table. When 0x71 fires while the CPU is in
+; kernel mode the hardware saves only `ip`, so the handler brackets itself with
+; int_prologue / int_epilogue to preserve and restore everything else. Anything
+; it calls (the registered tick handler) must obey the normal calling
+; convention (r4-r7 callee-preserved).
+;
+;
+; -- Usage ------------------------------------------------------------------
+;
+;     mov r1, 10                 ; tick every 10ms
+;     mov r2, on_tick            ; address of your tick handler (a normal proc)
+;     call timerinit             ; r0 = 0 on success, -1 if no timer was found
+;     ; interrupts are enabled by timerinit; ticks now call on_tick
+;     ...
+;     call timerstop             ; stop ticking
+;
+; The tick handler is called as an ordinary routine (no arguments). The real
+; scheduler will replace it once the process system exists.
+
+
+#define TIMER_TYPE, 0xB1F91A0C   ; hardware timer device type
+; HWMAN_PORT / HWMAN_LIST now come from hwman.cat (included before this file)
+#define TIMER_CMD_NEW, 1         ; timer "new timer" command
+#define INT_TIMER, 0x71          ; hardware timer callback interrupt
+#define TIMER_TICK_ID, 1         ; the id we tag our periodic timer with
+
+
+; ---- driver state ----
+timer_port:
+    d32 0                        ; discovered serial port of the timer
+timer_interval:
+    d32 0                        ; tick period in milliseconds
+timer_id:
+    d32 0                        ; id our periodic timer was created with
+timer_cb:
+    d32 0                        ; tick handler address, 0 if none
+timer_running:
+    d32 0                        ; 1 while the timer should keep re-arming
+
+
+; Locate the timer device via the hardware manager.
+; returns r0 = the timer's port, or -1 if no timer is present
+timer_find:
+    push r4                      ; devices left to inspect
+    push r5                      ; port of the timer, -1 until found
+    mov r5, -1
+
+    out HWMAN_PORT, HWMAN_LIST    ; ask for the device list
+    in r4, HWMAN_PORT             ; device count
+    .loop:
+        cmp r4, 0
+        je .done
+        in r1, HWMAN_PORT         ; device port
+        in r2, HWMAN_PORT         ; device type
+        cmp r2, TIMER_TYPE
+        jne .next
+        mov r5, r1                ; this is our timer
+        .next:
+        sub r4, 1
+        jmp .loop                 ; keep reading so the manager's queue drains
+    .done:
+    mov r0, r5
+    pop r5
+    pop r4
+    ret
+
+
+; Arm (or re-arm) the one-shot timer for the next tick using the stored
+; interval and id. Clobbers r1, r2 (caller-saved).
+timer_arm:
+    mov r2, [timer_port]
+    out r2, TIMER_CMD_NEW         ; command: new timer
+    mov r1, [timer_interval]
+    out r2, r1                    ; duration in milliseconds
+    mov r1, [timer_id]
+    out r2, r1                    ; timer id
+    ret
+
+
+; Start the periodic timer.
+; r1 - tick period in milliseconds
+; r2 - tick handler address (a normal proc, called on every tick), or 0
+; returns r0 = 0 on success, -1 if no timer device could be found
+timerinit:
+    push r4                      ; interval
+    push r5                      ; callback
+    mov r4, r1
+    mov r5, r2
+
+    call timer_find
+    cmp r0, -1
+    je .fail
+
+    mov [timer_port], r0
+    mov [timer_interval], r4
+    mov [timer_cb], r5
+    mov r0, TIMER_TICK_ID
+    mov [timer_id], r0
+    mov r0, 1
+    mov [timer_running], r0
+
+    mov r1, INT_TIMER            ; route 0x71 to our trampoline via the manager
+    mov r2, timer_trampoline
+    call intregister
+    cmp r0, 0
+    jne .fail                    ; interrupt table was full
+
+    ei                           ; ticks can only arrive with interrupts enabled
+    call timer_arm               ; schedule the first tick
+
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, -1
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Stop the periodic tick. The handler simply stops re-arming, so at most one
+; more tick (already scheduled) may arrive before it goes quiet.
+timerstop:
+    mov r0, 0
+    mov [timer_running], r0
+    ret
+
+
+; Interrupt 0x71 handler, registered with the interrupt manager. Preempts
+; whatever kernel code was running, so int_prologue/int_epilogue save and
+; restore the full state around the work and handle the iret.
+timer_trampoline:
+    int_prologue
+
+    mov r2, [timer_port]         ; consume the id the device emitted so its
+    in r0, r2                    ; serial queue does not grow unbounded
+
+    mov r0, [timer_running]      ; re-arm for the next tick unless we were stopped
+    cmp r0, 0
+    je .norearm
+    call timer_arm
+    .norearm:
+
+    mov r0, [timer_cb]           ; invoke the registered tick handler
+    cmp r0, 0
+    je .nocb
+    call r0
+    .nocb:
+
+    int_epilogue

@@ -1,0 +1,85 @@
+; sleep - pause for the given number of milliseconds, then exit.
+;
+; Usage (from the shell):  sleep <ms>
+;
+; There is no sleep syscall, so the wait is measured against the CPU's `uptms`
+; instruction (uptime in milliseconds, returned as a 64-bit value in r1:r0). We
+; compute a deadline = now + <ms> once, then poll uptms and sys_yield until the
+; deadline is reached. Yielding keeps the sleep cooperative - other processes run
+; while we wait rather than us hogging a scheduling quantum spinning.
+#include "sys.cat"
+
+main:
+    mov r5, r1                       ; argc  (r5-r7 survive syscalls)
+    mov r6, r2                       ; argv
+    cmp r5, 2
+    jil .usage                       ; need: sleep <ms>
+
+    mov r1, r6                       ; r1 = argv[1]
+    add r1, 4
+    mov r1, [r1]
+    call atoi                        ; r0 = requested milliseconds
+    mov r7, r0
+
+    uptms                            ; now = r1:r0 (hi:lo)
+    mov r3, r0                       ; now_lo
+    add r0, r7                       ; deadline_lo = now_lo + ms
+    cmp r0, r3                       ; carry out of the low word?
+    juge .nocarry
+    add r1, 1                        ; propagate the carry into the high word
+.nocarry:
+    mov [dl_lo], r0
+    mov [dl_hi], r1
+
+.wait:
+    uptms                            ; now = r1:r0
+    mov r2, [dl_hi]
+    cmp r1, r2
+    jug .done                        ; now_hi > deadline_hi
+    jul .yield                       ; now_hi < deadline_hi
+    mov r2, [dl_lo]                  ; high words equal -> compare low words
+    cmp r0, r2
+    juge .done
+.yield:
+    sys_yield
+    jmp .wait
+.done:
+    sys_exit 0
+
+.usage:
+    sys_write 1, msg_usage, msg_usage_end - msg_usage
+    sys_exit 1
+
+
+; atoi(r1) - parse a null-terminated decimal string into r0. Stops at the first
+; non-digit; a leading non-digit yields 0. Preserves r4-r7.
+atoi:
+    push r4
+    push r5
+    mov r0, 0                        ; accumulator
+    mov r4, r1                       ; cursor
+    .loop:
+        mov8 r5, [r4]
+        cmp r5, 48                   ; '0'
+        jil .fin
+        cmp r5, 57                   ; '9'
+        jig .fin
+        umul r0, 10
+        sub r5, 48
+        add r0, r5
+        add r4, 1
+        jmp .loop
+    .fin:
+    pop r5
+    pop r4
+    ret
+
+
+msg_usage:
+    dstr "usage: sleep <ms>\n"
+msg_usage_end:
+
+dl_lo:
+    res32 1
+dl_hi:
+    res32 1

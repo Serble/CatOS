@@ -1,0 +1,46 @@
+; cat - write the contents of a file to stdout. There is no cwd, so the path is
+; absolute. Reads the file in fixed-size chunks and forwards each chunk straight
+; to stdout until end of file. r5-r7 survive syscalls, so the fd and byte count
+; live there across the read/write calls.
+#include "sys.cat"
+
+#define BUFSZ, 256
+
+main:
+    mov r5, r1                       ; argc
+    cmp r5, 2
+    jul .usage
+    mov r1, r2                       ; argv[1] -> path
+    add r1, 4
+    mov r1, [r1]
+    sys_open r1, O_READ
+    mov r6, r0                       ; fd
+    cmp r6, -1
+    je .fail
+
+.loop:
+    sys_read r6, buf, BUFSZ
+    mov r7, r0                       ; bytes read
+    cmp r7, 0
+    jile .done                       ; 0 = EOF, <0 = error
+    sys_write 1, buf, r7
+    jmp .loop
+.done:
+    sys_close r6
+    sys_exit 0
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+.fail:
+    sys_write 1, failmsg, failmsg_end - failmsg
+    sys_exit 1
+
+usage:
+    dstr "usage: cat <file>\n"
+usage_end:
+failmsg:
+    dstr "cat: cannot open file\n"
+failmsg_end:
+buf:
+    res8 BUFSZ

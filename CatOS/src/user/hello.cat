@@ -1,0 +1,6 @@
+; A trivial program loaded from the filesystem: announce itself and exit with a
+; distinctive code that its parent (init) collects via wait().
+#include "sys.cat"
+
+    sys_print 0xE1
+    sys_exit 0xE0

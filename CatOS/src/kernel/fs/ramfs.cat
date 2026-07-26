@@ -1,0 +1,326 @@
+; ==========================
+;   CatOS in-memory filesystem (ramfs)
+; ==========================
+; A small writable filesystem that lives entirely in the kernel heap. It backs
+; the root "/" for now: it can hold directories (so "/dev" and "/sys" have
+; something to be mounted onto) and regular files (scratch space the process
+; system will want later).
+;
+; Layout:
+;   * A directory node keeps a singly linked list of "dirents" in NODE_FSDATA.
+;     Each dirent is {node, next} and holds a reference on its child, so the
+;     child persists for as long as the directory does.
+;   * A regular file node keeps a small descriptor {buf, capacity} in
+;     NODE_FSDATA; NODE_SIZE is the logical length. Writes grow the buffer by
+;     allocating a bigger one and copying.
+;
+; Register + mount it as the root exactly like any other driver:
+;   mov r1, ramfs_name
+;   mov r2, ramfs_mount
+;   call vfsregister
+;   mov r1, rootpath        ; "/"
+;   mov r2, ramfs_name
+;   mov r3, 0
+;   call vfsmount
+
+; ---- directory entry ----
+#define DENT_NODE, 0            ; child node pointer
+#define DENT_NEXT, 4            ; next dirent, 0 at end
+#define DENT_STRUCT, 8
+
+; ---- regular file descriptor ----
+#define RF_BUF, 0              ; heap buffer, 0 if empty
+#define RF_CAP, 4              ; capacity of that buffer in bytes
+#define RF_STRUCT, 8
+
+
+; mountfn(r1=device) -> r0 = empty root directory node
+ramfs_mount:
+    mov r1, NODE_DIR
+    mov r2, 0                    ; the root has no name
+    mov r3, 0                    ; and no parent
+    call vfsnodenew              ; NODE_FSDATA is zeroed -> empty dirent list
+    cmp r0, 0
+    je .done
+    vstore r0, NODE_OPS, ramfs_ops, r1
+    .done:
+    ret
+
+
+; lookup(r1=dir, r2=name) -> r0 = child node (ref taken) or 0
+ramfs_lookup:
+    push r4                      ; name
+    push r5                      ; dirent walk
+    push r6                      ; candidate child
+    mov r4, r2
+    vload r5, r1, NODE_FSDATA
+    .loop:
+        cmp r5, 0
+        je .none
+        vload r6, r5, DENT_NODE
+        vload r1, r6, NODE_NAME
+        mov r2, r4
+        call vfsstreq
+        cmp r0, 0
+        jne .found
+        vload r5, r5, DENT_NEXT
+        jmp .loop
+    .found:
+    mov r1, r6
+    call vfsnoderef
+    mov r0, r6
+    jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; create(r1=dir, r2=name, r3=type) -> r0 = new node (ref taken) or 0
+ramfs_create:
+    push r4                      ; dir
+    push r5                      ; type
+    push r6                      ; new node
+    push r7                      ; dirent
+    mov r4, r1
+    mov r5, r3
+
+    mov r1, r5                   ; vfsnodenew(type, name, parent=dir)
+    mov r3, r4
+    call vfsnodenew
+    cmp r0, 0
+    je .fail
+    mov r6, r0
+    vstore r6, NODE_OPS, ramfs_ops, r1
+
+    cmp r5, NODE_FILE            ; files get an (empty) buffer descriptor
+    jne .nofile
+    mov r1, RF_STRUCT
+    call heapalloc
+    cmp r0, 0
+    je .failnode
+    vstore r0, RF_BUF, 0, r1
+    vstore r0, RF_CAP, 0, r1
+    vstore r6, NODE_FSDATA, r0, r1
+    .nofile:
+
+    mov r1, DENT_STRUCT          ; link the child into the directory
+    call heapalloc
+    cmp r0, 0
+    je .failnode
+    mov r7, r0
+    vstore r7, DENT_NODE, r6, r1
+    mov r1, r6                   ; the dirent pins the child
+    call vfsnoderef
+    vload r0, r4, NODE_FSDATA     ; prepend to the dirent list
+    vstore r7, DENT_NEXT, r0, r1
+    vstore r4, NODE_FSDATA, r7, r1
+
+    mov r0, r6                   ; hand back the node the caller now owns
+    jmp .done
+    .failnode:
+    mov r1, r6
+    call vfsnodeunref
+    .fail:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; readdir(r1=dir, r2=index) -> r0 = child node (ref taken) or 0 past the end
+ramfs_readdir:
+    push r4                      ; index
+    push r5                      ; dirent walk
+    mov r4, r2
+    vload r5, r1, NODE_FSDATA
+    .loop:
+        cmp r5, 0
+        je .none
+        cmp r4, 0
+        je .found
+        sub r4, 1
+        vload r5, r5, DENT_NEXT
+        jmp .loop
+    .found:
+    vload r0, r5, DENT_NODE
+    mov r1, r0
+    call vfsnoderef
+    vload r5, r5, DENT_NODE       ; reload (vfsnoderef clobbered r0)
+    mov r0, r5
+    jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Ensure a file's buffer can hold at least (off + len) bytes, growing it if
+; needed and preserving the existing NODE_SIZE bytes.
+; r1 = file node, r2 = offset, r3 = len
+; returns r0 = buffer pointer, or 0 on OOM
+ramfs_ensure:
+    push r4                      ; node
+    push r5                      ; needed bytes
+    push r6                      ; RF descriptor
+    push r7                      ; new buffer
+    mov r4, r1
+    mov r5, r2
+    add r5, r3                   ; needed = off + len
+    vload r6, r4, NODE_FSDATA
+    vload r0, r6, RF_CAP
+    cmp r5, r0
+    jule .have                   ; capacity already covers it
+
+    mov r1, r5
+    call heapalloc
+    cmp r0, 0
+    je .fail
+    mov r7, r0
+
+    vload r1, r6, RF_BUF         ; carry over old contents, then free old buf
+    cmp r1, 0
+    je .stored
+    push r1
+    vload r2, r4, NODE_SIZE
+    cmp r2, 0
+    je .freeold
+    mov r0, r7
+    cpy r1, r2
+    .freeold:
+    pop r1
+    call heapfree
+    .stored:
+    vstore r6, RF_BUF, r7, r1
+    vstore r6, RF_CAP, r5, r1
+    mov r0, r7
+    jmp .done
+    .have:
+    vload r0, r6, RF_BUF
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; read(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes read
+ramfs_read:
+    push r4                      ; node
+    push r5                      ; offset
+    push r6                      ; buffer
+    push r7                      ; length
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    mov r7, sp
+    add r7, 20                   ; 4 pushes + return address
+    mov r7, [r7]
+
+    vload r0, r4, NODE_SIZE
+    cmp r5, r0
+    juge .zero                   ; offset at/past EOF
+    sub r0, r5
+    cmp r7, r0
+    jule .lenok
+    mov r7, r0                   ; clamp to what's left
+    .lenok:
+    cmp r7, 0
+    je .zero
+    vload r0, r4, NODE_FSDATA
+    vload r1, r0, RF_BUF
+    add r1, r5
+    mov r0, r6
+    cpy r1, r7
+    mov r0, r7
+    jmp .done
+    .zero:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; write(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes written
+; (the VFS core grows NODE_SIZE from the returned count.)
+ramfs_write:
+    push r4                      ; node
+    push r5                      ; offset
+    push r6                      ; buffer
+    push r7                      ; length
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    mov r7, sp
+    add r7, 20
+    mov r7, [r7]
+    cmp r7, 0
+    je .zero
+
+    mov r1, r4                   ; make room for off+len
+    mov r2, r5
+    mov r3, r7
+    call ramfs_ensure
+    cmp r0, 0
+    je .zero                     ; OOM
+
+    add r0, r5                   ; dest = buffer + offset (cpy uses r0)
+    mov r1, r6
+    cpy r1, r7
+    mov r0, r7
+    jmp .done
+    .zero:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; truncate(r1=node, r2=newlen) -> r0 = status
+ramfs_truncate:
+    push r4                      ; node
+    push r5                      ; new length
+    mov r4, r1
+    mov r5, r2
+    mov r1, r4
+    mov r2, 0
+    mov r3, r5
+    call ramfs_ensure            ; guarantee capacity for a grow
+    vstore r4, NODE_SIZE, r5, r0
+    mov r0, 0
+    pop r5
+    pop r4
+    ret
+
+
+ramfs_ops:
+    d32 ramfs_lookup             ; OP_LOOKUP
+    d32 ramfs_read               ; OP_READ
+    d32 ramfs_write              ; OP_WRITE
+    d32 ramfs_create             ; OP_CREATE
+    d32 0                        ; OP_REMOVE
+    d32 ramfs_readdir            ; OP_READDIR
+    d32 ramfs_truncate           ; OP_TRUNCATE
+    d32 0                        ; OP_STAT
+    d32 0                        ; OP_SYNC
+
+ramfs_name:
+    dstr "ramfs\0"

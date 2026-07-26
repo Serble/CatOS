@@ -1,0 +1,479 @@
+; ==========================
+;   CatOS signals & CPU-fault handling
+; ==========================
+; The VM raises a CPU exception as an ordinary interrupt whenever a program does
+; something illegal - a bad memory access (0x00 page fault), an unknown opcode
+; (0x01), a divide by zero (0x02) or a privileged instruction from user mode
+; (0x03 protection fault). Until now nothing in the kernel claimed those vectors,
+; so a faulting user program fell through to the VM's default handler, which dumps
+; the CPU state and halts the WHOLE machine. A single buggy or malicious process
+; could take down the kernel.
+;
+; This file closes that hole and builds a small POSIX-style signal system on top
+; of the same machinery:
+;
+;   * siginit registers a handler for every CPU-exception vector. A fault that
+;     happened in USER mode is turned into a signal delivered to the current
+;     process; a fault that happened in KERNEL mode is a genuine kernel bug and
+;     panics (a correct kernel bounds-checks every user pointer, so user code can
+;     never provoke this path - see copyinstr / uaddr in proc.cat).
+;
+;   * A process may install a handler for a signal (SYS_SIGNAL) and send a signal
+;     to another process (SYS_KILL). Signals are also raised internally by faults.
+;
+;   * Delivery happens on the way back to user mode, from the one place every
+;     resume funnels through: sched_resume (sched.cat) calls sig_dispatch. If the
+;     signal has a user handler we manufacture a call to it; otherwise the default
+;     action (terminate, or ignore for SIGUSR*) runs.
+;
+;
+; -- Invoking a user handler, and returning from it ---------------------------
+;
+; To run handler H for signal S we edit the process's saved interrupt frame in
+; place: IP -> H, r1 -> S (the argument, same register spawn uses for argc), and
+; we push a sentinel return address SIGRETURN_MAGIC onto the user stack. When the
+; handler executes `ret` it pops that address and "returns" to it; the address is
+; deliberately outside every user segment, so the fetch page-faults. Our page
+; fault handler notices the process is mid-handler and that the faulting IP is the
+; sentinel, and performs the sigreturn - restoring the frame we saved in PCB_SIGSAVE
+; - instead of killing the process. This keeps the whole scheme inside the kernel:
+; user programs need no trampoline and handlers are plain `ret`-terminated procs.
+
+
+; ---- CPU-exception interrupt vectors (must match SpecialInterrupts) ----
+#define INT_PAGEFAULT, 0x00
+#define INT_INVALIDOP, 0x01
+#define INT_DIVZERO,   0x02
+#define INT_PROTFAULT, 0x03
+
+; ---- signal dispositions (values stored in the PCB handler table) ----
+#define SIG_DFL, 0              ; take the default action
+#define SIG_IGN, 1              ; ignore the signal
+
+; ---- signal numbers (keep in sync with user/sys.cat) ----
+#define SIGINT,  2             ; interrupt (default: terminate)
+#define SIGILL,  4             ; illegal instruction (fault)
+#define SIGABRT, 6             ; abort
+#define SIGFPE,  8             ; arithmetic fault (divide by zero)
+#define SIGKILL, 9             ; unconditional kill - cannot be caught or ignored
+#define SIGUSR1, 10            ; user-defined (default: ignore)
+#define SIGSEGV, 11            ; segmentation / protection fault
+#define SIGUSR2, 12            ; user-defined (default: ignore)
+#define SIGTERM, 15            ; polite termination request
+#define NSIG,    16            ; signal numbers are 1..NSIG-1
+
+; Signals whose default action is to terminate the process. Bit N set => signal N
+; kills by default; everything else (e.g. SIGUSR1/2) is ignored by default.
+; = (1<<2)|(1<<4)|(1<<6)|(1<<8)|(1<<9)|(1<<11)|(1<<15)
+#define SIG_DFLTERM_MASK, 0x8B54
+
+; Sentinel "return address" a handler unwinds to; guaranteed outside any user
+; segment so the return fetch faults and we can intercept it as a sigreturn.
+#define SIGRETURN_MAGIC, 0xFFFFFF00
+
+#define PANIC_KERNEL_FAULT, 0x10   ; a CPU fault happened in kernel mode
+
+
+; Register the CPU-exception handlers. Call once at boot, after intinit. From
+; here on a userland fault can never reach the VM's halt-the-machine default.
+siginit:
+    mov r1, INT_PAGEFAULT
+    mov r2, pagefault_handler
+    call intregister
+    mov r1, INT_PROTFAULT
+    mov r2, protfault_handler
+    call intregister
+    mov r1, INT_INVALIDOP
+    mov r2, invalidop_handler
+    call intregister
+    mov r1, INT_DIVZERO
+    mov r2, divzero_handler
+    call intregister
+    ret
+
+
+; ==========================
+;   Process termination
+; ==========================
+
+; Turn a process into a zombie with an exit code and wake anything wait()ing on
+; it. Does NOT switch away - the caller decides who runs next. Mirrors the guts of
+; sys_exit_h so a signalled process is reaped through the ordinary wait() path.
+; r1 - PCB pointer
+; r2 - exit code
+proc_terminate:
+    push r4
+    mov r4, r1
+    vstore r4, PCB_EXIT, r2, r0
+    mov r0, PROC_ZOMBIE
+    mov [r4], r0
+    vload r1, r4, PCB_PID         ; waiters block on the child's pid
+    call proc_wakeup
+    pop r4
+    ret
+
+
+; ==========================
+;   Delivering a handler
+; ==========================
+
+; Arrange for a process to run one of its user signal handlers the next time it
+; is resumed, by rewriting its saved interrupt frame and staging a sigreturn.
+; r1 - PCB pointer
+; r2 - signal number (passed to the handler in r1)
+; r3 - handler address (a user vaddr)
+; returns r0 = 1 on success, 0 if the user stack could not be extended (caller
+; should then terminate the process)
+sig_setup_handler:
+    push r4                       ; pcb
+    push r5                       ; frame base (SAVED_SP)
+    push r6                       ; signal number
+    push r7                       ; handler address
+    mov r4, r1
+    mov r6, r2
+    mov r7, r3
+    vload r5, r4, PCB_SAVEDSP
+
+    ; snapshot the current frame so sigreturn can restore it
+    mov r1, r4
+    add r1, PCB_SIGSAVE           ; destination (kernel address)
+    mov r0, r1                    ; cpy destination is r0
+    cpy r5, FRM_SIZE              ; copy the live frame at r5 into the save area
+
+    ; push SIGRETURN_MAGIC onto the user stack: newsp = usersp - 4
+    mov r0, r5
+    add r0, FRM_SP
+    mov r1, [r0]                  ; saved user sp (virtual)
+    sub r1, 4
+    vload r2, r4, PCB_MLEN
+    mov r0, r1
+    add r0, 4                     ; end of the 4-byte slot
+    cmp r0, r2
+    jug .fail                     ; slot past the top of the segment
+    cmp r0, r1
+    jul .fail                     ; wrapped (user sp was < 4) -> no room
+    vload r0, r4, PCB_MBASE
+    add r0, r1                    ; physical address of the slot
+    mov [r0], SIGRETURN_MAGIC     ; the handler's "return address"
+
+    ; retarget the frame: sp below the sentinel, ip = handler, r1 = signum
+    mov r0, r5
+    add r0, FRM_SP
+    mov [r0], r1
+    mov r0, r5
+    add r0, FRM_IP
+    mov [r0], r7
+    mov r0, r5
+    add r0, FRM_R1
+    mov [r0], r6
+
+    mov r0, 1                     ; mark the process as running a handler
+    vstore r4, PCB_SIGINFR, r0, r1
+    mov r0, 1
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Signal dispatch
+; ==========================
+
+; Act on any pending signals for a process about to be resumed. Called by
+; sched_resume with the process's frame reachable via PCB_SAVEDSP.
+;   * ignored signals are discarded;
+;   * a signal with a user handler is delivered (one per resume) unless a handler
+;     is already running, in which case it is left pending (no nesting);
+;   * SIGKILL and default-terminate signals terminate the process.
+; r1 - PCB pointer
+; returns r0 = 1 if the process is still runnable, 0 if it was terminated
+sig_dispatch:
+    push r4                       ; pcb
+    push r5                       ; signal number
+    push r6                       ; pending snapshot
+    push r7                       ; handler disposition
+    mov r4, r1
+    .next:
+    vload r6, r4, PCB_SIGPEND
+    cmp r6, 0
+    je .runnable                  ; nothing pending -> run normally
+    mov r5, 1                     ; find the lowest pending signal (>= 1)
+    .scan:
+        cmp r5, NSIG
+        juge .runnable            ; only reserved/zero bits set -> done
+        mov r0, 1
+        shl r0, r5
+        mov r1, r6
+        and r1, r0
+        cmp r1, 0
+        jne .have
+        add r5, 1
+        jmp .scan
+    .have:
+    cmp r5, SIGKILL
+    je .clearterm                 ; SIGKILL is never caught or ignored
+    mov r0, r4                    ; disposition = PCB_SIGH[signal]
+    add r0, PCB_SIGH
+    mov r1, r5
+    shl r1, 2
+    add r0, r1
+    mov r7, [r0]
+    cmp r7, SIG_IGN
+    je .clearcont                 ; explicitly ignored -> drop it, look for more
+    cmp r7, SIG_DFL
+    jne .user
+    mov r0, 1                     ; default action: terminate or ignore?
+    shl r0, r5
+    and r0, SIG_DFLTERM_MASK
+    cmp r0, 0
+    je .clearcont                 ; default-ignore -> drop it
+    jmp .clearterm                ; default-terminate
+    .user:
+    vload r0, r4, PCB_SIGINFR
+    cmp r0, 0
+    jne .runnable                 ; already in a handler -> defer (stay pending)
+    vload r0, r4, PCB_SIGPEND     ; consume the signal, then deliver it
+    mov r1, 1
+    shl r1, r5
+    not r1
+    and r0, r1
+    vstore r4, PCB_SIGPEND, r0, r2
+    mov r1, r4
+    mov r2, r5
+    mov r3, r7
+    call sig_setup_handler
+    cmp r0, 0
+    je .term                      ; couldn't stage delivery -> kill instead
+    mov r0, 1
+    jmp .done
+    .clearcont:
+    vload r0, r4, PCB_SIGPEND
+    mov r1, 1
+    shl r1, r5
+    not r1
+    and r0, r1
+    vstore r4, PCB_SIGPEND, r0, r2
+    jmp .next
+    .clearterm:
+    vload r0, r4, PCB_SIGPEND
+    mov r1, 1
+    shl r1, r5
+    not r1
+    and r0, r1
+    vstore r4, PCB_SIGPEND, r0, r2
+    .term:
+    mov r1, r4                    ; exit code 128 + signal (shell convention)
+    mov r2, 128
+    add r2, r5
+    call proc_terminate
+    mov r0, 0
+    jmp .done
+    .runnable:
+    mov r0, 1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   CPU-fault handlers
+; ==========================
+; Each is registered as the raw handler for its exception vector. On entry the CPU
+; has already pushed the faulting context as an interrupt frame, so sp points at
+; the frame marker exactly as it does for the syscall dispatcher.
+
+; Common tail: raise signal r1 on the process that faulted in user mode. A fault
+; from kernel mode (or with no current process) is unrecoverable and panics.
+fault_common:
+    di
+    mov r5, r1                    ; signal number
+    mov8 r0, [sp]
+    cmp r0, FRAME_USER
+    jne .kpanic
+    mov r4, [curproc]
+    cmp r4, 0
+    je .kpanic
+    mov r0, sp                    ; this frame is the process's resume point
+    vstore r4, PCB_SAVEDSP, r0, r1
+    vload r0, r4, PCB_SIGINFR     ; a fault *inside* a handler is unrecoverable
+    cmp r0, 0
+    jne .kill
+    mov r0, r4                    ; is there a user handler for this fault?
+    add r0, PCB_SIGH
+    mov r1, r5
+    shl r1, 2
+    add r0, r1
+    mov r0, [r0]
+    cmp r0, SIG_IGN
+    jule .kill                    ; SIG_DFL/SIG_IGN: a fault can't be ignored -> kill
+    mov r1, r4                    ; deliver the handler
+    mov r2, r5
+    mov r3, r0
+    call sig_setup_handler
+    cmp r0, 0
+    je .kill
+    mov r1, r4
+    jmp sched_resume
+    .kill:
+    mov r1, r4                    ; terminate with exit code 128 + signal
+    mov r2, 128
+    add r2, r5
+    call proc_terminate
+    call sched_pick
+    mov r1, r0
+    jmp sched_resume
+    .kpanic:
+    kpanic PANIC_KERNEL_FAULT
+
+
+; Page fault (0x00). Doubles as the sigreturn trap: a handler unwinding to
+; SIGRETURN_MAGIC lands here, and we restore the pre-signal frame instead of
+; treating it as a real access violation.
+pagefault_handler:
+    di
+    mov8 r0, [sp]
+    cmp r0, FRAME_USER
+    jne .real                     ; kernel-mode fault -> real (panics)
+    mov r4, [curproc]
+    cmp r4, 0
+    je .real
+    vload r0, r4, PCB_SIGINFR
+    cmp r0, 0
+    je .real                      ; not in a handler -> a genuine fault
+    mov r0, sp
+    add r0, FRM_IP
+    mov r0, [r0]
+    cmp r0, SIGRETURN_MAGIC
+    jne .real                     ; faulted somewhere else -> a genuine fault
+    ; ---- sigreturn: restore the frame saved at delivery ----
+    mov r1, r4
+    add r1, PCB_SIGSAVE           ; source
+    mov r0, sp                    ; cpy destination is r0 (the live frame)
+    cpy r1, FRM_SIZE
+    mov r0, 0
+    vstore r4, PCB_SIGINFR, r0, r1
+    mov r0, sp
+    vstore r4, PCB_SAVEDSP, r0, r1
+    mov r1, r4                    ; resume (re-checks pending, delivers any deferred)
+    jmp sched_resume
+    .real:
+    mov r1, SIGSEGV
+    jmp fault_common
+
+; Protection fault (0x03): a privileged instruction attempted from user mode.
+protfault_handler:
+    mov r1, SIGSEGV
+    jmp fault_common
+
+; Invalid instruction (0x01).
+invalidop_handler:
+    mov r1, SIGILL
+    jmp fault_common
+
+; Divide by zero (0x02).
+divzero_handler:
+    mov r1, SIGFPE
+    jmp fault_common
+
+
+; Tail of sysret for user-mode callers (jumped to from syscall.cat, sp still at
+; the caller's frame, saved r0 already patched). Delivers any pending signals
+; before returning to user by funnelling through the same gate every resume uses,
+; so a signal raised during the syscall - including one a process sent itself -
+; runs before control reaches the instruction after `syscall`. Never returns.
+sysret_user:
+    mov r2, [curproc]
+    cmp r2, 0
+    je .plain                     ; no process context -> ordinary return
+    mov r0, sp                    ; the caller's frame is its resume point
+    vstore r2, PCB_SAVEDSP, r0, r1
+    mov r1, r2
+    jmp sched_resume
+    .plain:
+    iret
+
+
+; ==========================
+;   Signal syscalls
+; ==========================
+; Reached from syscall_handler (syscall.cat) with the caller's frame still at sp,
+; so results are returned through sysret like any other syscall.
+
+; SYS_SIGNAL: r2 = signal number, r3 = disposition (SIG_DFL, SIG_IGN or a handler
+; vaddr). Installs it for the caller and returns the previous disposition, or -1
+; for an out-of-range signal or an attempt to catch SIGKILL.
+sys_signal_h:
+    cmp r2, 1
+    jul .fail
+    cmp r2, NSIG
+    juge .fail
+    cmp r2, SIGKILL
+    je .fail                      ; SIGKILL cannot be caught or ignored
+    mov r4, [curproc]
+    mov r0, r4
+    add r0, PCB_SIGH
+    mov r1, r2
+    shl r1, 2
+    add r0, r1                    ; &PCB_SIGH[signal]
+    mov r1, [r0]                  ; previous disposition
+    mov [r0], r3                  ; install the new one
+    mov r0, r1
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_KILL: r2 = target pid, r3 = signal number. Marks the signal pending on the
+; target; a blocked target is made runnable so the signal can be delivered.
+; Returns 0 on success, -1 for a bad signal or unknown/dead pid.
+sys_kill_h:
+    cmp r3, 1
+    jul .fail
+    cmp r3, NSIG
+    juge .fail
+    mov r4, proctable
+    mov r5, 0
+    .scan:
+        cmp r5, MAX_PROCS
+        juge .fail
+        mov r0, [r4]              ; PCB_STATE
+        cmp r0, PROC_FREE
+        je .nextp
+        cmp r0, PROC_ZOMBIE
+        je .nextp                 ; can't signal a dead process
+        vload r0, r4, PCB_PID
+        cmp r0, r2
+        je .found
+        .nextp:
+        add r4, PCB_STRUCT
+        add r5, 1
+        jmp .scan
+    .found:
+    vload r0, r4, PCB_SIGPEND     ; set the pending bit
+    mov r1, 1
+    shl r1, r3
+    or r0, r1
+    vstore r4, PCB_SIGPEND, r0, r1
+    mov r0, [r4]                  ; wake a blocked target so it can take the signal
+    cmp r0, PROC_BLOCKED
+    jne .nowake
+    mov r0, PROC_READY
+    mov [r4], r0
+    mov r0, 0
+    vstore r4, PCB_CHAN, r0, r1
+    .nowake:
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret

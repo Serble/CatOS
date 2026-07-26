@@ -1,0 +1,315 @@
+; ==========================
+;   CatOS disk driver
+; ==========================
+; Blocking block-level access to a disk device (type 0x96818B9A), plus the
+; "block-backed file" abstraction that turns a block range into a byte
+; addressable read/write file. Both /dev/diskN (the whole disk) and /sys (the
+; kernel partition, via rawfs) are block-backed files, so they share one
+; read/write implementation here.
+;
+; The disk is asynchronous: a read/write is issued over the serial port and the
+; device raises interrupt 0x72 when it finishes. We register a handler with the
+; interrupt manager that sets a "ready" flag, and the blocking helpers spin on
+; that flag with interrupts enabled (exactly like the firmware does).
+;
+; Requires: ints.cat (int_prologue/epilogue, intregister), vfs.cat, heapalloc.
+; The whole-disk extent used for /dev/diskN comes from bootdev.cat
+; (disk_extent_blocks), which parses the partition table.
+
+#define DISK_TYPE, 0x96818B9A    ; disk device type
+#define DISK_READ, 1             ; read command
+#define DISK_WRITE, 2            ; write command
+#define INT_DISK, 0x72           ; disk-operation-finished interrupt
+#define BLOCK_SIZE, 512
+#define BLOCK_SHIFT, 9           ; log2(BLOCK_SIZE)
+
+; block-backed file descriptor (stored in a node's NODE_FSDATA)
+#define BF_PORT, 0               ; disk serial port
+#define BF_BASE, 4               ; first block of the region
+#define BF_COUNT, 8              ; region length in blocks
+#define BF_STRUCT, 12
+
+
+disk_ready:
+    d32 0                        ; set by the ISR when an op completes
+disk_bounce:
+    res8 BLOCK_SIZE              ; scratch block for partial read/modify/write
+disk_namebuf:
+    dstr "disk0\0"               ; /dev name; the final digit is patched per unit
+
+
+; Interrupt 0x72 handler: mark the pending disk op complete.
+disk_isr:
+    int_prologue
+    mov r0, 1
+    mov [disk_ready], r0
+    int_epilogue
+
+
+; Register the disk interrupt handler. Call once at boot (after intinit).
+diskinit:
+    mov r1, INT_DISK
+    mov r2, disk_isr
+    call intregister
+    ret
+
+
+; Wait for the in-flight disk op to complete. Interrupts must be able to fire.
+disk_wait:
+    ei                           ; the completion interrupt must be deliverable
+    .loop:
+        mov r0, [disk_ready]
+        cmp r0, 0
+        je .loop
+    ret
+
+
+; Read one 512-byte block into memory (blocking).
+; r1 - disk port, r2 - destination address, r3 - absolute block number
+disk_readblock:
+    push r4
+    mov r4, r1
+    mov r0, 0
+    mov [disk_ready], r0
+    out r4, DISK_READ
+    out r4, r2                   ; memory address
+    out r4, r3                   ; start block
+    out r4, 1                    ; block count
+    call disk_wait
+    pop r4
+    ret
+
+
+; Write one 512-byte block from memory (blocking).
+; r1 - disk port, r2 - source address, r3 - absolute block number
+disk_writeblock:
+    push r4
+    mov r4, r1
+    mov r0, 0
+    mov [disk_ready], r0
+    out r4, DISK_WRITE
+    out r4, r2
+    out r4, r3
+    out r4, 1
+    call disk_wait
+    pop r4
+    ret
+
+
+; Allocate a block-backed-file descriptor.
+; r1 - port, r2 - base block, r3 - block count
+; returns r0 = descriptor, or 0 on OOM
+bf_new:
+    push r4
+    push r5
+    push r6
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    mov r1, BF_STRUCT
+    call heapalloc
+    cmp r0, 0
+    je .done
+    vstore r0, BF_PORT, r4, r1
+    vstore r0, BF_BASE, r5, r1
+    vstore r0, BF_COUNT, r6, r1
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; read(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes read
+; Byte-addressed read over the descriptor's block range, via the bounce block.
+blkfile_read:
+    push r4                      ; descriptor
+    push r5                      ; byte offset
+    push r6                      ; destination buffer
+    push r7                      ; bytes remaining
+    vload r4, r1, NODE_FSDATA
+    mov r5, r2
+    mov r6, r3
+    mov r7, sp
+    add r7, 20
+    mov r7, [r7]
+
+    vload r0, r4, BF_COUNT       ; total bytes = count * 512
+    shl r0, BLOCK_SHIFT
+    cmp r5, r0
+    juge .zero
+    sub r0, r5
+    cmp r7, r0
+    jule .lenok
+    mov r7, r0                   ; clamp to what's left
+    .lenok:
+    cmp r7, 0
+    je .zero
+    push r7                      ; remember total to return
+
+    .cploop:
+        cmp r7, 0
+        je .doneloop
+        vload r1, r4, BF_PORT     ; read the block containing the cursor
+        mov r2, disk_bounce
+        mov r3, r5
+        shr r3, BLOCK_SHIFT
+        vload r0, r4, BF_BASE
+        add r3, r0
+        call disk_readblock
+        mov r2, r5               ; blkoff = off & 511
+        and r2, BLOCK_SIZE - 1
+        mov r3, BLOCK_SIZE       ; n = min(remaining, 512 - blkoff)
+        sub r3, r2
+        cmp r3, r7
+        jule .nok
+        mov r3, r7
+        .nok:
+        mov r0, r6               ; copy bounce+blkoff -> buf
+        mov r1, disk_bounce
+        add r1, r2
+        cpy r1, r3
+        add r5, r3
+        add r6, r3
+        sub r7, r3
+        jmp .cploop
+    .doneloop:
+    pop r0                       ; total copied
+    jmp .done
+    .zero:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; write(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes written
+; Read-modify-write each touched block so partial writes are preserved.
+blkfile_write:
+    push r4                      ; descriptor
+    push r5                      ; byte offset
+    push r6                      ; source buffer
+    push r7                      ; bytes remaining
+    vload r4, r1, NODE_FSDATA
+    mov r5, r2
+    mov r6, r3
+    mov r7, sp
+    add r7, 20
+    mov r7, [r7]
+
+    vload r0, r4, BF_COUNT
+    shl r0, BLOCK_SHIFT
+    cmp r5, r0
+    juge .zero
+    sub r0, r5
+    cmp r7, r0
+    jule .lenok
+    mov r7, r0
+    .lenok:
+    cmp r7, 0
+    je .zero
+    push r7                      ; total to return
+
+    .cploop:
+        cmp r7, 0
+        je .doneloop
+        vload r1, r4, BF_PORT     ; read current block (read-modify-write)
+        mov r2, disk_bounce
+        mov r3, r5
+        shr r3, BLOCK_SHIFT
+        vload r0, r4, BF_BASE
+        add r3, r0
+        call disk_readblock
+        mov r2, r5               ; blkoff, n
+        and r2, BLOCK_SIZE - 1
+        mov r3, BLOCK_SIZE
+        sub r3, r2
+        cmp r3, r7
+        jule .nok
+        mov r3, r7
+        .nok:
+        mov r0, disk_bounce      ; overlay buf -> bounce+blkoff
+        add r0, r2
+        mov r1, r6
+        cpy r1, r3
+        vload r1, r4, BF_PORT     ; write the block back
+        mov r2, disk_bounce
+        push r3                  ; keep n across the write
+        mov r3, r5
+        shr r3, BLOCK_SHIFT
+        vload r0, r4, BF_BASE
+        add r3, r0
+        call disk_writeblock
+        pop r3
+        add r5, r3
+        add r6, r3
+        sub r7, r3
+        jmp .cploop
+    .doneloop:
+    pop r0
+    jmp .done
+    .zero:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; truncate: a physical region can't be resized, so this is a no-op success.
+blkfile_trunc:
+    mov r0, 0
+    ret
+
+
+; Driver bind routine for disks: publish the whole disk as /dev/diskN.
+; r1 - port, r2 - unit index
+disk_bind:
+    push r4                      ; port
+    push r5                      ; unit
+    push r6                      ; descriptor
+    mov r4, r1
+    mov r5, r2
+
+    mov r0, r5                   ; patch the trailing digit of "disk0"
+    add r0, 48                   ; '0' + unit (unit assumed < 10)
+    mov r1, disk_namebuf
+    add r1, 4
+    mov8 [r1], r0
+
+    mov r1, r4                   ; whole-disk descriptor (base 0, full extent)
+    mov r2, 0
+    mov r3, [disk_extent_blocks]
+    call bf_new
+    cmp r0, 0
+    je .done
+    mov r6, r0
+
+    mov r1, disk_namebuf
+    mov r2, NODE_BLOCKDEV
+    mov r3, blkfile_ops
+    push r6                      ; fsdata = descriptor
+    call devfs_add
+    add sp, 4
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+blkfile_ops:
+    d32 0                        ; OP_LOOKUP
+    d32 blkfile_read             ; OP_READ
+    d32 blkfile_write            ; OP_WRITE
+    d32 0                        ; OP_CREATE
+    d32 0                        ; OP_REMOVE
+    d32 0                        ; OP_READDIR
+    d32 blkfile_trunc            ; OP_TRUNCATE
+    d32 0                        ; OP_STAT
+    d32 0                        ; OP_SYNC

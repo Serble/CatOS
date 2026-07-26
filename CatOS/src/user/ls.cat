@@ -1,0 +1,64 @@
+; ls - list the entries of a directory. With no argument it lists "/"; otherwise
+; it lists the directory named by argv[1]. Each name is written to stdout on its
+; own line. Uses the readdir syscall, which fills the buffer with one
+; null-terminated entry name per call (returns 1 per entry, 0 at the end).
+#include "sys.cat"
+
+main:
+    mov r5, r1                       ; argc (survives syscalls)
+    cmp r5, 2                        ; argv[1] if given, else the root path
+    jul .default
+    mov r1, r2                       ; argv[1] -> path pointer
+    add r1, 4
+    mov r1, [r1]
+    jmp .haspath
+.default:
+    mov r1, rootpath
+.haspath:
+    sys_open r1, O_READ
+    mov r6, r0                       ; dir fd (survives syscalls)
+    cmp r6, -1
+    je .fail
+
+.read:
+    sys_readdir r6, namebuf, 64
+    cmp r0, 1
+    jne .readdone
+    mov r1, namebuf
+    call strlen
+    sys_write 1, namebuf, r0
+    sys_write 1, newline, 1
+    jmp .read
+.readdone:
+    sys_close r6
+    sys_exit 0
+
+.fail:
+    sys_write 1, errmsg, errmsg_end - errmsg
+    sys_exit 1
+
+
+; strlen(r1) -> r0 = length excluding the terminator. Leaves r1 untouched.
+strlen:
+    mov r0, 0
+    mov r2, r1
+    .sl:
+        mov8 r3, [r2]
+        cmp r3, 0
+        je .sldone
+        add r0, 1
+        add r2, 1
+        jmp .sl
+    .sldone:
+    ret
+
+
+rootpath:
+    dstr "/\0"
+newline:
+    dstr "\n"
+errmsg:
+    dstr "ls: cannot open directory\n"
+errmsg_end:
+namebuf:
+    res8 64

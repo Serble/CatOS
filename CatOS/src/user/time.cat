@@ -1,0 +1,235 @@
+; time - run a command and report its exit code and how long it took.
+;
+; Usage (from the shell):  time <command> [args...]
+;
+; It resolves <command> as /bin/<command> (like the shell does), spawns it with
+; the remaining tokens as argv, and waits for it to finish. Wall-clock duration is
+; measured with the CPU's `uptms` instruction (uptime in milliseconds, returned as
+; a 64-bit value in r1:r0) sampled either side of the spawn+wait, so the reported
+; figure covers the whole lifetime of the child. Results are printed to stdout as
+; decimal via a small 64-bit itoa, e.g.:
+;
+;   exit=0
+;   time=1234 ms
+;
+#include "sys.cat"
+
+#define OBUFLEN, 24                  ; enough for any 64-bit value in decimal
+#define PATHBUF, 64                  ; "/bin/" + command name
+
+main:
+    mov r5, r1                       ; argc  (r5-r7 survive syscalls)
+    mov r6, r2                       ; argv
+    cmp r5, 2
+    jil .usage                       ; need at least: time <command>
+
+    mov r1, r6                       ; r1 = argv[1] = the command name
+    add r1, 4
+    mov r1, [r1]
+    call buildpath                   ; pathbuf = "/bin/" + argv[1]
+
+    uptms                            ; start = r1:r0 (hi:lo) milliseconds
+    mov [start_lo], r0
+    mov [start_hi], r1
+
+    mov r3, r6                       ; child argv = &argv[1] (already null-terminated,
+    add r3, 4                        ; so argv[0] for the child is the command name)
+    mov r2, pathbuf
+    mov r1, SYS_SPAWN
+    syscall
+    cmp r0, -1
+    je .spawnfail
+
+    mov r2, r0                       ; wait for the child; r0 = its exit code
+    mov r1, SYS_WAIT
+    syscall
+    mov r7, r0                       ; exit code (survives the timing syscalls)
+
+    uptms                            ; end = r1:r0 (hi:lo)
+    mov r2, [start_lo]
+    mov r3, [start_hi]
+    ; Keep the elapsed value in r5/r6 (and the exit code in r7): sys_write and
+    ; putu64 both clobber r1-r4, but leave r5-r7 untouched.
+    mov r6, r0                       ; diff_lo = end_lo - start_lo
+    sub r6, r2
+    mov r5, r1                       ; diff_hi = end_hi - start_hi (- borrow)
+    sub r5, r3
+    cmp r0, r2                       ; borrow out of the low word?
+    juge .noborrow
+    sub r5, 1
+.noborrow:
+
+    sys_write 1, msg_exit, msg_exit_end - msg_exit
+    mov r1, 0                        ; exit code is 32-bit: high word = 0
+    mov r2, r7
+    call putu64
+    sys_write 1, newline, 1
+
+    sys_write 1, msg_time, msg_time_end - msg_time
+    mov r1, r5                       ; elapsed = diff_hi:diff_lo
+    mov r2, r6
+    call putu64
+    sys_write 1, msg_ns, msg_ns_end - msg_ns
+
+    sys_exit 0
+
+.usage:
+    sys_write 1, msg_usage, msg_usage_end - msg_usage
+    sys_exit 1
+
+.spawnfail:
+    sys_write 1, msg_fail, msg_fail_end - msg_fail
+    sys_exit 1
+
+
+; buildpath(r1) - write pathbuf = "/bin/" + the null-terminated name at r1.
+; Preserves r6/r7 (argc/argv); uses r4/r5 as cursors.
+buildpath:
+    push r4
+    push r5
+    mov r4, pathbuf                  ; write cursor
+    mov r5, binprefix                ; read cursor
+    .pre:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .predone
+        mov8 [r4], r0
+        add r4, 1
+        add r5, 1
+        jmp .pre
+    .predone:
+    mov r5, r1                       ; append the name, including its terminator
+    .name:
+        mov8 r0, [r5]
+        mov8 [r4], r0
+        cmp r0, 0
+        je .namedone
+        add r4, 1
+        add r5, 1
+        jmp .name
+    .namedone:
+    pop r5
+    pop r4
+    ret
+
+
+; putu64(r1 = high word, r2 = low word) - print the 64-bit value as decimal to
+; stdout. Generates digits least-significant-first into numbuf (filled from the
+; back) by repeated division by 10, then writes them out. Preserves r4-r7.
+putu64:
+    push r4                          ; write cursor
+    push r5                          ; digit count
+    mov [v_hi], r1
+    mov [v_lo], r2
+    mov r4, numbuf
+    add r4, OBUFLEN                  ; one past the end; digits are pre-decremented in
+    mov r5, 0
+    .dloop:
+        call div10                   ; v_hi:v_lo /= 10, r0 = remainder digit
+        add r0, 48                   ; '0'
+        sub r4, 1
+        mov8 [r4], r0
+        add r5, 1
+        mov r0, [v_hi]               ; stop once the value reaches zero
+        mov r1, [v_lo]
+        or r0, r1
+        cmp r0, 0
+        jne .dloop
+    mov r3, r4                       ; write(1, ptr=r4, len=r5)
+    mov r4, r5
+    mov r2, 1
+    mov r1, SYS_WRITE
+    syscall
+    pop r5
+    pop r4
+    ret
+
+
+; div10 - divide the 64-bit value in v_hi:v_lo by 10 in place, returning the
+; remainder (0-9) in r0. Works one 16-bit limb at a time from most significant to
+; least so the running (rem<<16 | limb) never overflows 32 bits. Clobbers r0-r3.
+div10:
+    mov r0, 0
+    mov [v_rem], r0
+    mov r1, [v_hi]                   ; limb a = v_hi >> 16
+    shr r1, 16
+    mov r0, [v_rem]
+    shl r0, 16
+    or r0, r1
+    mov r2, 10
+    udiv r0, r2                      ; r0 = quotient, r2 = remainder
+    mov [v_rem], r2
+    mov [v_qa], r0
+    mov r1, [v_hi]                   ; limb b = v_hi & 0xFFFF
+    and r1, 0xFFFF
+    mov r0, [v_rem]
+    shl r0, 16
+    or r0, r1
+    mov r2, 10
+    udiv r0, r2
+    mov [v_rem], r2
+    mov r1, [v_qa]                   ; v_hi = (q_a << 16) | q_b
+    shl r1, 16
+    or r1, r0
+    mov [v_hi], r1
+    mov r1, [v_lo]                   ; limb c = v_lo >> 16
+    shr r1, 16
+    mov r0, [v_rem]
+    shl r0, 16
+    or r0, r1
+    mov r2, 10
+    udiv r0, r2
+    mov [v_rem], r2
+    mov [v_qa], r0
+    mov r1, [v_lo]                   ; limb d = v_lo & 0xFFFF
+    and r1, 0xFFFF
+    mov r0, [v_rem]
+    shl r0, 16
+    or r0, r1
+    mov r2, 10
+    udiv r0, r2
+    mov [v_rem], r2
+    mov r1, [v_qa]                   ; v_lo = (q_c << 16) | q_d
+    shl r1, 16
+    or r1, r0
+    mov [v_lo], r1
+    mov r0, [v_rem]
+    ret
+
+
+msg_usage:
+    dstr "usage: time <command> [args...]\n"
+msg_usage_end:
+msg_fail:
+    dstr "time: could not start command\n"
+msg_fail_end:
+msg_exit:
+    dstr "exit="
+msg_exit_end:
+msg_time:
+    dstr "time="
+msg_time_end:
+msg_ns:
+    dstr " ms\n"
+msg_ns_end:
+newline:
+    dstr "\n"
+binprefix:
+    dstr "/bin/\0"
+
+v_hi:
+    res32 1
+v_lo:
+    res32 1
+v_rem:
+    res32 1
+v_qa:
+    res32 1
+start_lo:
+    res32 1
+start_hi:
+    res32 1
+numbuf:
+    res8 OBUFLEN
+pathbuf:
+    res8 PATHBUF

@@ -1,0 +1,337 @@
+; ==========================
+;   CatOS program loading (exec / spawn)
+; ==========================
+; Turns a program *file* into a running process. proc.cat can already build a
+; process from an image in kernel memory (proc_create); this file supplies that
+; image by reading a flat binary out of the VFS.
+;
+; The model is "spawn = load fresh": there is no fork/copy-on-write. A caller
+; names a path; the kernel reads the whole file into a scratch buffer, hands it
+; to proc_create (which carves a fresh segment + kernel stack and makes it
+; runnable), and returns the new pid. Combined with SYS_WAIT this is all an
+; init/supervisor process needs to launch and relaunch its children.
+;
+; Every program lives on the root filesystem under /bin (populated by the host
+; tools). proc_spawn takes a kernel-space path and is called both by the kernel
+; at boot (to start idle and init) and by the SYS_SPAWN handler on behalf of a
+; user process (after copying its path argument in from user space).
+
+
+#define SPAWN_MAX_ARGS, 8       ; argv entries a spawn can carry
+#define SPAWN_ARGBUF, 512       ; total bytes for all argv strings
+
+; scratch buffer for copying a syscall's path argument out of user space
+spawn_pathbuf:
+    res8 VFS_PATH_MAX
+
+; argv staging: filled from the parent's address space, then written into the
+; child's segment. Single-threaded kernel, so plain globals are fine.
+spawn_argc:
+    d32 0
+spawn_argptrs:                  ; kernel pointer to each arg string in spawn_argbuf
+    res8 SPAWN_MAX_ARGS * 4
+spawn_arglen:                   ; length (incl. terminator) of each arg string
+    res8 SPAWN_MAX_ARGS * 4
+spawn_argbuf:
+    res8 SPAWN_ARGBUF
+; scratch scalars used while laying argv into the child
+spawn_argvbase:
+    d32 0
+spawn_curstr:
+    d32 0
+
+
+; Load a flat binary from a path and create a runnable process from it.
+; r1 - path (kernel address)
+; returns r0 = PCB pointer, or 0 on failure
+proc_spawn:
+    push r4                      ; handle
+    push r5                      ; file size
+    push r6                      ; scratch buffer
+    push r7                      ; bytes read so far
+    mov r2, O_READ
+    call vfsopen
+    cmp r0, -1
+    je .failopen
+    mov r4, r0
+
+    mov r1, r4                   ; size = seek to end
+    mov r2, 0
+    mov r3, SEEK_END
+    call vfsseek
+    cmp r0, 0
+    jile .failclose              ; empty file or error
+    mov r5, r0
+
+    mov r1, r4                   ; rewind to the start
+    mov r2, 0
+    mov r3, SEEK_SET
+    call vfsseek
+
+    mov r1, r5                   ; scratch buffer for the whole image
+    call heapalloc
+    cmp r0, 0
+    je .failclose
+    mov r6, r0
+
+    mov r7, 0                    ; read the file in full (may take >1 call)
+    .rl:
+        cmp r7, r5
+        juge .rdone
+        mov r1, r4
+        mov r2, r6
+        add r2, r7
+        mov r3, r5
+        sub r3, r7
+        call vfsread
+        cmp r0, 0
+        jile .rdone              ; error or premature EOF
+        add r7, r0
+        jmp .rl
+    .rdone:
+    mov r1, r4
+    call vfsclose
+    cmp r7, r5
+    jne .failbuf                 ; short read -> refuse to run a partial image
+
+    mov r1, r6                   ; build the process (spawned procs are unnamed)
+    mov r2, r5
+    mov r3, 0
+    call proc_create
+
+    push r0                      ; free the scratch buffer, keep the result
+    mov r1, r6
+    call heapfree
+    pop r0
+    jmp .done
+
+    .failbuf:
+    mov r1, r6
+    call heapfree
+    mov r0, 0
+    jmp .done
+    .failclose:
+    mov r1, r4
+    call vfsclose
+    .failopen:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Length of a null-terminated string, INCLUDING the terminator.
+; r1 - string -> r0 = length
+spawn_strlen:
+    mov r0, 0
+    .loop:
+        mov8 r2, [r1]
+        add r0, 1
+        cmp r2, 0
+        je .done
+        add r1, 1
+        jmp .loop
+    .done:
+    ret
+
+
+; Parse a user-space argv array (a null-terminated array of user string
+; pointers) into the spawn_* staging globals, copying each string into the
+; kernel. Runs while curproc is still the parent.
+; r1 - user argv pointer (0 = no arguments)
+; returns r0 = argc, or -1 on a bad pointer / overflow
+spawn_parseargv:
+    push r4                      ; user argv pointer
+    push r5                      ; argc / index
+    push r6                      ; kernel write cursor in spawn_argbuf
+    push r7                      ; current arg string pointer
+    mov r0, 0
+    mov [spawn_argc], r0
+    cmp r1, 0
+    je .zero
+    mov r4, r1
+    mov r5, 0
+    mov r6, spawn_argbuf
+    .loop:
+        cmp r5, SPAWN_MAX_ARGS
+        juge .done
+        mov r1, r5               ; user address of argv[r5]
+        shl r1, 2
+        add r1, r4
+        mov r2, 4                ; translate + bounds-check the 4-byte slot
+        call uaddr
+        cmp r0, 0
+        je .fault
+        mov r7, [r0]             ; argv[r5] (a user string pointer)
+        cmp r7, 0
+        je .done                 ; null terminator ends the array
+        mov r1, r7               ; copy the string into spawn_argbuf at r6
+        mov r2, r6
+        mov r3, spawn_argbuf
+        add r3, SPAWN_ARGBUF
+        sub r3, r6               ; remaining capacity
+        call copyinstr
+        cmp r0, 0
+        jne .fault
+        mov r0, r5               ; record ptr + length for this arg
+        shl r0, 2
+        mov r1, spawn_argptrs
+        add r1, r0
+        mov [r1], r6
+        mov r1, r6
+        call spawn_strlen        ; r0 = length incl. terminator
+        mov r1, r5
+        shl r1, 2
+        mov r2, spawn_arglen
+        add r2, r1
+        mov [r2], r0
+        add r6, r0               ; advance the buffer cursor
+        add r5, 1
+        jmp .loop
+    .done:
+    mov [spawn_argc], r5
+    mov r0, r5
+    jmp .ret
+    .zero:
+    mov r0, 0
+    jmp .ret
+    .fault:
+    mov r0, -1
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Lay the staged argv into a freshly created child and patch its initial frame
+; so it starts with r1 = argc, r2 = argv (a child virtual address) and its user
+; stack just below the argv block. No-op if there were no arguments.
+; r1 - child PCB pointer
+spawn_setargs:
+    push r4                      ; pcb
+    push r5                      ; segment base
+    push r6                      ; argc
+    push r7                      ; loop index
+    mov r4, r1
+    mov r6, [spawn_argc]
+    cmp r6, 0
+    je .none
+    vload r5, r4, PCB_MBASE
+
+    ; block size = pointer array (argc+1 words) + all string bytes, 4-aligned
+    mov r0, r6
+    add r0, 1
+    shl r0, 2
+    mov r7, 0
+    .sum:
+        cmp r7, r6
+        juge .sumdone
+        mov r1, r7
+        shl r1, 2
+        add r1, spawn_arglen
+        mov r1, [r1]
+        add r0, r1
+        add r7, 1
+        jmp .sum
+    .sumdone:
+    add r0, 3
+    and r0, -4                   ; block size, rounded up to 4
+    vload r1, r4, PCB_MLEN
+    sub r1, r0                   ; argv block sits at the top of the segment
+    and r1, -4
+    mov [spawn_argvbase], r1
+    mov r0, r6                   ; strings begin after the pointer array
+    add r0, 1
+    shl r0, 2
+    add r0, r1
+    mov [spawn_curstr], r0
+
+    mov r7, 0                    ; write each arg: pointer slot + string bytes
+    .wr:
+        cmp r7, r6
+        juge .wrdone
+        mov r0, [spawn_argvbase] ; argv[r7] slot -> child vaddr of the string
+        mov r1, r7
+        shl r1, 2
+        add r0, r1
+        add r0, r5               ; physical address of the slot
+        mov r1, [spawn_curstr]
+        mov [r0], r1
+        mov r0, r5               ; copy the string into the child's segment
+        mov r1, [spawn_curstr]
+        add r0, r1               ; destination physical (cpy dest = r0)
+        mov r1, r7
+        shl r1, 2
+        mov r2, r1
+        add r1, spawn_argptrs
+        mov r1, [r1]             ; source kernel pointer
+        add r2, spawn_arglen
+        mov r2, [r2]             ; length
+        cpy r1, r2
+        mov r0, [spawn_curstr]   ; advance the string cursor
+        add r0, r2
+        mov [spawn_curstr], r0
+        add r7, 1
+        jmp .wr
+    .wrdone:
+    mov r0, [spawn_argvbase]     ; null-terminate the pointer array
+    mov r1, r6
+    shl r1, 2
+    add r0, r1
+    add r0, r5
+    mov [r0], 0
+
+    ; patch the child's initial user frame: r1 = argc, r2 = argv, sp = block base
+    vload r0, r4, PCB_SAVEDSP
+    mov r1, r0
+    add r1, FRM_R1
+    mov [r1], r6
+    mov r1, [spawn_argvbase]
+    mov r2, r0
+    add r2, FRM_R2
+    mov [r2], r1
+    mov r2, r0
+    add r2, FRM_SP
+    mov [r2], r1
+    .none:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; SYS_SPAWN handler: r2 = path (user pointer), r3 = argv (user pointer, 0 for
+; none). Loads the program, passes it its arguments, and starts it as a child of
+; the caller (proc_create records curproc as the parent). Returns the child's
+; pid, or -1. Does not switch - the parent keeps running and typically follows
+; up with SYS_WAIT.
+sys_spawn_h:
+    mov r4, r3                   ; save argv pointer (copyinstr clobbers r3)
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, r4                   ; parse the arguments (still in the parent)
+    call spawn_parseargv
+    cmp r0, -1
+    je .fail
+    mov r1, spawn_pathbuf        ; load the program
+    call proc_spawn
+    cmp r0, 0
+    je .fail
+    mov r5, r0                   ; child pcb
+    mov r1, r5                   ; install argv into the child
+    call spawn_setargs
+    vload r0, r5, PCB_PID
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret

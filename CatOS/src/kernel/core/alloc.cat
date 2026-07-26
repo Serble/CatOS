@@ -218,6 +218,30 @@ allocpages:
     ret
 
 
+; free a run of pages previously handed out by allocpages/allocpage.
+; r1 - base address (page aligned)
+; r2 - page count
+freepages:
+    push r4                      ; pages remaining
+    push r5                      ; current page index
+    mov r5, r1
+    shr r5, PAGE_SHIFT_FAC       ; base address -> page index
+    mov r4, r2
+    .loop:
+        cmp r4, 0
+        je .done
+        mov r1, r5
+        mov r2, 0
+        call setpageused
+        add r5, 1
+        sub r4, 1
+        jmp .loop
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
 ; gets the base memory address for a page
 ; r1 - page index
 getpagebase:

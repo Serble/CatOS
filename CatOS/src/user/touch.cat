@@ -1,0 +1,32 @@
+; touch - create a file if it does not already exist, leaving an existing file
+; (and its contents) untouched. There is no cwd, so the path is absolute.
+; Opening with O_CREATE + O_WRITE (no O_TRUNC) creates the file when missing and
+; succeeds without modifying it when present; we just close it again.
+#include "sys.cat"
+
+main:
+    mov r5, r1                       ; argc
+    cmp r5, 2
+    jul .usage
+    mov r1, r2                       ; argv[1] -> path
+    add r1, 4
+    mov r1, [r1]
+    sys_open r1, O_WRITE + O_CREATE
+    cmp r0, -1
+    je .fail
+    sys_close r0
+    sys_exit 0
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+.fail:
+    sys_write 1, failmsg, failmsg_end - failmsg
+    sys_exit 1
+
+usage:
+    dstr "usage: touch <file>\n"
+usage_end:
+failmsg:
+    dstr "touch: cannot create file\n"
+failmsg_end:

@@ -1,0 +1,1585 @@
+; ==========================
+;   CatOS virtual file system
+; ==========================
+; The VFS is the kernel's single abstract view of every file, directory and
+; device in the system. Callers never talk to a concrete filesystem (a disk
+; format, an in-memory tree, the device tree) directly; they talk to the VFS,
+; and the VFS forwards each request to whichever driver is mounted at that
+; point in the tree. This is what lets "/dev/disk0", "/tmp/scratch" and
+; "/boot/kernel.bin" all be read with the same handful of calls.
+;
+;
+; -- Two layers -------------------------------------------------------------
+;
+;   1. The VFS core (this file). Generic, filesystem-agnostic. Owns the node
+;      cache, the mount table, path resolution and the open-handle table.
+;
+;   2. Filesystem drivers. Each concrete filesystem (ramfs, diskfs, devfs)
+;      supplies a vtable of function pointers implementing the operations the
+;      core calls into. The core never assumes anything about a driver's on-
+;      backing-store layout; it only ever calls through the vtable.
+;
+;
+; -- Nodes ("everything is a node") ----------------------------------------
+;
+; A node is the in-memory handle for one filesystem object. Nodes are
+; allocated from the kernel heap (see heapalloc) and reference counted, so a
+; node stays live for as long as anything is using it (an open handle, a
+; child pointing at its parent, an active mount) and is freed once the last
+; reference is dropped. The core keeps resolved nodes cached so repeated
+; lookups of the same path don't hit the driver every time.
+;
+; Proposed node layout (all fields 32 bit unless noted; offsets to be fixed
+; when the struct is implemented):
+;
+;   +0   type      NODE_FILE / NODE_DIR / NODE_CHARDEV / NODE_BLOCKDEV /
+;                  NODE_SYMLINK / NODE_MOUNT
+;   +4   flags     read-only, hidden, dirty, etc. (bitfield)
+;   +8   size      logical size in bytes (files) / entry count (dirs)
+;   +12  refcount  live references; node is freed when this hits 0
+;   +16  ops       pointer to the owning driver's vtable (see below)
+;   +20  fsdata    driver-private pointer (inode number, ram buffer, ...)
+;   +24  mount     pointer to a mount overlaying this node, 0 if none
+;   +28  parent    pointer to the parent directory node
+;   +32  name      pointer to the node's name string (owned by the node)
+;
+;
+; -- Driver vtable ----------------------------------------------------------
+;
+; Every driver publishes a table of operation entry points. The core loads a
+; node's `ops` pointer and calls the slot it needs. A driver may leave a slot
+; 0 to mean "unsupported", in which case the core returns an error. Proposed
+; slots (each a 32 bit code address):
+;
+;   +0   lookup    (dirnode, name)          -> child node or 0
+;   +4   read      (node, offset, buf, len) -> bytes read
+;   +8   write     (node, offset, buf, len) -> bytes written
+;   +12  create    (dirnode, name, type)    -> new node or 0
+;   +16  remove    (dirnode, name)          -> status
+;   +20  readdir   (dirnode, index)         -> child node or 0
+;   +24  truncate  (node, newlen)           -> status
+;   +28  stat      (node, statbuf)          -> status
+;   +32  sync      (node)                   -> status   ; flush to backing store
+;
+;
+; -- Mounts -----------------------------------------------------------------
+;
+; A mount binds a driver instance (and its backing device, if any) onto a
+; directory node. During path resolution, when the walk reaches a node that
+; carries a mount, the core transparently crosses into the mounted
+; filesystem's root. The root filesystem is simply the mount at "/".
+;
+;
+; -- Handles ----------------------------------------------------------------
+;
+; Open files are tracked in an open-handle table. A handle couples a node
+; with a cursor (current byte offset) and the mode it was opened in. Read and
+; write advance the cursor; seek moves it. Handles are the small integer /
+; pointer that user-facing code passes around; nodes are the shared,
+; refcounted objects behind them, so many handles may reference one node.
+;
+;
+; -- Path resolution --------------------------------------------------------
+;
+; Absolute paths start at the root mount; the resolver splits on '/', calling
+; each directory's `lookup` for the next component, crossing mounts as it
+; goes, and following symlinks up to a bounded depth. It returns the target
+; node (ref taken) or an error if any component is missing.
+;
+;
+; ==========================
+;   Method list
+; ==========================
+; Lifecycle / mounting
+;   vfsinit         set up the node cache, mount table and handle table
+;   vfsregister     register a filesystem driver (name -> vtable factory)
+;   vfsmount        mount a registered driver onto a path (with a device)
+;   vfsunmount      tear down a mount once nothing references it
+;
+; Path & node resolution
+;   vfsresolve      full path        -> node (ref taken)
+;   vfslookup       (dirnode, name)  -> child node (ref taken)
+;   vfsnoderef      take a reference on a node
+;   vfsnodeunref    drop a reference; free the node at zero
+;
+; File I/O (operate on open handles)
+;   vfsopen         (path, mode)             -> handle
+;   vfsclose        (handle)                 -> status
+;   vfsread         (handle, buf, len)       -> bytes read
+;   vfswrite        (handle, buf, len)       -> bytes written
+;   vfsseek         (handle, offset, whence) -> new cursor
+;   vfsstat         (path, statbuf)          -> status
+;
+; Directory & namespace management
+;   vfscreate       (path, type) -> node     ; create a file/device node
+;   vfsmkdir        (path)       -> node     ; create a directory
+;   vfsremove       (path)       -> status   ; unlink a file/empty dir
+;   vfsreaddir      (handle)     -> next entry (name + node), 0 at end
+;   vfssync         (path or 0)  -> status   ; flush one node, or all, to disk
+;
+; Node helpers exposed for driver authors
+;   vfsnodenew      (type, name, parent) -> node   ; allocate a cached node
+
+
+; ==========================
+;   Implementation
+; ==========================
+; Register / calling convention (see the assembly reference): r0 holds the
+; return value, r1-r3 the first three arguments, and r4-r7 are callee saved.
+; Every routine below preserves r4-r7; r0-r3 are considered clobbered.
+;
+; This module builds on the kernel heap (heapalloc / heapfree from
+; heapalloc.cat). Include heapalloc.cat before this file and call `heapinit`
+; then `vfsinit` during boot before using any other entry point.
+;
+;
+; -- Driver ABI -------------------------------------------------------------
+;
+; A driver is a table of function pointers (the vtable, see slot offsets
+; below). Each op follows the standard calling convention. Unsupported ops
+; must be left as 0; the core turns those into an error for the caller.
+;
+;   lookup   (r1=dir, r2=name)                 -> r0 = child node or 0
+;   read     (r1=node, r2=offset, r3=buf, [sp]=len) -> r0 = bytes read
+;   write    (r1=node, r2=offset, r3=buf, [sp]=len) -> r0 = bytes written
+;   create   (r1=dir, r2=name, r3=type)        -> r0 = new node or 0
+;   remove   (r1=dir, r2=name)                 -> r0 = status (0 ok)
+;   readdir  (r1=dir, r2=index)                -> r0 = child node or 0
+;   truncate (r1=node, r2=newlen)              -> r0 = status
+;   stat     (r1=node, r2=statbuf)             -> r0 = status
+;   sync     (r1=node)                         -> r0 = status
+;
+; `read`/`write` take a fourth argument (len) on the stack. The core (caller)
+; pushes it and cleans it up, so on entry the op finds len at [sp+4] (with the
+; return address at [sp]); it must not pop it.
+;
+; A driver's `lookup`/`create`/`readdir` return freshly discovered objects by
+; calling `vfsnodenew` (which allocates, reference counts and caches the node)
+; and then filling in NODE_OPS (its own vtable) and NODE_FSDATA. The returned
+; node carries one reference which the caller now owns.
+;
+; A filesystem is attached with `vfsregister` + `vfsmount`. `vfsregister` maps
+; a name to a mount routine `mountfn(r1=device) -> r0 = root node`; the mount
+; routine builds the root directory node (again via `vfsnodenew`, parent 0)
+; with its vtable installed. The first successful mount becomes the root "/".
+;
+;
+; -- Reference counting -----------------------------------------------------
+;
+; A node stays alive while its refcount is > 0. Every child holds a reference
+; on its parent, every open handle holds one on its node, and each mount holds
+; one on both its root and the directory it covers. Routines that hand a node
+; back to you (`vfsresolve`, `vfslookup`, `vfsopen`'s node, `vfscreate`, ...)
+; return it with a reference taken; release it with `vfsnodeunref`. The node
+; cache does not itself pin nodes, so a node is freed as soon as the last real
+; reference drops.
+;
+; NOTE: symlink following is not yet implemented in the resolver - a symlink
+; component resolves to the symlink node itself. Add it once a driver exposes
+; link targets through `read`.
+
+
+; ---- Node layout ----
+#define NODE_TYPE, 0        ; NODE_* type tag
+#define NODE_FLAGS, 4       ; bitfield: read-only, hidden, dirty, ...
+#define NODE_SIZE, 8        ; bytes (files) / entry count (dirs)
+#define NODE_REFCNT, 12     ; live references; freed at 0
+#define NODE_OPS, 16        ; driver vtable pointer
+#define NODE_FSDATA, 20     ; driver-private pointer
+#define NODE_MOUNT, 24      ; mount overlaying this node, 0 if none
+#define NODE_PARENT, 28     ; parent directory node
+#define NODE_NAME, 32       ; owned name string pointer
+#define NODE_CNEXT, 36      ; VFS-private: next node in the cache list
+#define NODE_STRUCT, 40     ; total node size
+
+; ---- Node types ----
+#define NODE_FILE, 1
+#define NODE_DIR, 2
+#define NODE_CHARDEV, 3
+#define NODE_BLOCKDEV, 4
+#define NODE_SYMLINK, 5
+#define NODE_MOUNTPT, 6
+
+; ---- Driver vtable slots ----
+#define OP_LOOKUP, 0
+#define OP_READ, 4
+#define OP_WRITE, 8
+#define OP_CREATE, 12
+#define OP_REMOVE, 16
+#define OP_READDIR, 20
+#define OP_TRUNCATE, 24
+#define OP_STAT, 28
+#define OP_SYNC, 32
+
+; ---- Mount struct ----
+#define MNT_ROOT, 0         ; root node of the mounted filesystem
+#define MNT_NODE, 4         ; directory node this mount covers (0 for "/")
+#define MNT_OPS, 8          ; driver vtable
+#define MNT_DEV, 12         ; backing device handle, 0 if none
+#define MNT_FSDATA, 16      ; driver-private mount data
+#define MNT_NEXT, 20        ; next mount in the mount list
+#define MNT_STRUCT, 24
+
+; ---- Driver registration struct ----
+#define DRV_NAME, 0         ; owned driver name string
+#define DRV_MOUNT, 4        ; mountfn(device) -> root node
+#define DRV_NEXT, 8         ; next registered driver
+#define DRV_STRUCT, 12
+
+; ---- Open handle struct ----
+#define H_NODE, 0           ; node this handle refers to, 0 = free slot
+#define H_POS, 4            ; cursor byte offset
+#define H_MODE, 8           ; open mode flags
+#define H_RDIDX, 12         ; readdir cursor
+#define H_STRUCT, 16
+
+; ---- Open modes (bitfield) ----
+#define O_READ, 1
+#define O_WRITE, 2
+#define O_RDWR, 3
+#define O_CREATE, 4
+#define O_APPEND, 8
+#define O_TRUNC, 16
+
+; ---- Seek whence ----
+#define SEEK_SET, 0
+#define SEEK_CUR, 1
+#define SEEK_END, 2
+
+; ---- Stat buffer layout ----
+#define ST_TYPE, 0
+#define ST_SIZE, 4
+#define ST_FLAGS, 8
+#define ST_STRUCT, 12
+
+; ---- Tunables ----
+#define VFS_MAX_HANDLES, 64
+#define VFS_NAME_MAX, 128    ; longest single path component (with null)
+#define VFS_PATH_MAX, 256    ; longest path a split buffer must hold
+
+
+; load a 32-bit struct field.
+; $1 - destination register
+; $2 - base register (holding the struct address)
+; $3 - field offset
+#macro vload, 3
+    mov $1, $2
+    add $1, $3
+    mov $1, [$1]
+#endmacro
+
+; store into a 32-bit struct field.
+; $1 - base register (holding the struct address)
+; $2 - field offset
+; $3 - value (register or immediate)
+; $4 - scratch register (clobbered, must differ from $1 and $3)
+#macro vstore, 4
+    mov $4, $1
+    add $4, $2
+    mov [$4], $3
+#endmacro
+
+
+; ==========================
+;   Global state
+; ==========================
+vfsroot:
+    d32 0                    ; root node ("/"), 0 until the first mount
+
+vfsmounts:
+    d32 0                    ; head of the mount list (MNT_NEXT linked)
+
+vfsdrivers:
+    d32 0                    ; head of the driver registry (DRV_NEXT linked)
+
+vfsnodelist:
+    d32 0                    ; head of the node cache (NODE_CNEXT linked)
+
+vfsdotstr:
+    dstr ".\0"               ; "." path component
+
+vfsdotdotstr:
+    dstr "..\0"              ; ".." path component
+
+vfshandles:
+    res8 VFS_MAX_HANDLES * H_STRUCT   ; open-handle table
+
+vfscompbuf:
+    res8 VFS_NAME_MAX        ; scratch: one path component during resolution
+
+vfsparentbuf:
+    res8 VFS_PATH_MAX        ; scratch: parent path during create/remove
+
+
+; ==========================
+;   Lifecycle
+; ==========================
+
+; Reset the VFS to an empty state: no root, no mounts, no drivers, no open
+; handles. Call once after heapinit.
+vfsinit:
+    mov r0, 0
+    mov [vfsroot], r0
+    mov [vfsmounts], r0
+    mov [vfsdrivers], r0
+    mov [vfsnodelist], r0
+
+    mov r1, vfshandles
+    mov r2, VFS_MAX_HANDLES * H_STRUCT
+    call vfszero
+    ret
+
+
+; Zero a word-aligned region.
+; r1 - address
+; r2 - byte count (rounded down to a whole number of words)
+vfszero:
+    push r4
+    mov r4, r1
+    .loop:
+        cmp r2, 0
+        je .done
+        mov [r4], 0
+        add r4, 4
+        sub r2, 4
+        jmp .loop
+    .done:
+    pop r4
+    ret
+
+
+; ==========================
+;   String helpers
+; ==========================
+
+; Length of a null-terminated string, excluding the terminator.
+; r1 - string pointer
+; returns r0 = length
+vfsstrlen:
+    mov r0, 0
+    .loop:
+        mov8 r2, [r1]
+        cmp r2, 0
+        je .done
+        add r0, 1
+        add r1, 1
+        jmp .loop
+    .done:
+    ret
+
+
+; Compare two null-terminated strings.
+; r1 - string a
+; r2 - string b
+; returns r0 = 1 if equal, 0 otherwise
+vfsstreq:
+    .loop:
+        mov8 r0, [r1]
+        mov8 r3, [r2]
+        cmp r0, r3
+        jne .neq
+        cmp r0, 0            ; equal so far; a null here means both ended
+        je .eq
+        add r1, 1
+        add r2, 1
+        jmp .loop
+    .eq:
+    mov r0, 1
+    ret
+    .neq:
+    mov r0, 0
+    ret
+
+
+; Duplicate a null-terminated string onto the heap.
+; r1 - source string
+; returns r0 = heap copy (caller frees with heapfree), or 0 on OOM / null src
+vfsstrdup:
+    push r4                  ; source
+    push r5                  ; length
+    cmp r1, 0
+    je .fail
+    mov r4, r1
+    call vfsstrlen           ; r0 = length (walks a private copy of r1)
+    mov r5, r0
+    add r0, 1                ; room for the terminator
+    mov r1, r0
+    call heapalloc
+    cmp r0, 0
+    je .fail
+    mov r1, r5
+    add r1, 1                ; copy the bytes including the terminator
+    cpy r4, r1               ; cpy dest is r0 (the fresh buffer)
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Node lifecycle
+; ==========================
+
+; Allocate a fresh, cached, reference-counted node. Exposed for drivers.
+; r1 - node type (NODE_*)
+; r2 - name string (duplicated onto the heap, may be 0)
+; r3 - parent node (a reference is taken on it, may be 0)
+; returns r0 = node (refcount 1), or 0 on OOM
+vfsnodenew:
+    push r4                  ; node
+    push r5                  ; type
+    push r6                  ; parent
+    push r7                  ; name
+    mov r5, r1
+    mov r7, r2
+    mov r6, r3
+
+    mov r1, NODE_STRUCT
+    call heapalloc
+    cmp r0, 0
+    je .fail
+    mov r4, r0
+
+    mov r1, r4               ; wipe every field first
+    mov r2, NODE_STRUCT
+    call vfszero
+
+    vstore r4, NODE_TYPE, r5, r0
+    vstore r4, NODE_REFCNT, 1, r0
+    vstore r4, NODE_PARENT, r6, r0
+
+    cmp r6, 0                ; a child pins its parent
+    je .noparent
+    mov r1, r6
+    call vfsnoderef
+    .noparent:
+
+    cmp r7, 0                ; duplicate the name if one was given
+    je .noname
+    mov r1, r7
+    call vfsstrdup
+    vstore r4, NODE_NAME, r0, r1
+    .noname:
+
+    mov r0, [vfsnodelist]    ; link into the cache
+    vstore r4, NODE_CNEXT, r0, r1
+    mov [vfsnodelist], r4
+
+    mov r0, r4
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Take a reference on a node.
+; r1 - node (0 is a no-op)
+vfsnoderef:
+    cmp r1, 0
+    je .done
+    vload r0, r1, NODE_REFCNT
+    add r0, 1
+    vstore r1, NODE_REFCNT, r0, r2
+    .done:
+    ret
+
+
+; Drop a reference on a node, freeing it (and releasing its parent) at zero.
+; r1 - node (0 is a no-op)
+vfsnodeunref:
+    push r4                  ; node
+    cmp r1, 0
+    je .done
+    mov r4, r1
+    vload r0, r4, NODE_REFCNT
+    cmp r0, 0
+    je .done                 ; already dead, guard against underflow
+    sub r0, 1
+    vstore r4, NODE_REFCNT, r0, r1
+    cmp r0, 0
+    jne .done                ; still referenced
+    mov r1, r4
+    call vfsnodefree
+    .done:
+    pop r4
+    ret
+
+
+; Free a node: unlink it from the cache, release its parent, free its name and
+; the node itself. Internal - only called when the refcount reaches 0.
+; r1 - node
+vfsnodefree:
+    push r4                  ; node
+    push r5                  ; cache walk
+    mov r4, r1
+
+    mov r5, [vfsnodelist]    ; unlink from the cache list
+    cmp r5, r4
+    jne .scan
+    vload r0, r4, NODE_CNEXT
+    mov [vfsnodelist], r0
+    jmp .unlinked
+    .scan:
+        cmp r5, 0
+        je .unlinked         ; not present (should not happen)
+        vload r0, r5, NODE_CNEXT
+        cmp r0, r4
+        je .found
+        mov r5, r0
+        jmp .scan
+    .found:
+        vload r0, r4, NODE_CNEXT
+        vstore r5, NODE_CNEXT, r0, r1
+    .unlinked:
+
+    vload r1, r4, NODE_PARENT   ; release our reference on the parent
+    call vfsnodeunref
+
+    vload r1, r4, NODE_NAME     ; free the owned name string
+    call heapfree
+
+    mov r1, r4                  ; free the node itself
+    call heapfree
+
+    pop r5
+    pop r4
+    ret
+
+
+; Cross any mounts stacked on a node, descending into mounted roots.
+; Consumes the reference in r1 and returns an equivalent reference in r0.
+; r1 - node (owns a reference)
+; returns r0 = resolved node (owns a reference)
+vfscrossmounts:
+    push r4
+    mov r4, r1
+    .loop:
+        vload r0, r4, NODE_MOUNT
+        cmp r0, 0
+        je .done
+        vload r1, r0, MNT_ROOT   ; step into the mounted root
+        push r1
+        call vfsnoderef          ; take a ref on the new node
+        mov r1, r4
+        call vfsnodeunref        ; drop the ref on the covered node
+        pop r4
+        jmp .loop
+    .done:
+    mov r0, r4
+    pop r4
+    ret
+
+
+; ==========================
+;   Driver registry & mounting
+; ==========================
+
+; Register a filesystem driver.
+; r1 - driver name (duplicated)
+; r2 - mount routine: mountfn(r1=device) -> r0 = root node
+; returns r0 = driver record, or 0 on OOM
+vfsregister:
+    push r4                  ; name
+    push r5                  ; mountfn
+    push r6                  ; record
+    mov r4, r1
+    mov r5, r2
+
+    mov r1, DRV_STRUCT
+    call heapalloc
+    cmp r0, 0
+    je .fail
+    mov r6, r0
+
+    mov r1, r4
+    call vfsstrdup
+    vstore r6, DRV_NAME, r0, r1
+    vstore r6, DRV_MOUNT, r5, r1
+
+    mov r0, [vfsdrivers]
+    vstore r6, DRV_NEXT, r0, r1
+    mov [vfsdrivers], r6
+
+    mov r0, r6
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Find a registered driver by name.
+; r1 - name
+; returns r0 = driver record, or 0 if none
+vfsfinddriver:
+    push r4                  ; walk
+    push r5                  ; name
+    mov r5, r1
+    mov r4, [vfsdrivers]
+    .loop:
+        cmp r4, 0
+        je .none
+        vload r1, r4, DRV_NAME
+        mov r2, r5
+        call vfsstreq
+        cmp r0, 0
+        jne .found
+        vload r4, r4, DRV_NEXT
+        jmp .loop
+    .found:
+    mov r0, r4
+    jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Mount a registered driver at a path. The first successful mount becomes the
+; root filesystem "/"; later mounts attach onto an existing directory node.
+; r1 - mount path
+; r2 - driver name
+; r3 - backing device handle (opaque, may be 0)
+; returns r0 = mount record, or 0 on failure
+vfsmount:
+    push r4                  ; path
+    push r5                  ; device
+    push r6                  ; root node / scratch
+    push r7                  ; mount record
+    mov r4, r1
+    mov r5, r3
+
+    mov r1, r2
+    call vfsfinddriver       ; r0 = driver
+    cmp r0, 0
+    je .fail
+
+    vload r2, r0, DRV_MOUNT  ; call the driver's mount routine
+    mov r1, r5
+    call r2                  ; r0 = fresh root node
+    cmp r0, 0
+    je .fail
+    mov r6, r0
+
+    mov r1, MNT_STRUCT       ; build the mount record
+    call heapalloc
+    cmp r0, 0
+    je .fail
+    mov r7, r0
+
+    vstore r7, MNT_ROOT, r6, r1
+    vload r0, r6, NODE_OPS
+    vstore r7, MNT_OPS, r0, r1
+    vstore r7, MNT_DEV, r5, r1
+    vstore r7, MNT_FSDATA, 0, r1
+
+    mov r0, [vfsmounts]      ; link into the mount list
+    vstore r7, MNT_NEXT, r0, r1
+    mov [vfsmounts], r7
+
+    mov r0, [vfsroot]        ; first mount is the root filesystem
+    cmp r0, 0
+    jne .notroot
+    mov [vfsroot], r6
+    vstore r7, MNT_NODE, 0, r1
+    jmp .ok
+
+    .notroot:
+    mov r1, r4               ; resolve the directory to cover
+    call vfsresolve          ; r0 = mountpoint node (ref taken)
+    cmp r0, 0
+    je .fail                 ; leaves the record + root allocated; caller aborts
+    vstore r7, MNT_NODE, r0, r1
+    mov r1, r0               ; overlay the mount on the covered node
+    vstore r1, NODE_MOUNT, r7, r2
+
+    .ok:
+    mov r0, r7
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Tear down a mount identified by its mount path. Fails if the mounted
+; filesystem is still busy (anything other than the mount itself references
+; its root).
+; r1 - mount path
+; returns r0 = 0 on success, -1 on failure / busy
+vfsunmount:
+    push r4                  ; mounted root
+    push r5                  ; mount record
+    push r6                  ; previous record
+    call vfsresolve          ; r0 = mounted root (ref taken)
+    cmp r0, 0
+    je .bad
+    mov r4, r0
+    mov r1, r4               ; we only needed it to identify the mount
+    call vfsnodeunref
+
+    mov r5, [vfsmounts]      ; find the mount whose root this is
+    mov r6, 0
+    .find:
+        cmp r5, 0
+        je .bad
+        vload r0, r5, MNT_ROOT
+        cmp r0, r4
+        je .found
+        mov r6, r5
+        vload r5, r5, MNT_NEXT
+        jmp .find
+    .found:
+
+    vload r0, r4, NODE_REFCNT   ; busy if anything else still holds the root
+    cmp r0, 1
+    jug .busy
+
+    vload r0, r5, MNT_NODE      ; detach from the covered node
+    cmp r0, 0
+    je .wasroot
+    vstore r0, NODE_MOUNT, 0, r1
+    mov r1, r0
+    call vfsnodeunref           ; release the covered-node reference
+    jmp .unlink
+    .wasroot:
+    mov r0, 0
+    mov [vfsroot], r0
+
+    .unlink:
+    cmp r6, 0                   ; unlink the record from the mount list
+    jne .midlist
+    vload r0, r5, MNT_NEXT
+    mov [vfsmounts], r0
+    jmp .unlinked
+    .midlist:
+    vload r0, r5, MNT_NEXT
+    vstore r6, MNT_NEXT, r0, r1
+    .unlinked:
+
+    mov r1, r4                  ; release the mount's own root reference
+    call vfsnodeunref
+    mov r1, r5                  ; free the record
+    call heapfree
+
+    mov r0, 0
+    jmp .done
+    .busy:
+    mov r0, -1
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Path & node resolution
+; ==========================
+
+; Look up a single child by name within a directory, consulting the node cache
+; before falling through to the driver.
+; r1 - directory node
+; r2 - child name (null-terminated)
+; returns r0 = child node (ref taken), or 0 if not found / unsupported
+vfslookup:
+    push r4                  ; dir
+    push r5                  ; name
+    push r6                  ; cache walk
+    mov r4, r1
+    mov r5, r2
+
+    mov r6, [vfsnodelist]    ; cache scan: match parent + name
+    .cloop:
+        cmp r6, 0
+        je .miss
+        vload r0, r6, NODE_PARENT
+        cmp r0, r4
+        jne .cnext
+        vload r1, r6, NODE_NAME
+        cmp r1, 0
+        je .cnext
+        mov r2, r5
+        call vfsstreq
+        cmp r0, 0
+        jne .hit
+        .cnext:
+        vload r6, r6, NODE_CNEXT
+        jmp .cloop
+    .hit:
+    mov r1, r6
+    call vfsnoderef
+    mov r0, r6
+    jmp .done
+
+    .miss:
+    vload r0, r4, NODE_OPS   ; ask the driver
+    cmp r0, 0
+    je .fail
+    vload r0, r0, OP_LOOKUP
+    cmp r0, 0
+    je .fail
+    mov r1, r4
+    mov r2, r5
+    call r0                  ; r0 = child (ref taken by the driver) or 0
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Resolve an absolute path to a node, crossing mounts and honouring "."/"..".
+; r1 - path (should start with '/')
+; returns r0 = node (ref taken), or 0 if any component is missing
+vfsresolve:
+    push r4                  ; current node
+    push r5                  ; path cursor
+    push r6                  ; next node
+    push r7                  ; component length
+
+    mov r5, r1
+
+    mov r1, [vfsroot]
+    cmp r1, 0
+    je .fail
+    call vfsnoderef          ; own a reference on the root
+    call vfscrossmounts      ; enter any mount stacked on it
+    mov r4, r0
+
+    .skipslash:
+        mov8 r0, [r5]
+        cmp r0, 47           ; '/'
+        jne .comploop
+        add r5, 1
+        jmp .skipslash
+
+    .comploop:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .success          ; end of path
+
+        mov r1, vfscompbuf   ; copy one component into the scratch buffer
+        mov r7, 0
+        .readc:
+            mov8 r0, [r5]
+            cmp r0, 0
+            je .compend
+            cmp r0, 47
+            je .compend
+            cmp r7, VFS_NAME_MAX - 1
+            juge .skipchar   ; clamp over-long components
+            mov8 [r1], r0
+            add r1, 1
+            add r7, 1
+            .skipchar:
+            add r5, 1
+            jmp .readc
+        .compend:
+        mov8 [r1], 0         ; terminate the component
+
+        .skipslash2:
+            mov8 r0, [r5]
+            cmp r0, 47
+            jne .haveslash2
+            add r5, 1
+            jmp .skipslash2
+        .haveslash2:
+
+        cmp r7, 0            ; empty component (e.g. trailing slash)
+        je .comploop
+
+        mov r1, vfscompbuf   ; "." keeps the current node
+        mov r2, vfsdotstr
+        call vfsstreq
+        cmp r0, 0
+        jne .comploop
+
+        mov r1, vfscompbuf   ; ".." ascends to the parent
+        mov r2, vfsdotdotstr
+        call vfsstreq
+        cmp r0, 0
+        je .dolookup
+        vload r6, r4, NODE_PARENT
+        cmp r6, 0
+        je .comploop         ; already at the root, stay put
+        mov r1, r6
+        call vfsnoderef      ; own a reference on the parent
+        jmp .moveto
+
+        .dolookup:
+        mov r1, r4
+        mov r2, vfscompbuf
+        call vfslookup       ; r0 = child (ref taken) or 0
+        cmp r0, 0
+        je .notfound
+        mov r6, r0
+
+        .moveto:
+        mov r1, r4           ; leave the old node
+        call vfsnodeunref
+        mov r1, r6           ; enter the new one, crossing any mount
+        call vfscrossmounts
+        mov r4, r0
+        jmp .comploop
+
+    .notfound:
+    mov r1, r4
+    call vfsnodeunref
+    mov r0, 0
+    jmp .ret
+    .success:
+    mov r0, r4               ; hand back the current node with its reference
+    jmp .ret
+    .fail:
+    mov r0, 0
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Split a path into its parent directory and final component.
+; r1 - path
+; returns r0 = pointer to the final component (inside the original path);
+;         the parent path is written (null-terminated) to vfsparentbuf.
+vfssplitpath:
+    push r4                  ; path
+    push r5                  ; last-slash position
+    push r6                  ; component pointer
+    mov r4, r1
+
+    mov r5, 0                ; find the final '/'
+    mov r2, r4
+    .scan:
+        mov8 r0, [r2]
+        cmp r0, 0
+        je .scandone
+        cmp r0, 47
+        jne .noslash
+        mov r5, r2
+        .noslash:
+        add r2, 1
+        jmp .scan
+    .scandone:
+
+    cmp r5, 0
+    je .noslashfound
+
+    mov r6, r5               ; component starts just past the slash
+    add r6, 1
+
+    mov r3, r5               ; parent length = slash - start
+    sub r3, r4
+    cmp r3, 0
+    jne .copyparent
+    mov r0, vfsparentbuf     ; leading-slash path -> parent is "/"
+    mov8 [r0], 47
+    add r0, 1
+    mov8 [r0], 0
+    jmp .finish
+    .copyparent:
+    mov r0, vfsparentbuf     ; cpy dest is r0
+    cpy r4, r3
+    mov r0, vfsparentbuf
+    add r0, r3
+    mov8 [r0], 0
+    .finish:
+    mov r0, r6
+    jmp .done
+
+    .noslashfound:
+    mov r0, vfsparentbuf     ; no slash: whole path is the name, empty parent
+    mov8 [r0], 0
+    mov r0, r4
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Handle helpers
+; ==========================
+
+; Address of a handle slot, or 0 if the index is out of range.
+; r1 - handle index
+; returns r0 = slot address, or 0
+vfshandleaddr:
+    cmp r1, 0
+    jil .bad
+    cmp r1, VFS_MAX_HANDLES
+    juge .bad
+    mov r0, r1
+    shl r0, 4                ; * H_STRUCT (16)
+    add r0, vfshandles
+    ret
+    .bad:
+    mov r0, 0
+    ret
+
+
+; ==========================
+;   File I/O
+; ==========================
+
+; Open a path, returning a handle index.
+; r1 - path
+; r2 - mode (O_* bitfield; O_CREATE creates a missing file)
+; returns r0 = handle index (>= 0), or -1 on failure
+vfsopen:
+    push r4                  ; node
+    push r5                  ; mode
+    push r6                  ; path
+    mov r6, r1
+    mov r5, r2
+
+    mov r1, r6
+    call vfsresolve          ; r0 = node or 0
+    cmp r0, 0
+    jne .havenode
+
+    mov r0, r5               ; missing: create it if asked
+    and r0, O_CREATE
+    cmp r0, 0
+    je .fail
+    mov r1, r6
+    mov r2, NODE_FILE
+    call vfscreate           ; r0 = node (ref taken) or 0
+    cmp r0, 0
+    je .fail
+    .havenode:
+    mov r4, r0
+
+    mov r0, r5               ; O_TRUNC: drop the contents to length 0
+    and r0, O_TRUNC
+    cmp r0, 0
+    je .notrunc
+    vload r0, r4, NODE_OPS
+    cmp r0, 0
+    je .notrunc
+    vload r0, r0, OP_TRUNCATE
+    cmp r0, 0
+    je .notrunc
+    mov r1, r4
+    mov r2, 0
+    call r0
+    .notrunc:
+
+    mov r1, 0                ; find a free handle slot
+    .findslot:
+        cmp r1, VFS_MAX_HANDLES
+        juge .noslots
+        mov r0, r1
+        shl r0, 4
+        add r0, vfshandles
+        mov r2, [r0]         ; H_NODE
+        cmp r2, 0
+        je .gotslot
+        add r1, 1
+        jmp .findslot
+    .gotslot:
+        vstore r0, H_NODE, r4, r2
+        mov r2, 0            ; append -> start at end of file
+        mov r3, r5
+        and r3, O_APPEND
+        cmp r3, 0
+        je .posset
+        vload r2, r4, NODE_SIZE
+        .posset:
+        vstore r0, H_POS, r2, r3
+        vstore r0, H_MODE, r5, r2
+        vstore r0, H_RDIDX, 0, r2
+        mov r0, r1           ; return the index
+        jmp .done
+
+    .noslots:
+    mov r1, r4               ; release the node we resolved / created
+    call vfsnodeunref
+    .fail:
+    mov r0, -1
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Close a handle, releasing its node reference.
+; r1 - handle index
+; returns r0 = 0 on success, -1 if the handle was invalid
+vfsclose:
+    push r4                  ; slot
+    call vfshandleaddr
+    cmp r0, 0
+    je .bad
+    mov r4, r0
+    mov r1, [r4]             ; H_NODE
+    cmp r1, 0
+    je .bad
+    call vfsnodeunref
+    mov r0, 0
+    mov [r4], r0             ; free the slot
+    mov r0, 0
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r4
+    ret
+
+
+; Read from a handle, advancing its cursor.
+; r1 - handle index
+; r2 - destination buffer
+; r3 - byte count
+; returns r0 = bytes read, or -1 on error
+vfsread:
+    push r4                  ; slot
+    push r5                  ; node
+    push r6                  ; buffer
+    push r7                  ; length
+    mov r6, r2
+    mov r7, r3
+    call vfshandleaddr
+    cmp r0, 0
+    je .bad
+    mov r4, r0
+    mov r5, [r4]             ; H_NODE
+    cmp r5, 0
+    je .bad
+
+    vload r0, r5, NODE_OPS
+    cmp r0, 0
+    je .bad
+    vload r0, r0, OP_READ
+    cmp r0, 0
+    je .bad
+
+    mov r1, r5               ; read(node, pos, buf, len)
+    vload r2, r4, H_POS
+    mov r3, r6
+    push r7                  ; len on the stack (caller cleans up)
+    call r0
+    add sp, 4
+    cmp r0, 0
+    jil .done                ; driver reported an error, pass it through
+
+    push r0                  ; advance the cursor by the bytes read
+    vload r1, r4, H_POS
+    add r1, r0
+    vstore r4, H_POS, r1, r2
+    pop r0
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Write to a handle, advancing its cursor and growing the node as needed.
+; r1 - handle index
+; r2 - source buffer
+; r3 - byte count
+; returns r0 = bytes written, or -1 on error
+vfswrite:
+    push r4                  ; slot
+    push r5                  ; node
+    push r6                  ; buffer
+    push r7                  ; length
+    mov r6, r2
+    mov r7, r3
+    call vfshandleaddr
+    cmp r0, 0
+    je .bad
+    mov r4, r0
+    mov r5, [r4]             ; H_NODE
+    cmp r5, 0
+    je .bad
+
+    vload r0, r5, NODE_OPS
+    cmp r0, 0
+    je .bad
+    vload r0, r0, OP_WRITE
+    cmp r0, 0
+    je .bad
+
+    mov r1, r5               ; write(node, pos, buf, len)
+    vload r2, r4, H_POS
+    mov r3, r6
+    push r7
+    call r0
+    add sp, 4
+    cmp r0, 0
+    jil .done
+
+    push r0                  ; advance the cursor
+    vload r1, r4, H_POS
+    add r1, r0
+    vstore r4, H_POS, r1, r2
+    vload r2, r5, NODE_SIZE  ; grow the logical size if we wrote past the end
+    cmp r1, r2
+    jule .nosize
+    vstore r5, NODE_SIZE, r1, r0
+    .nosize:
+    pop r0
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Move a handle's cursor.
+; r1 - handle index
+; r2 - offset (signed)
+; r3 - whence (SEEK_SET / SEEK_CUR / SEEK_END)
+; returns r0 = new cursor, or -1 on error
+vfsseek:
+    push r4                  ; slot
+    push r5                  ; node
+    push r6                  ; offset
+    push r7                  ; whence
+    mov r6, r2
+    mov r7, r3
+    call vfshandleaddr
+    cmp r0, 0
+    je .bad
+    mov r4, r0
+    mov r5, [r4]             ; H_NODE
+    cmp r5, 0
+    je .bad
+
+    cmp r7, SEEK_SET
+    je .set
+    cmp r7, SEEK_CUR
+    je .cur
+    cmp r7, SEEK_END
+    je .end
+    jmp .bad
+    .set:
+    mov r0, 0
+    jmp .apply
+    .cur:
+    vload r0, r4, H_POS
+    jmp .apply
+    .end:
+    vload r0, r5, NODE_SIZE
+    .apply:
+    add r0, r6               ; base + offset
+    vstore r4, H_POS, r0, r1
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Fill a stat buffer for a path. Populates ST_TYPE / ST_SIZE / ST_FLAGS from
+; the node, then lets the driver refine it.
+; r1 - path
+; r2 - stat buffer (ST_STRUCT bytes)
+; returns r0 = 0 on success, -1 if the path is missing
+vfsstat:
+    push r4                  ; node
+    push r5                  ; statbuf
+    mov r5, r2
+    call vfsresolve
+    cmp r0, 0
+    je .bad
+    mov r4, r0
+
+    vload r0, r4, NODE_TYPE
+    vstore r5, ST_TYPE, r0, r1
+    vload r0, r4, NODE_SIZE
+    vstore r5, ST_SIZE, r0, r1
+    vload r0, r4, NODE_FLAGS
+    vstore r5, ST_FLAGS, r0, r1
+
+    vload r0, r4, NODE_OPS
+    cmp r0, 0
+    je .noop
+    vload r0, r0, OP_STAT
+    cmp r0, 0
+    je .noop
+    mov r1, r4
+    mov r2, r5
+    call r0
+    .noop:
+
+    mov r1, r4
+    call vfsnodeunref
+    mov r0, 0
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Namespace management
+; ==========================
+
+; Create a file/device node at a path via its parent directory's driver.
+; r1 - path
+; r2 - node type (NODE_*)
+; returns r0 = new node (ref taken), or 0 on failure
+vfscreate:
+    push r4                  ; type
+    push r5                  ; final name
+    push r6                  ; parent dir
+    mov r4, r2
+    call vfssplitpath        ; r0 = final name; parent path -> vfsparentbuf
+    mov r5, r0
+
+    mov r1, vfsparentbuf
+    call vfsresolve          ; r0 = parent dir (ref taken)
+    cmp r0, 0
+    je .fail
+    mov r6, r0
+
+    vload r0, r6, NODE_OPS
+    cmp r0, 0
+    je .failunref
+    vload r0, r0, OP_CREATE
+    cmp r0, 0
+    je .failunref
+    mov r1, r6
+    mov r2, r5
+    mov r3, r4
+    call r0                  ; r0 = new node (ref taken) or 0
+
+    push r0                  ; release the parent reference
+    mov r1, r6
+    call vfsnodeunref
+    pop r0
+    jmp .done
+    .failunref:
+    mov r1, r6
+    call vfsnodeunref
+    .fail:
+    mov r0, 0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Create a directory at a path.
+; r1 - path
+; returns r0 = new node (ref taken), or 0 on failure
+vfsmkdir:
+    mov r2, NODE_DIR
+    jmp vfscreate            ; tail call - returns to our caller
+
+
+; Remove (unlink) a file or empty directory.
+; r1 - path
+; returns r0 = driver status (0 ok), or -1 on failure
+vfsremove:
+    push r4                  ; final name
+    push r5                  ; parent dir
+    call vfssplitpath        ; r0 = final name; parent path -> vfsparentbuf
+    mov r4, r0
+
+    mov r1, vfsparentbuf
+    call vfsresolve
+    cmp r0, 0
+    je .fail
+    mov r5, r0
+
+    vload r0, r5, NODE_OPS
+    cmp r0, 0
+    je .failunref
+    vload r0, r0, OP_REMOVE
+    cmp r0, 0
+    je .failunref
+    mov r1, r5
+    mov r2, r4
+    call r0                  ; r0 = status
+
+    push r0
+    mov r1, r5               ; drop the cached child so lookups miss it
+    mov r2, r4
+    call vfsinvalidate
+    mov r1, r5               ; release the parent
+    call vfsnodeunref
+    pop r0
+    jmp .done
+    .failunref:
+    mov r1, r5
+    call vfsnodeunref
+    .fail:
+    mov r0, -1
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Detach a cached child from its parent so future lookups miss it (used after
+; a remove). The node itself lives until its references drop.
+; r1 - parent node
+; r2 - child name
+vfsinvalidate:
+    push r4                  ; parent
+    push r5                  ; name
+    push r6                  ; walk
+    mov r4, r1
+    mov r5, r2
+    mov r6, [vfsnodelist]
+    .loop:
+        cmp r6, 0
+        je .done
+        vload r0, r6, NODE_PARENT
+        cmp r0, r4
+        jne .next
+        vload r1, r6, NODE_NAME
+        cmp r1, 0
+        je .next
+        mov r2, r5
+        call vfsstreq
+        cmp r0, 0
+        je .next
+        vstore r6, NODE_PARENT, 0, r0   ; detach it
+        .next:
+        vload r6, r6, NODE_CNEXT
+        jmp .loop
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Read the next entry from a directory handle.
+; r1 - handle index (opened on a directory)
+; returns r0 = next child node (ref taken), or 0 at end / on error
+vfsreaddir:
+    push r4                  ; slot
+    push r5                  ; node
+    call vfshandleaddr
+    cmp r0, 0
+    je .end
+    mov r4, r0
+    mov r5, [r4]             ; H_NODE
+    cmp r5, 0
+    je .end
+
+    vload r0, r5, NODE_OPS
+    cmp r0, 0
+    je .end
+    vload r0, r0, OP_READDIR
+    cmp r0, 0
+    je .end
+    mov r1, r5
+    vload r2, r4, H_RDIDX
+    call r0                  ; r0 = child or 0
+
+    push r0                  ; advance the readdir cursor
+    vload r1, r4, H_RDIDX
+    add r1, 1
+    vstore r4, H_RDIDX, r1, r2
+    pop r0
+    jmp .done
+    .end:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Flush cached state to backing store.
+; r1 - path to flush a single subtree, or 0 to flush every cached node
+; returns r0 = 0 on success, -1 if a given path is missing
+vfssync:
+    push r4
+    cmp r1, 0
+    jne .single
+
+    mov r4, [vfsnodelist]    ; flush everything
+    .allloop:
+        cmp r4, 0
+        je .allok
+        vload r0, r4, NODE_OPS
+        cmp r0, 0
+        je .allnext
+        vload r0, r0, OP_SYNC
+        cmp r0, 0
+        je .allnext
+        mov r1, r4
+        call r0
+        .allnext:
+        vload r4, r4, NODE_CNEXT
+        jmp .allloop
+    .allok:
+    mov r0, 0
+    jmp .done
+
+    .single:
+    call vfsresolve
+    cmp r0, 0
+    je .bad
+    mov r4, r0
+    vload r0, r4, NODE_OPS
+    cmp r0, 0
+    je .syncnoop
+    vload r0, r0, OP_SYNC
+    cmp r0, 0
+    je .syncnoop
+    mov r1, r4
+    call r0
+    .syncnoop:
+    mov r1, r4
+    call vfsnodeunref
+    mov r0, 0
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r4
+    ret
+

@@ -1,0 +1,550 @@
+; ==========================
+;   CatOS process model
+; ==========================
+; A process is a user-mode program with its own memory segment and its own
+; kernel stack. The VM already gives us everything needed to run one safely:
+;
+;   * virtual mode relocates every user access by MBase and bounds-checks it
+;     against MLen, so a process sees a private 0-based address space and can
+;     never reach kernel memory or another process;
+;   * on a user->kernel trap the CPU switches Sp onto the per-process kernel
+;     stack (Ksp) and pushes the entire resumable state as an "interrupt frame";
+;     `iret` restores it atomically. A suspended process is therefore fully
+;     described by one saved kernel-stack pointer (SAVED_SP) pointing at its
+;     frame.
+;
+; This file owns the process table and the mechanics of *building* a process
+; (carving a segment, loading a flat image, and manufacturing the first frame
+; so it can be entered with the ordinary resume path). Scheduling and the
+; context switch itself live in sched.cat.
+;
+;
+; -- The interrupt frame (must match CatVm.BuildInterruptFrameAndDispatch) ----
+;
+; A user->kernel frame is pushed low->high address as:
+;   marker(1B), ip(4), sp(4), fl(4), mbase(4), mlen(4), r7,r6,r5,r4,r3,r2,r1,r0
+; so from the frame base (where SAVED_SP / Sp points on entry) the fields sit at
+; the offsets below. Total size 1 + 4*12 = 53 bytes. `iret` pops the marker
+; first, then everything else, and restores Mode from the marker.
+
+
+; ---- process states ----
+#define PROC_FREE, 0            ; slot unused
+#define PROC_READY, 1           ; runnable, waiting for the CPU
+#define PROC_RUNNING, 2         ; currently on the CPU
+#define PROC_BLOCKED, 3         ; waiting on a channel (see PCB_CHAN)
+#define PROC_ZOMBIE, 4          ; exited, awaiting reap by wait()
+#define PROC_EMBRYO, 5          ; being constructed (not yet runnable)
+
+; ---- PCB (process control block) layout ----
+#define PCB_STATE, 0            ; one of PROC_*
+#define PCB_PID, 4              ; process id
+#define PCB_SAVEDSP, 8          ; kernel Sp to resume at (points at the frame)
+#define PCB_KSP, 12             ; kernel-stack top (loaded into the Ksp register)
+#define PCB_KSTACK, 16          ; kernel-stack base (for freeing)
+#define PCB_MBASE, 20           ; user segment physical base
+#define PCB_MLEN, 24            ; user segment length (bytes)
+#define PCB_USEG, 28            ; user segment base (== MBASE, kept for freeing)
+#define PCB_UPAGES, 32          ; user segment page count
+#define PCB_KPAGES, 36          ; kernel-stack page count
+#define PCB_PARENT, 40          ; parent PCB, 0 if none
+#define PCB_EXIT, 44            ; exit code (valid once ZOMBIE)
+#define PCB_CHAN, 48            ; blocking channel, 0 if not blocked
+#define PCB_NAME, 52            ; name string pointer
+#define PCB_FDS, 56             ; per-process fd table: MAX_FDS slots, each a
+                                ; VFS handle index or -1 for a free slot
+; ---- signal state (see signal.cat) ----
+#define PCB_SIGH, 88            ; NSIG disposition slots (0 = default, 1 = ignore,
+                                ; else a user handler vaddr), 4 bytes each
+#define PCB_SIGPEND, 152        ; pending-signal bitmask (bit N = signal N pending)
+#define PCB_SIGSAVE, 156        ; saved interrupt frame while a handler runs (for
+                                ; sigreturn); FRM_SIZE bytes, padded to 56
+#define PCB_SIGINFR, 212        ; nonzero while a signal handler is running
+#define PCB_STRUCT, 216         ; total PCB size
+
+; ---- interrupt-frame field offsets (from the frame base) ----
+#define FRM_MARKER, 0           ; 1 byte
+#define FRM_IP, 1
+#define FRM_SP, 5
+#define FRM_FL, 9
+#define FRM_MBASE, 13
+#define FRM_MLEN, 17
+#define FRM_R7, 21
+#define FRM_R6, 25
+#define FRM_R5, 29
+#define FRM_R4, 33
+#define FRM_R3, 37
+#define FRM_R2, 41
+#define FRM_R1, 45
+#define FRM_R0, 49
+#define FRM_SIZE, 53            ; total frame size
+#define FRAME_USER, 1           ; marker value for a user-mode frame
+
+; ---- configuration ----
+#define MAX_PROCS, 16           ; process table capacity
+#define MAX_FDS, 8              ; open file descriptors per process
+#define PROC_KSTACK_PAGES, 4    ; kernel stack per process (2 KiB; spawn does
+                                ; deep in-kernel work - VFS + CatFS - on it)
+#define USER_STACK_BYTES, 4096  ; user stack reserved above the image
+
+
+; ==========================
+;   State
+; ==========================
+curproc:
+    d32 0                       ; running PCB, 0 = kernel boot context
+nextpid:
+    d32 1                       ; next pid to hand out
+idleproc:
+    d32 0                       ; the idle PCB (always runnable)
+proc_tmp_name:
+    d32 0                       ; scratch across proc_create (single-threaded)
+proc_tmp_upages:
+    d32 0
+proctable:
+    res8 MAX_PROCS * PCB_STRUCT
+
+
+; ==========================
+;   Helpers
+; ==========================
+
+; Zero a region. r1 = address, r2 = length in bytes (must be a multiple of 4).
+proc_memzero:
+    push r4
+    mov r4, r2
+    shr r4, 2                    ; word count
+    .loop:
+        cmp r4, 0
+        je .done
+        mov [r1], 0
+        add r1, 4
+        sub r4, 1
+        jmp .loop
+    .done:
+    pop r4
+    ret
+
+
+; Initialise the process system. Zeroes the table (every slot -> PROC_FREE) and
+; resets the running pointer and pid counter. Call once during boot.
+procinit:
+    mov r1, proctable
+    mov r2, MAX_PROCS * PCB_STRUCT
+    call proc_memzero
+    mov r0, 0
+    mov [curproc], r0
+    mov r0, 1
+    mov [nextpid], r0
+    ret
+
+
+; Find a free PCB slot, assign it a pid and mark it EMBRYO (so it is neither
+; scheduled nor reused while it is being built).
+; returns r0 = PCB pointer, or 0 if the table is full
+proc_alloc:
+    push r4                      ; cursor
+    push r5                      ; index
+    mov r4, proctable
+    mov r5, 0
+    .loop:
+        cmp r5, MAX_PROCS
+        juge .full
+        mov r0, [r4]             ; PCB_STATE
+        cmp r0, PROC_FREE
+        je .found
+        add r4, PCB_STRUCT
+        add r5, 1
+        jmp .loop
+    .found:
+    mov r0, [nextpid]
+    vstore r4, PCB_PID, r0, r1
+    add r0, 1
+    mov [nextpid], r0
+    mov r0, PROC_EMBRYO
+    mov [r4], r0                 ; reserve the slot
+    mov r0, r4
+    jmp .done
+    .full:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Create a runnable process from a flat binary image already in kernel memory.
+; The image is loaded at user virtual address 0 and entered at offset 0.
+; r1 - image pointer (kernel address)
+; r2 - image length in bytes
+; r3 - name string pointer
+; returns r0 = PCB pointer (state READY), or 0 on failure
+proc_create:
+    push r4                      ; pcb
+    push r5                      ; image ptr
+    push r6                      ; image len
+    push r7                      ; segment base / ksp / frame base
+    mov r5, r1
+    mov r6, r2
+    mov [proc_tmp_name], r3
+
+    call proc_alloc
+    cmp r0, 0
+    je .fail
+    mov r4, r0
+
+    ; ---- user segment: image + stack, rounded to whole pages ----
+    mov r1, r6
+    add r1, USER_STACK_BYTES
+    add r1, PAGE_SIZE - 1
+    shr r1, PAGE_SHIFT_FAC
+    mov [proc_tmp_upages], r1
+    call allocpages
+    cmp r0, 0
+    je .failslot
+    mov r7, r0                   ; user segment base
+
+    vstore r4, PCB_MBASE, r7, r1
+    vstore r4, PCB_USEG, r7, r1
+    mov r1, [proc_tmp_upages]
+    vstore r4, PCB_UPAGES, r1, r2
+    shl r1, PAGE_SHIFT_FAC       ; segment size in bytes
+    vstore r4, PCB_MLEN, r1, r2
+
+    ; zero the whole segment (clears bss + stack)
+    mov r1, r7
+    mov r2, [proc_tmp_upages]
+    shl r2, PAGE_SHIFT_FAC
+    call proc_memzero
+
+    ; copy the image to the segment start (cpy dest is r0)
+    mov r0, r7
+    cpy r5, r6
+
+    ; ---- kernel stack ----
+    mov r1, PROC_KSTACK_PAGES
+    call allocpages
+    cmp r0, 0
+    je .failseg
+    vstore r4, PCB_KSTACK, r0, r1
+    mov r1, PROC_KSTACK_PAGES
+    vstore r4, PCB_KPAGES, r1, r2
+    mov r1, PROC_KSTACK_PAGES
+    shl r1, PAGE_SHIFT_FAC
+    add r0, r1                   ; kernel-stack top
+    vstore r4, PCB_KSP, r0, r1
+    sub r0, FRM_SIZE             ; the frame sits just below the top
+    vstore r4, PCB_SAVEDSP, r0, r1
+    mov r7, r0                   ; r7 = frame base
+
+    ; ---- manufacture the initial user frame ----
+    mov8 [r7], FRAME_USER        ; marker
+    mov r0, r7                   ; ip = 0 (entry)
+    add r0, FRM_IP
+    mov [r0], 0
+    mov r0, r7                   ; sp = MLEN (top of the user segment)
+    add r0, FRM_SP
+    vload r1, r4, PCB_MLEN
+    mov [r0], r1
+    mov r0, r7                   ; fl = 0
+    add r0, FRM_FL
+    mov [r0], 0
+    mov r0, r7                   ; mbase
+    add r0, FRM_MBASE
+    vload r1, r4, PCB_MBASE
+    mov [r0], r1
+    mov r0, r7                   ; mlen
+    add r0, FRM_MLEN
+    vload r1, r4, PCB_MLEN
+    mov [r0], r1
+    mov r0, r7                   ; r0..r7 = 0
+    add r0, FRM_R7
+    mov r2, 8
+    .zregs:
+        mov [r0], 0
+        add r0, 4
+        sub r2, 1
+        cmp r2, 0
+        jne .zregs
+
+    ; ---- finalise the PCB ----
+    mov r1, [proc_tmp_name]
+    vstore r4, PCB_NAME, r1, r2
+    mov r1, [curproc]
+    vstore r4, PCB_PARENT, r1, r2
+    mov r1, 0
+    vstore r4, PCB_EXIT, r1, r2
+    vstore r4, PCB_CHAN, r1, r2
+
+    ; clear the signal state: every disposition defaults to SIG_DFL (0), no signal
+    ; pending, not currently in a handler (proc_alloc reuses freed slots verbatim,
+    ; so a fresh process must not inherit the previous occupant's handlers).
+    mov r1, r4
+    add r1, PCB_SIGH
+    mov r2, PCB_STRUCT - PCB_SIGH
+    call proc_memzero
+
+    ; start with an empty fd table (every slot free = -1)
+    mov r0, r4
+    add r0, PCB_FDS
+    mov r1, MAX_FDS
+    .fdinit:
+        mov [r0], -1
+        add r0, 4
+        sub r1, 1
+        cmp r1, 0
+        jne .fdinit
+
+    ; wire stdin/stdout/stderr (fd 0/1/2) to /dev/console if it exists
+    mov r0, [console_node]
+    cmp r0, 0
+    je .noconsole
+    mov r1, r4
+    call proc_open_console
+    .noconsole:
+
+    mov r1, PROC_READY
+    mov [r4], r1                 ; publish as runnable
+    mov r0, r4
+    jmp .done
+
+    .failseg:
+    vload r1, r4, PCB_USEG
+    vload r2, r4, PCB_UPAGES
+    call freepages
+    .failslot:
+    mov r1, PROC_FREE
+    mov [r4], r1                 ; release the reserved slot
+    .fail:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Open /dev/console into fd 0, 1 and 2 of a process (stdin/stdout/stderr).
+; Each gets its own handle so closing one does not disturb the others.
+; r1 - PCB pointer
+proc_open_console:
+    push r4                      ; pcb
+    push r5                      ; fd index
+    mov r4, r1
+    mov r5, 0
+    .loop:
+        cmp r5, 3
+        juge .done
+        mov r1, consolepath
+        mov r2, O_RDWR
+        call vfsopen
+        cmp r0, -1
+        je .done
+        push r0                  ; handle
+        mov r1, r4
+        mov r2, r5
+        mov r3, r0
+        call fd_set
+        pop r0
+        add r5, 1
+        jmp .loop
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Release a process's memory and return its slot to the pool. Used by wait()
+; to reap a ZOMBIE.
+; r1 - PCB pointer
+proc_reap:
+    push r4
+    push r5                      ; fd cursor
+    push r6                      ; fd count
+    mov r4, r1
+
+    ; close any file descriptors the process left open
+    mov r5, r4
+    add r5, PCB_FDS
+    mov r6, MAX_FDS
+    .fdclose:
+        mov r0, [r5]
+        cmp r0, -1
+        je .fdnext
+        mov r1, r0
+        call vfsclose
+        .fdnext:
+        add r5, 4
+        sub r6, 1
+        cmp r6, 0
+        jne .fdclose
+
+    vload r1, r4, PCB_USEG
+    vload r2, r4, PCB_UPAGES
+    cmp r1, 0
+    je .noseg
+    call freepages
+    .noseg:
+    vload r1, r4, PCB_KSTACK
+    vload r2, r4, PCB_KPAGES
+    cmp r1, 0
+    je .noks
+    call freepages
+    .noks:
+    mov r0, PROC_FREE
+    mov [r4], r0                 ; slot is free again
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Copy a null-terminated string out of the current process's user address space
+; into a kernel buffer. User pointers are virtual (relative to MBase) and cannot
+; be dereferenced directly from a handler, so we translate and bounds-check each
+; byte against the process's segment.
+; r1 - user pointer (virtual)
+; r2 - kernel destination buffer
+; r3 - destination capacity in bytes
+; returns r0 = 0 on success, -1 if the string ran out of bounds or was too long
+copyinstr:
+    push r4                      ; segment base
+    push r5                      ; segment length
+    push r6                      ; user offset
+    push r7                      ; destination cursor
+    mov r0, [curproc]
+    vload r4, r0, PCB_MBASE
+    vload r5, r0, PCB_MLEN
+    mov r6, r1
+    mov r7, r2
+    .loop:
+        cmp r3, 0
+        je .fault                ; no room left for even the terminator
+        cmp r6, r5
+        juge .fault              ; user offset outside the segment
+        mov r0, r6
+        add r0, r4               ; physical = base + offset
+        mov8 r0, [r0]
+        mov8 [r7], r0
+        cmp r0, 0
+        je .ok                   ; copied the terminator
+        add r6, 1
+        add r7, 1
+        sub r3, 1
+        jmp .loop
+    .ok:
+    mov r0, 0
+    jmp .done
+    .fault:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Translate a user buffer pointer to a kernel (physical) address, bounds-checking
+; the whole [ptr, ptr+len) range against the current process's segment. Because
+; the kernel is identity-mapped, the returned address can be handed straight to
+; the VFS as a read/write target - no bounce buffer needed.
+; r1 - user pointer, r2 - length
+; returns r0 = kernel address, or 0 if the range is out of bounds
+uaddr:
+    push r4                      ; segment length
+    mov r0, [curproc]
+    vload r4, r0, PCB_MLEN
+    mov r0, r1
+    add r0, r2                   ; end = ptr + len
+    cmp r0, r1
+    jul .fault                   ; wrapped -> overflow
+    cmp r0, r4
+    jug .fault                   ; end past the end of the segment
+    mov r0, [curproc]
+    vload r0, r0, PCB_MBASE
+    add r0, r1                   ; physical = base + ptr
+    pop r4
+    ret
+    .fault:
+    mov r0, 0
+    pop r4
+    ret
+
+
+; Copy a null-terminated string from the kernel out to the current process's
+; user address space, bounded by a capacity.
+; r1 - kernel source string
+; r2 - user destination pointer
+; r3 - destination capacity in bytes
+; returns r0 = 0 on success, -1 if it ran out of bounds or capacity
+copyoutstr:
+    push r4                      ; segment base
+    push r5                      ; segment length
+    push r6                      ; user offset
+    push r7                      ; source cursor
+    mov r0, [curproc]
+    vload r4, r0, PCB_MBASE
+    vload r5, r0, PCB_MLEN
+    mov r6, r2
+    mov r7, r1
+    .loop:
+        cmp r3, 0
+        je .fault                ; out of destination capacity
+        cmp r6, r5
+        juge .fault              ; user offset outside the segment
+        mov8 r0, [r7]            ; source byte
+        mov r1, r6
+        add r1, r4               ; physical destination
+        mov8 [r1], r0
+        cmp r0, 0
+        je .ok                   ; wrote the terminator
+        add r6, 1
+        add r7, 1
+        sub r3, 1
+        jmp .loop
+    .ok:
+    mov r0, 0
+    jmp .done
+    .fault:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Wake every process blocked on a channel (mark them READY, clear the channel).
+; r1 - channel value
+proc_wakeup:
+    push r4                      ; channel
+    push r5                      ; cursor
+    push r6                      ; count
+    mov r4, r1
+    mov r5, proctable
+    mov r6, 0
+    .loop:
+        cmp r6, MAX_PROCS
+        juge .done
+        mov r0, [r5]             ; PCB_STATE
+        cmp r0, PROC_BLOCKED
+        jne .next
+        vload r0, r5, PCB_CHAN
+        cmp r0, r4
+        jne .next
+        mov r0, PROC_READY
+        mov [r5], r0
+        mov r0, 0
+        vstore r5, PCB_CHAN, r0, r1
+        .next:
+        add r5, PCB_STRUCT
+        add r6, 1
+        jmp .loop
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret

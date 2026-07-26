@@ -1,0 +1,286 @@
+; ==========================
+;   CatOS heap allocator
+; ==========================
+; A byte-granular allocator that sits on top of the page allocator in
+; alloc.cat. It hands out arbitrary runs of sequential bytes for the kernel
+; by carving them out of whole pages requested via allocpages.
+;
+; The heap is a singly linked list of blocks. Every block starts with a
+; 12 byte header:
+;
+;     +0  size   total size of the block in bytes, INCLUDING this header
+;     +4  next   address of the next block header, 0 if this is the last
+;     +8  used   1 if the block is allocated, 0 if it is free
+;
+; heapalloc walks the list first-fit, splitting a block when the leftover
+; is big enough to be worth its own header. When no block fits it asks the
+; page allocator for more pages and appends them as a fresh free block.
+;
+; heapfree marks a block free and coalesces neighbouring free blocks that
+; are physically adjacent (so freed regions get merged back together).
+
+#define HB_SIZE, 0          ; header field offsets
+#define HB_NEXT, 4
+#define HB_USED, 8
+#define HEAP_HDR, 12         ; header size in bytes
+
+#define HEAP_INIT_PAGES, 2   ; pages grabbed when heapinit runs (grows on demand)
+#define HEAP_MIN_SPLIT, 4    ; smallest payload worth splitting a block for
+
+; load a header field into a register
+; $1 - destination register
+; $2 - block base register
+; $3 - field offset
+#macro hload, 3
+    mov $1, $2
+    add $1, $3
+    mov $1, [$1]
+#endmacro
+
+; store a value into a header field
+; $1 - block base register
+; $2 - field offset
+; $3 - value (register or immediate)
+; $4 - scratch register (clobbered)
+#macro hstore, 4
+    mov $4, $1
+    add $4, $2
+    mov [$4], $3
+#endmacro
+
+
+heapstart:
+    d32 0                    ; address of the first block, 0 until seeded
+
+heapend:
+    d32 0                    ; address one past the highest block
+
+
+; Seed the heap with an initial region. Optional: heapalloc will grow the
+; heap on demand even if this is never called, but seeding up front avoids
+; a page-allocator round trip on the first allocation.
+; returns r0 = 1 on success, 0 if the page allocator was out of memory.
+heapinit:
+    push r4
+
+    mov r1, HEAP_INIT_PAGES
+    call allocpages
+    cmp r0, 0
+    je .fail
+
+    mov r4, r0                   ; region base is the first block
+    mov [heapstart], r4
+
+    mov r1, HEAP_INIT_PAGES
+    shl r1, PAGE_SHIFT_FAC       ; region size in bytes
+
+    mov r2, r4
+    add r2, r1
+    mov [heapend], r2            ; end of the heap
+
+    ; one big free block covering the whole region
+    hstore r4, HB_SIZE, r1, r3
+    hstore r4, HB_NEXT, 0, r3
+    hstore r4, HB_USED, 0, r3
+
+    mov r0, 1
+    pop r4
+    ret
+
+    .fail:
+    mov r0, 0
+    pop r4
+    ret
+
+
+; Allocate a run of sequential bytes.
+; r1 - number of bytes wanted (non zero)
+; returns r0 = address of the first byte, or 0 if we're out of memory.
+heapalloc:
+    push r4                      ; current block
+    push r5                      ; total bytes needed (payload + header)
+    push r6                      ; aligned payload size
+    push r7                      ; scratch / chosen block size
+
+    cmp r1, 0
+    je .fail                     ; zero byte allocations aren't allowed
+
+    ; round the payload up to a 4 byte boundary
+    add r1, 3
+    and r1, -4
+    mov r6, r1
+
+    mov r5, r6
+    add r5, HEAP_HDR             ; total block size we must find
+
+    .search:
+    mov r4, [heapstart]
+    .loop:
+        cmp r4, 0
+        je .grow                 ; hit the end of the list, need more memory
+
+        hload r0, r4, HB_USED
+        cmp r0, 0
+        jne .next                ; already in use
+
+        hload r0, r4, HB_SIZE
+        cmp r0, r5
+        juge .found              ; free and big enough
+
+        .next:
+        hload r4, r4, HB_NEXT
+        jmp .loop
+
+    .found:
+    hload r7, r4, HB_SIZE        ; r7 = size of the block we picked
+
+    ; only split if the remainder can hold a header plus a useful payload
+    mov r0, r7
+    sub r0, r5                   ; r0 = bytes left over after the split
+    cmp r0, HEAP_HDR + HEAP_MIN_SPLIT
+    jul .take                    ; too small, hand out the whole block
+
+    ; split: build a new free block right after the part we keep
+    mov r1, r4
+    add r1, r5                   ; address of the leftover block
+    hstore r1, HB_SIZE, r0, r2   ; leftover size
+    hload r3, r4, HB_NEXT
+    hstore r1, HB_NEXT, r3, r2   ; leftover inherits the old next link
+    hstore r1, HB_USED, 0, r2    ; leftover is free
+    ; shrink the block we're handing out
+    hstore r4, HB_SIZE, r5, r2
+    hstore r4, HB_NEXT, r1, r2
+
+    .take:
+    hstore r4, HB_USED, 1, r2    ; mark allocated
+    mov r0, r4
+    add r0, HEAP_HDR             ; skip the header to the payload
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+    .grow:
+    ; ask the page allocator for enough pages to cover the request
+    mov r1, r5
+    add r1, PAGE_SIZE - 1
+    shr r1, PAGE_SHIFT_FAC       ; page count (round up)
+    call allocpages
+    cmp r0, 0
+    je .fail                     ; genuinely out of memory
+
+    mov r4, r0                   ; new region base becomes a new block
+    ; work out the region size in bytes again (allocpages clobbered r1)
+    mov r1, r5
+    add r1, PAGE_SIZE - 1
+    shr r1, PAGE_SHIFT_FAC
+    shl r1, PAGE_SHIFT_FAC       ; region size in bytes
+
+    hstore r4, HB_SIZE, r1, r2
+    hstore r4, HB_NEXT, 0, r2
+    hstore r4, HB_USED, 0, r2
+
+    ; link the new block into the list
+    mov r3, [heapstart]
+    cmp r3, 0
+    jne .haslist
+    mov [heapstart], r4          ; first block the heap has ever had
+    jmp .grewlinked
+
+    .haslist:
+    .findtail:
+        hload r0, r3, HB_NEXT
+        cmp r0, 0
+        je .tailfound
+        mov r3, r0
+        jmp .findtail
+    .tailfound:
+    hstore r3, HB_NEXT, r4, r0   ; append after the current tail
+
+    .grewlinked:
+    ; push heapend up if this region reaches further than anything so far
+    mov r0, r4
+    add r0, r1                   ; end of the new region
+    mov r2, [heapend]
+    cmp r0, r2
+    jule .grewdone
+    mov [heapend], r0
+    .grewdone:
+
+    jmp .search                  ; retry now that there's a fitting block
+
+    .fail:
+    mov r0, 0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Free a run previously returned by heapalloc.
+; r1 - address returned by heapalloc (0 is a safe no-op)
+heapfree:
+    push r4
+    cmp r1, 0
+    je .done                     ; freeing null does nothing
+
+    mov r4, r1
+    sub r4, HEAP_HDR             ; step back to the header
+    hstore r4, HB_USED, 0, r0    ; mark free
+    call heapcoalesce
+
+    .done:
+    pop r4
+    ret
+
+
+; Merge neighbouring free blocks that are physically adjacent. Because
+; blocks stay in address order within any contiguous page run, two free
+; blocks that touch in memory are always adjacent in the list too, so a
+; single left-to-right sweep is enough.
+heapcoalesce:
+    push r4                      ; current block
+    push r5                      ; successor block
+
+    mov r4, [heapstart]
+    .loop:
+        cmp r4, 0
+        je .done
+
+        hload r5, r4, HB_NEXT
+        cmp r5, 0
+        je .done                 ; nothing after this block
+
+        hload r0, r4, HB_USED
+        cmp r0, 0
+        jne .advance             ; current block is in use
+
+        hload r0, r5, HB_USED
+        cmp r0, 0
+        jne .advance             ; successor is in use
+
+        ; are they physically touching?  r4 + size(r4) == r5
+        hload r0, r4, HB_SIZE
+        add r0, r4
+        cmp r0, r5
+        jne .advance             ; a gap between them, leave it alone
+
+        ; merge the successor into the current block
+        hload r0, r4, HB_SIZE
+        hload r1, r5, HB_SIZE
+        add r0, r1
+        hstore r4, HB_SIZE, r0, r2
+        hload r0, r5, HB_NEXT
+        hstore r4, HB_NEXT, r0, r2
+        jmp .loop                ; recheck r4 against its new successor
+
+        .advance:
+        mov r4, r5
+        jmp .loop
+
+    .done:
+    pop r5
+    pop r4
+    ret

@@ -1,0 +1,208 @@
+; ==========================
+;   CatOS userland syscall interface
+; ==========================
+; Shared by every user program. Defines the syscall numbers (which must match
+; syscall.cat) and thin macros around the `syscall` instruction. User code runs
+; in virtual mode, so `syscall` is the ONLY way it can reach the kernel - every
+; privileged instruction (int, in, out, di, ei, iret, ...) faults here. A fault no
+; longer crashes the machine: the kernel turns it into a signal (SIGSEGV for a bad
+; access or privileged op, SIGILL for a bad opcode, SIGFPE for divide-by-zero) and,
+; if the program has not installed a handler, terminates it with code 128+signal.
+; See sys_signal / sys_kill below.
+;
+; Convention: r1 = syscall number, r2/r3 = arguments, r0 = result.
+
+#define SYS_TEST, 0
+#define SYS_YIELD, 1
+#define SYS_EXIT, 2
+#define SYS_GETPID, 3
+#define SYS_WAIT, 4
+#define SYS_PRINT, 5
+#define SYS_SPAWN, 6
+#define SYS_OPEN, 7
+#define SYS_CLOSE, 8
+#define SYS_READ, 9
+#define SYS_WRITE, 10
+#define SYS_SEEK, 11
+#define SYS_READDIR, 12
+#define SYS_CREATE, 13
+#define SYS_SIGNAL, 14
+#define SYS_KILL, 15
+
+; open() modes (bitfield) and seek() whence, matching the kernel VFS
+#define O_READ, 1
+#define O_WRITE, 2
+#define O_RDWR, 3
+#define O_CREATE, 4
+#define O_APPEND, 8
+#define O_TRUNC, 16
+#define SEEK_SET, 0
+#define SEEK_CUR, 1
+#define SEEK_END, 2
+; node types for create()
+#define T_FILE, 1
+#define T_DIR, 2
+
+; Give up the CPU but stay runnable.
+#macro sys_yield, 0
+    mov r1, SYS_YIELD
+    syscall
+#endmacro
+
+; Terminate with an exit code. $1 = code. Does not return.
+#macro sys_exit, 1
+    mov r2, $1
+    mov r1, SYS_EXIT
+    syscall
+#endmacro
+
+; Print a value (debug). $1 = value (register or immediate).
+#macro sys_print, 1
+    mov r2, $1
+    mov r1, SYS_PRINT
+    syscall
+#endmacro
+
+; Wait for a child pid to exit; its exit code lands in r0. $1 = pid.
+#macro sys_wait, 1
+    mov r2, $1
+    mov r1, SYS_WAIT
+    syscall
+#endmacro
+
+; Load and run a program by path, no arguments; its pid lands in r0 (-1 on fail).
+; $1 = pointer to a null-terminated path.
+#macro sys_spawn, 1
+    mov r3, 0
+    mov r2, $1
+    mov r1, SYS_SPAWN
+    syscall
+#endmacro
+
+; Spawn a program (no arguments) and wait for it; its exit code lands in r0.
+; $1 = pointer to a null-terminated path.
+#macro sys_spawnwait, 1
+    mov r3, 0
+    mov r2, $1
+    mov r1, SYS_SPAWN
+    syscall
+    mov r2, r0
+    mov r1, SYS_WAIT
+    syscall
+#endmacro
+
+; Spawn a program with arguments; its pid lands in r0. $1 = path, $2 = argv
+; (a null-terminated array of string pointers, in this program's address space).
+#macro sys_spawn_argv, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_SPAWN
+    syscall
+#endmacro
+
+; Spawn a program with arguments and wait for it; exit code lands in r0.
+; $1 = path, $2 = argv.
+#macro sys_spawnwait_argv, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_SPAWN
+    syscall
+    mov r2, r0
+    mov r1, SYS_WAIT
+    syscall
+#endmacro
+
+; ---- file I/O (return value in r0; r5-r7 survive a syscall, r1-r4 do not) ----
+
+; open(path, mode) -> fd (or -1). $1 = path, $2 = O_* mode bits.
+#macro sys_open, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_OPEN
+    syscall
+#endmacro
+
+; close(fd). $1 = fd.
+#macro sys_close, 1
+    mov r2, $1
+    mov r1, SYS_CLOSE
+    syscall
+#endmacro
+
+; read(fd, buf, len) -> bytes read. $1 = fd, $2 = buffer, $3 = length.
+#macro sys_read, 3
+    mov r4, $3
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_READ
+    syscall
+#endmacro
+
+; write(fd, buf, len) -> bytes written. $1 = fd, $2 = buffer, $3 = length.
+#macro sys_write, 3
+    mov r4, $3
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WRITE
+    syscall
+#endmacro
+
+; seek(fd, offset, whence) -> new cursor. $1 = fd, $2 = offset, $3 = SEEK_*.
+#macro sys_seek, 3
+    mov r4, $3
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_SEEK
+    syscall
+#endmacro
+
+; readdir(fd, buf, buflen) -> 1 entry / 0 end / -1. $1 = fd, $2 = name buffer.
+#macro sys_readdir, 3
+    mov r4, $3
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_READDIR
+    syscall
+#endmacro
+
+; create(path, type) -> 0/-1. $1 = path, $2 = T_FILE or T_DIR.
+#macro sys_create, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_CREATE
+    syscall
+#endmacro
+
+; ---- signals ----
+; Dispositions (passed as the handler argument to sys_signal):
+#define SIG_DFL, 0              ; default action (terminate, or ignore for SIGUSR*)
+#define SIG_IGN, 1              ; ignore the signal
+; Signal numbers (keep in sync with the kernel's signal.cat):
+#define SIGINT,  2
+#define SIGILL,  4
+#define SIGABRT, 6
+#define SIGFPE,  8
+#define SIGKILL, 9             ; cannot be caught or ignored
+#define SIGUSR1, 10
+#define SIGSEGV, 11
+#define SIGUSR2, 12
+#define SIGTERM, 15
+
+; signal(signum, handler) -> previous disposition (or -1). $1 = signal number,
+; $2 = a handler address, or SIG_DFL / SIG_IGN. A handler is a plain proc that
+; takes the signal number in r1 and ends in `ret`; returning resumes wherever the
+; program was interrupted. SIGKILL cannot be caught.
+#macro sys_signal, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_SIGNAL
+    syscall
+#endmacro
+
+; kill(pid, signum) -> 0/-1. Send a signal to a process. $1 = pid, $2 = signal.
+#macro sys_kill, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_KILL
+    syscall
+#endmacro

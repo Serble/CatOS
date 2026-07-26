@@ -1,0 +1,28 @@
+; Interactive console demo: prints a banner, then loops reading a line from
+; stdin (fd 0) and writing a response to stdout (fd 1). The tty echoes what you
+; type; pressing Enter delivers the line. Proves the PPU console does real text
+; output and keyboard input through the ordinary read/write syscalls.
+#include "sys.cat"
+
+    sys_write 1, banner, banner_end - banner
+conloop:
+    sys_write 1, prompt, prompt_end - prompt
+    sys_read 0, linebuf, 128         ; blocks until a line is typed
+    mov r6, r0                       ; bytes read (r5-r7 survive syscalls)
+    cmp r6, 0
+    jile conloop
+    sys_write 1, reply, reply_end - reply
+    sys_write 1, linebuf, r6         ; echo the line back (it ends in newline)
+    jmp conloop
+
+banner:
+    dstr "CatOS console up. Type something and press Enter.\n"
+banner_end:
+prompt:
+    dstr "> "
+prompt_end:
+reply:
+    dstr "you said: "
+reply_end:
+linebuf:
+    res8 128

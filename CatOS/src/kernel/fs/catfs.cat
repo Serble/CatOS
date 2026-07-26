@@ -1,0 +1,1686 @@
+; ==========================
+;   CatFS - CatOS native journaling filesystem driver
+; ==========================
+; A read/write, crash-safe filesystem that can serve as the root "/". It reads
+; the on-disk format documented in ../CatFS.md, replays the journal on mount to
+; recover from a crash, and funnels every mutation through a write-ahead redo
+; log so a power loss can never leave the metadata half-updated.
+;
+; The filesystem lives inside one partition, reached through a block-backed
+; file descriptor (BF, see disk.cat): BF_PORT + BF_BASE give the disk port and
+; the partition's first block. Every CatFS block number below is partition
+; relative; the absolute disk block is BF_BASE + fsblock.
+;
+; This driver assumes a single mounted CatFS instance (the root). Its cached
+; superblock and scratch buffers are global; a VFS node stores only its inode
+; number in NODE_FSDATA.
+;
+;   mov r1, catfs_name
+;   mov r2, catfs_mount
+;   call vfsregister
+;   mov r1, rootpath           ; "/"
+;   mov r2, catfs_name
+;   mov r3, [some_bf]          ; block-backed-file descriptor for the partition
+;   call vfsmount
+;
+; Requires: disk.cat (disk_readblock/writeblock, BF_*, BLOCK_SIZE/SHIFT),
+;           vfs.cat (node layout, vfsnodenew, vload/vstore), panic.cat, heapalloc.
+
+
+; ---- on-disk magics ----
+#define CATFS_MAGIC, 0x46746143      ; "CatF"
+#define CATFS_JMAGIC, 0x316C6E4A     ; "Jnl1"
+
+; ---- inode types (chosen to match the VFS NODE_* tags) ----
+#define CATFS_TFILE, 1               ; == NODE_FILE
+#define CATFS_TDIR, 2                ; == NODE_DIR
+
+; ---- superblock field offsets ----
+#define SB_TOTAL, 0x0C
+#define SB_ICOUNT, 0x10
+#define SB_IBM_START, 0x14
+#define SB_IBM_BLOCKS, 0x18
+#define SB_DBM_START, 0x1C
+#define SB_DBM_BLOCKS, 0x20
+#define SB_IT_START, 0x24
+#define SB_IT_BLOCKS, 0x28
+#define SB_DATA_START, 0x2C
+#define SB_DATA_BLOCKS, 0x30
+#define SB_J_START, 0x34
+#define SB_J_BLOCKS, 0x38
+#define SB_ROOT_INO, 0x3C
+
+; ---- journal header fields ----
+#define JH_MAGIC, 0
+#define JH_STATE, 4
+#define JH_COUNT, 8
+#define JH_SEQ, 12
+#define JSTATE_EMPTY, 0
+#define JSTATE_COMMIT, 1
+
+; ---- inode layout (64 bytes) ----
+#define CI_TYPE, 0
+#define CI_SIZE, 4
+#define CI_LINKS, 8
+#define CI_FLAGS, 12
+#define CI_DIRECT, 16                ; 8 direct pointers
+#define CI_INDIRECT, 48
+#define CATFS_DIRECT, 8
+#define CATFS_PTRS, 128              ; pointers per indirect block (512/4)
+#define CATFS_ISIZE, 64
+#define CATFS_ISHIFT, 6              ; log2(64)
+#define CATFS_IPERBLK, 8             ; inodes per block
+#define CATFS_IPERSHIFT, 3           ; log2(8)
+
+; ---- directory entry (32 bytes) ----
+#define DE_INO, 0
+#define DE_NAME, 4
+#define DE_STRUCT, 32
+#define DE_SHIFT, 5                  ; log2(32)
+#define DE_PERBLK, 16                ; dirents per block
+#define DE_PERSHIFT, 4               ; log2(16)
+#define CATFS_NAMEMAX, 27
+
+; ---- journal transaction capacity (must be <= journal_blocks - 2) ----
+#define CATFS_MAXTXN, 32
+
+; ---- panic codes ----
+#define CATFS_PANIC_MAGIC, 0xC5       ; superblock magic mismatch at mount
+#define CATFS_PANIC_TXN, 0xC6         ; transaction overflowed the log buffer
+
+
+; ==========================
+;   Global state
+; ==========================
+catfs_port:
+    d32 0
+catfs_base:
+    d32 0
+catfs_total:
+    d32 0
+catfs_icount:
+    d32 0
+catfs_ibmstart:
+    d32 0
+catfs_ibmblocks:
+    d32 0
+catfs_dbmstart:
+    d32 0
+catfs_dbmblocks:
+    d32 0
+catfs_itstart:
+    d32 0
+catfs_itblocks:
+    d32 0
+catfs_datastart:
+    d32 0
+catfs_datablocks:
+    d32 0
+catfs_jstart:
+    d32 0
+catfs_jblocks:
+    d32 0
+catfs_rootino:
+    d32 0
+catfs_seq:
+    d32 0
+catfs_inoblk:
+    d32 0                            ; fs block holding the inode now in catfs_ibuf
+catfs_iptr:
+    d32 0                            ; address of the loaded inode inside catfs_ibuf
+catfs_curino:
+    d32 0                            ; inode number of the op currently running
+catfs_dirblk:
+    d32 0                            ; fsblock of the dir data block now in catfs_dbuf
+catfs_t_fsblk:
+    d32 0                            ; per-iteration scratch (block map result)
+catfs_t_bo:
+    d32 0                            ; per-iteration scratch (byte offset in block)
+catfs_t_n:
+    d32 0                            ; per-iteration scratch (bytes this step)
+catfs_txncount:
+    d32 0
+
+catfs_txntargets:
+    res8 CATFS_MAXTXN * 4
+catfs_txndata:
+    res8 CATFS_MAXTXN * 512
+
+catfs_sb:
+    res8 512                         ; cached superblock
+catfs_ibuf:
+    res8 512                         ; inode block scratch
+catfs_dbuf:
+    res8 512                         ; directory / file data scratch
+catfs_blk:
+    res8 512                         ; indirect / header scratch
+catfs_bmbuf:
+    res8 512                         ; bitmap scratch
+catfs_jdesc:
+    res8 512                         ; journal descriptor scratch
+catfs_zeros:
+    res8 512                         ; a permanently-zero block
+
+
+; ==========================
+;   Low-level helpers
+; ==========================
+
+; Zero a word-aligned buffer.
+; r1 - address, r2 - byte count
+catfs_zerobuf:
+    push r4
+    mov r4, r1
+    .loop:
+        cmp r2, 0
+        je .done
+        mov [r4], 0
+        add r4, 4
+        sub r2, 4
+        jmp .loop
+    .done:
+    pop r4
+    ret
+
+
+; Copy len bytes. r1 - dest, r2 - src, r3 - len. Returns r0 = dest.
+catfs_cpy:
+    mov r0, r1
+    cpy r2, r3
+    ret
+
+
+; Read an absolute-from-partition block straight off the disk.
+; r1 - fsblock, r2 - destination buffer
+catfs_diskread:
+    push r4
+    mov r4, r2
+    mov r3, [catfs_base]
+    add r3, r1
+    mov r1, [catfs_port]
+    mov r2, r4
+    call disk_readblock
+    pop r4
+    ret
+
+
+; Write a block straight to the disk.
+; r1 - fsblock, r2 - source buffer
+catfs_diskwrite:
+    push r4
+    mov r4, r2
+    mov r3, [catfs_base]
+    add r3, r1
+    mov r1, [catfs_port]
+    mov r2, r4
+    call disk_writeblock
+    pop r4
+    ret
+
+
+; ==========================
+;   Journal / transactions
+; ==========================
+; A transaction buffers block writes in RAM (targets + data). commit flushes
+; them through the redo log (see CatFS.md section 6). Reads inside a
+; transaction see pending writes so a multi-step op is internally consistent.
+
+; Find a block in the current transaction.
+; r1 - fsblock -> r0 = slot index, or -1 if not buffered
+catfs_txnfind:
+    push r4                          ; count
+    push r5                          ; index
+    push r6                          ; cursor
+    mov r4, [catfs_txncount]
+    mov r5, 0
+    mov r6, catfs_txntargets
+    .loop:
+        cmp r5, r4
+        juge .none
+        mov r0, [r6]
+        cmp r0, r1
+        je .found
+        add r6, 4
+        add r5, 1
+        jmp .loop
+    .found:
+    mov r0, r5
+    jmp .done
+    .none:
+    mov r0, -1
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Address of transaction data slot i. r1 - index -> r0 = pointer
+catfs_txnslot:
+    mov r0, r1
+    shl r0, BLOCK_SHIFT
+    add r0, catfs_txndata
+    ret
+
+
+; Begin a fresh transaction.
+catfs_txn_begin:
+    mov r0, 0
+    mov [catfs_txncount], r0
+    ret
+
+
+; Read a block, honouring pending transaction writes.
+; r1 - fsblock, r2 - destination buffer
+catfs_txn_read:
+    push r4                          ; dest
+    push r5                          ; fsblock
+    mov r4, r2
+    mov r5, r1
+    call catfs_txnfind
+    cmp r0, -1
+    je .disk
+    mov r1, r0
+    call catfs_txnslot               ; r0 = source slot
+    mov r1, r4
+    mov r2, r0
+    mov r3, BLOCK_SIZE
+    call catfs_cpy
+    jmp .done
+    .disk:
+    mov r1, r5
+    mov r2, r4
+    call catfs_diskread
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Buffer a block write into the current transaction.
+; r1 - fsblock, r2 - source buffer
+catfs_txn_write:
+    push r4                          ; fsblock
+    push r5                          ; source
+    push r6                          ; slot index
+    mov r4, r1
+    mov r5, r2
+    call catfs_txnfind
+    cmp r0, -1
+    jne .have
+    mov r6, [catfs_txncount]         ; append a new slot
+    cmp r6, CATFS_MAXTXN
+    juge .full
+    mov r0, r6
+    shl r0, 2
+    add r0, catfs_txntargets
+    mov [r0], r4
+    mov r0, r6
+    add r0, 1
+    mov [catfs_txncount], r0
+    jmp .store
+    .have:
+    mov r6, r0
+    .store:
+    mov r1, r6
+    call catfs_txnslot               ; r0 = dest slot
+    mov r1, r0
+    mov r2, r5
+    mov r3, BLOCK_SIZE
+    call catfs_cpy
+    jmp .done
+    .full:
+    kpanic CATFS_PANIC_TXN
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Write the journal header (state r1, count r2) using the current seq.
+catfs_writeheader:
+    push r4                          ; state
+    push r5                          ; count
+    mov r4, r1
+    mov r5, r2
+    mov r1, catfs_blk
+    mov r2, BLOCK_SIZE
+    call catfs_zerobuf
+    mov r0, CATFS_JMAGIC
+    mov [catfs_blk], r0
+    mov r0, catfs_blk
+    add r0, JH_STATE
+    mov [r0], r4
+    mov r0, catfs_blk
+    add r0, JH_COUNT
+    mov [r0], r5
+    mov r0, catfs_blk
+    add r0, JH_SEQ
+    mov r1, [catfs_seq]
+    mov [r0], r1
+    mov r1, [catfs_jstart]
+    mov r2, catfs_blk
+    call catfs_diskwrite
+    pop r5
+    pop r4
+    ret
+
+
+; Commit the current transaction (the 5-step protocol from CatFS.md).
+catfs_txn_commit:
+    push r4                          ; count
+    push r5                          ; index
+    push r6                          ; scratch
+    push r7                          ; scratch
+    mov r4, [catfs_txncount]
+    cmp r4, 0
+    je .empty
+
+    ; 1. copy each data block into its journal data slot on disk
+    mov r5, 0
+    .dloop:
+        cmp r5, r4
+        juge .ddone
+        mov r1, r5
+        call catfs_txnslot           ; r0 = data ptr
+        mov r6, r0
+        mov r1, [catfs_jstart]
+        add r1, 2
+        add r1, r5                   ; journal_start + 2 + i
+        mov r2, r6
+        call catfs_diskwrite
+        add r5, 1
+        jmp .dloop
+    .ddone:
+
+    ; 2. write the descriptor block (target list)
+    mov r1, catfs_jdesc
+    mov r2, BLOCK_SIZE
+    call catfs_zerobuf
+    mov r5, 0
+    .descloop:
+        cmp r5, r4
+        juge .descdone
+        mov r0, r5
+        shl r0, 2
+        add r0, catfs_txntargets
+        mov r6, [r0]
+        mov r0, r5
+        shl r0, 2
+        add r0, catfs_jdesc
+        mov [r0], r6
+        add r5, 1
+        jmp .descloop
+    .descdone:
+    mov r1, [catfs_jstart]
+    add r1, 1
+    mov r2, catfs_jdesc
+    call catfs_diskwrite
+
+    ; 3. commit point: header goes COMMITTED
+    mov r0, [catfs_seq]
+    add r0, 1
+    mov [catfs_seq], r0
+    mov r1, JSTATE_COMMIT
+    mov r2, r4
+    call catfs_writeheader
+
+    ; 4. checkpoint: copy each data block to its real target
+    mov r5, 0
+    .cploop:
+        cmp r5, r4
+        juge .cpdone
+        mov r1, r5
+        call catfs_txnslot
+        mov r6, r0
+        mov r0, r5
+        shl r0, 2
+        add r0, catfs_txntargets
+        mov r1, [r0]                 ; target fsblock
+        mov r2, r6
+        call catfs_diskwrite
+        add r5, 1
+        jmp .cploop
+    .cpdone:
+
+    ; 5. header goes EMPTY - transaction done
+    mov r1, JSTATE_EMPTY
+    mov r2, 0
+    call catfs_writeheader
+    .empty:
+    mov r0, 0
+    mov [catfs_txncount], r0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Replay a committed-but-unfinished transaction, if any. Run once at mount.
+catfs_recover:
+    push r4                          ; count
+    push r5                          ; index
+    push r6                          ; scratch
+    mov r1, [catfs_jstart]
+    mov r2, catfs_blk
+    call catfs_diskread              ; header
+    mov r0, [catfs_blk]
+    cmp r0, CATFS_JMAGIC
+    jne .none
+    mov r0, catfs_blk
+    add r0, JH_STATE
+    mov r0, [r0]
+    cmp r0, JSTATE_COMMIT
+    jne .none
+
+    mov r0, catfs_blk
+    add r0, JH_COUNT
+    mov r4, [r0]
+    mov r0, catfs_blk
+    add r0, JH_SEQ
+    mov r6, [r0]
+    mov [catfs_seq], r6
+
+    mov r1, [catfs_jstart]           ; descriptor
+    add r1, 1
+    mov r2, catfs_jdesc
+    call catfs_diskread
+
+    mov r5, 0
+    .loop:
+        cmp r5, r4
+        juge .done
+        mov r1, [catfs_jstart]       ; journal data block -> scratch
+        add r1, 2
+        add r1, r5
+        mov r2, catfs_dbuf
+        call catfs_diskread
+        mov r0, r5                   ; target from descriptor
+        shl r0, 2
+        add r0, catfs_jdesc
+        mov r1, [r0]
+        mov r2, catfs_dbuf
+        call catfs_diskwrite
+        add r5, 1
+        jmp .loop
+    .done:
+    mov r1, JSTATE_EMPTY             ; mark the log consumed
+    mov r2, 0
+    call catfs_writeheader
+    .none:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Bitmaps
+; ==========================
+
+; Test a bitmap bit. r1 - bitmap start block, r2 - index -> r0 = 0/1
+catfs_bit_get:
+    push r4                          ; index
+    push r5                          ; byte offset
+    push r6                          ; bit position
+    mov r4, r2
+    mov r0, r4                       ; block = start + idx>>12
+    shr r0, 12
+    add r0, r1
+    mov r1, r0
+    mov r2, catfs_bmbuf
+    call catfs_txn_read
+    mov r5, r4                       ; byteoff = (idx & 4095) >> 3
+    and r5, 4095
+    shr r5, 3
+    mov r6, r4                       ; bit = idx & 7
+    and r6, 7
+    mov r0, catfs_bmbuf
+    add r0, r5
+    mov8 r0, [r0]
+    shr r0, r6
+    and r0, 1
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Set/clear a bitmap bit (buffered in the transaction).
+; r1 - bitmap start, r2 - index, r3 - value (0/1)
+catfs_bit_set:
+    push r4                          ; index
+    push r5                          ; value
+    push r6                          ; bitmap block fsblock
+    push r7                          ; byte offset
+    mov r4, r2
+    mov r5, r3
+    mov r6, r4                       ; block = start + idx>>12
+    shr r6, 12
+    add r6, r1
+    mov r1, r6
+    mov r2, catfs_bmbuf
+    call catfs_txn_read
+    mov r7, r4                       ; byteoff
+    and r7, 4095
+    shr r7, 3
+    mov r1, r4                       ; mask = 1 << (idx & 7)
+    and r1, 7
+    mov r2, 1
+    shl r2, r1
+    mov r0, catfs_bmbuf
+    add r0, r7
+    mov8 r1, [r0]                    ; current byte
+    cmp r5, 0
+    je .clear
+    or r1, r2
+    jmp .store
+    .clear:
+    not r2
+    and r1, r2
+    .store:
+    mov8 [r0], r1
+    mov r1, r6                       ; write the bitmap block back
+    mov r2, catfs_bmbuf
+    call catfs_txn_write
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Allocate a data block: mark it used and zero it. -> r0 = fsblock, 0 if full.
+catfs_alloc_block:
+    push r4                          ; bitmap block index
+    push r5                          ; byte within block
+    push r6                          ; data index base
+    push r7                          ; scratch
+    mov r4, 0
+    .bmloop:
+        mov r0, [catfs_dbmblocks]
+        cmp r4, r0
+        juge .full
+        mov r1, [catfs_dbmstart]
+        add r1, r4
+        mov r2, catfs_bmbuf
+        call catfs_txn_read
+        mov r5, 0
+        .byteloop:
+            cmp r5, BLOCK_SIZE
+            juge .nextbm
+            mov r0, catfs_bmbuf
+            add r0, r5
+            mov8 r0, [r0]
+            cmp r0, 255
+            je .nextbyte
+            ; found a byte with a free bit; find it
+            mov r6, 0                ; bit position
+            .bitloop:
+                mov r7, 1
+                shl r7, r6
+                mov r0, catfs_bmbuf
+                add r0, r5
+                mov8 r0, [r0]
+                and r0, r7
+                cmp r0, 0
+                je .gotbit
+                add r6, 1
+                cmp r6, 8
+                jul .bitloop
+            .nextbyte:
+            add r5, 1
+            jmp .byteloop
+        .nextbm:
+        add r4, 1
+        jmp .bmloop
+    .gotbit:
+    ; data index = bmblock*4096 + byte*8 + bit
+    mov r0, r4
+    shl r0, 12
+    mov r1, r5
+    shl r1, 3
+    add r0, r1
+    add r0, r6
+    mov r1, [catfs_datablocks]
+    cmp r0, r1
+    juge .full                       ; bit lies past the real data region
+    push r0                          ; data index
+    ; set the bit
+    mov r1, [catfs_dbmstart]
+    mov r2, r0
+    mov r3, 1
+    call catfs_bit_set
+    pop r0
+    mov r1, [catfs_datastart]        ; fsblock = data_start + index
+    add r0, r1
+    push r0
+    mov r1, r0                       ; zero the fresh block
+    mov r2, catfs_zeros
+    call catfs_txn_write
+    pop r0
+    jmp .done
+    .full:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Free a data block. r1 - fsblock (0 ignored)
+catfs_free_block:
+    cmp r1, 0
+    je .done
+    push r4
+    mov r4, r1
+    mov r1, [catfs_dbmstart]
+    mov r2, r4
+    mov r0, [catfs_datastart]
+    sub r2, r0                       ; index = fsblock - data_start
+    mov r3, 0
+    call catfs_bit_set
+    pop r4
+    .done:
+    ret
+
+
+; Allocate an inode number. -> r0 = inode, or 0 if none free.
+catfs_alloc_inode:
+    push r4                          ; candidate inode
+    mov r4, 1                        ; inode 0 is reserved
+    .loop:
+        mov r0, [catfs_icount]
+        cmp r4, r0
+        juge .full
+        mov r1, [catfs_ibmstart]
+        mov r2, r4
+        call catfs_bit_get
+        cmp r0, 0
+        je .found
+        add r4, 1
+        jmp .loop
+    .found:
+    mov r1, [catfs_ibmstart]
+    mov r2, r4
+    mov r3, 1
+    call catfs_bit_set
+    mov r0, r4
+    jmp .done
+    .full:
+    mov r0, 0
+    .done:
+    pop r4
+    ret
+
+
+; Free an inode number. r1 - inode
+catfs_free_inode:
+    mov r2, r1
+    mov r1, [catfs_ibmstart]
+    mov r3, 0
+    call catfs_bit_set
+    ret
+
+
+; ==========================
+;   Inodes
+; ==========================
+; The inode currently being worked on is loaded into catfs_ibuf; catfs_ibuf +
+; offset is its address, and catfs_inoblk remembers which block it came from so
+; it can be written back. Always store one inode before loading another.
+
+; Load an inode into catfs_ibuf. r1 - inode -> r0 = address inside catfs_ibuf
+catfs_load_inode:
+    push r4                          ; inode
+    push r5                          ; offset
+    mov r4, r1
+    mov r0, r4                       ; block = itable_start + inode>>3
+    shr r0, CATFS_IPERSHIFT
+    mov r1, [catfs_itstart]
+    add r0, r1
+    mov [catfs_inoblk], r0
+    mov r5, r4                       ; offset = (inode & 7) << 6
+    and r5, 7
+    shl r5, CATFS_ISHIFT
+    mov r1, [catfs_inoblk]
+    mov r2, catfs_ibuf
+    call catfs_txn_read
+    mov r0, catfs_ibuf
+    add r0, r5
+    mov [catfs_iptr], r0             ; publish for the block-mapping loops
+    pop r5
+    pop r4
+    ret
+
+
+; Write the inode block in catfs_ibuf back through the transaction.
+catfs_store_inode:
+    mov r1, [catfs_inoblk]
+    mov r2, catfs_ibuf
+    call catfs_txn_write
+    ret
+
+
+; Map a file block index to its fsblock, optionally allocating.
+; r1 - inode address (in catfs_ibuf), r2 - file block index, r3 - allocate flag
+; -> r0 = fsblock, or 0 (hole / past capacity when not allocating)
+catfs_map_block:
+    push r4                          ; inode address
+    push r5                          ; file block index
+    push r6                          ; allocate flag
+    push r7                          ; scratch
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+
+    cmp r5, CATFS_DIRECT
+    juge .indirect
+    ; direct[fbi]
+    mov r7, r4                       ; slot addr = inode + CI_DIRECT + fbi*4
+    add r7, CI_DIRECT
+    mov r0, r5
+    shl r0, 2
+    add r7, r0
+    mov r0, [r7]
+    cmp r0, 0
+    jne .done
+    cmp r6, 0
+    je .done                         ; hole, not allocating
+    call catfs_alloc_block           ; allocate a direct block
+    mov [r7], r0
+    push r0
+    call catfs_store_inode
+    pop r0
+    jmp .done
+
+    .indirect:
+    sub r5, CATFS_DIRECT
+    cmp r5, CATFS_PTRS
+    juge .fail                       ; beyond single-indirect capacity
+    mov r7, r4                       ; indirect pointer slot
+    add r7, CI_INDIRECT
+    mov r0, [r7]
+    cmp r0, 0
+    jne .haveind
+    cmp r6, 0
+    je .done                         ; hole
+    call catfs_alloc_block           ; allocate the indirect block itself
+    mov r7, r4
+    add r7, CI_INDIRECT
+    mov [r7], r0
+    push r0
+    call catfs_store_inode
+    pop r0
+    .haveind:
+    mov r7, r0                       ; r7 = indirect fsblock
+    mov r1, r7                       ; load it
+    mov r2, catfs_blk
+    call catfs_txn_read
+    mov r0, r5                       ; pointer slot addr
+    shl r0, 2
+    add r0, catfs_blk
+    mov r1, [r0]
+    cmp r1, 0
+    jne .indfound
+    cmp r6, 0
+    je .indhole
+    push r7                          ; keep indirect fsblock
+    call catfs_alloc_block           ; allocate a data block
+    mov r1, r0                       ; new block
+    pop r7
+    mov r2, r7                       ; reload indirect (alloc left catfs_blk stale)
+    push r1
+    mov r1, r7
+    mov r2, catfs_blk
+    call catfs_txn_read
+    pop r1
+    mov r0, r5                       ; write pointer
+    shl r0, 2
+    add r0, catfs_blk
+    mov [r0], r1
+    push r1
+    mov r1, r7
+    mov r2, catfs_blk
+    call catfs_txn_write
+    pop r0
+    jmp .done
+    .indfound:
+    mov r0, r1
+    jmp .done
+    .indhole:
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Node construction
+; ==========================
+; Build a VFS node backed by a CatFS inode.
+; r1 - node type, r2 - name, r3 - parent, [sp] - inode number
+; -> r0 = node (ref taken) or 0
+catfs_makenode:
+    push r4                          ; inode number
+    push r5                          ; node
+    mov r4, sp                       ; 4th arg (inode) sits above the two pushes
+    add r4, 12                       ; 2 pushes + return address
+    mov r4, [r4]
+    call vfsnodenew                  ; r1/r2/r3 still type/name/parent
+    cmp r0, 0
+    je .done
+    mov r5, r0
+    vstore r5, NODE_OPS, catfs_ops, r1
+    vstore r5, NODE_FSDATA, r4, r1
+    ; size from the inode
+    mov r1, r4
+    call catfs_load_inode            ; r0 = inode addr
+    vload r1, r0, CI_SIZE
+    vstore r5, NODE_SIZE, r1, r2
+    mov r0, r5
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Directory operations
+; ==========================
+
+; Find a child by name. r1 - dir inode addr, r2 - name
+; -> r0 = child inode number, 0 if absent
+catfs_dir_find:
+    push r4                          ; dir inode addr
+    push r5                          ; name
+    push r6                          ; entry index
+    push r7                          ; entry count
+    mov r4, r1
+    mov r5, r2
+    vload r7, r4, CI_SIZE
+    shr r7, DE_SHIFT                 ; entry count = size / 32
+    mov r6, 0
+    .loop:
+        cmp r6, r7
+        juge .none
+        mov r0, r6                   ; new block? load it
+        and r0, DE_PERBLK - 1
+        cmp r0, 0
+        jne .haveblk
+        mov r1, r4
+        mov r2, r6
+        shr r2, DE_PERSHIFT          ; file block index
+        mov r3, 0
+        call catfs_map_block
+        cmp r0, 0
+        je .skipblk                  ; hole (should not happen in a dir)
+        mov r1, r0
+        mov r2, catfs_dbuf
+        call catfs_txn_read
+        .haveblk:
+        mov r0, r6                   ; entry addr = dbuf + (idx&15)*32
+        and r0, DE_PERBLK - 1
+        shl r0, DE_SHIFT
+        add r0, catfs_dbuf
+        mov r1, [r0]                 ; DE_INO
+        cmp r1, 0
+        je .next                     ; free slot
+        push r0                      ; save entry addr across the compare
+        mov r1, r0
+        add r1, DE_NAME
+        mov r2, r5
+        call vfsstreq                ; r0 = 1 if the names match
+        pop r1                       ; r1 = entry addr
+        cmp r0, 0
+        je .next
+        mov r0, [r1]                 ; matched: hand back the inode number
+        jmp .done
+    .next:
+        add r6, 1
+        jmp .loop
+    .skipblk:
+        add r6, DE_PERBLK            ; hole: skip a whole block of entries
+        jmp .loop
+    .none:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Copy a name (up to CATFS_NAMEMAX bytes, stopping at the null) to dest.
+; The destination is assumed pre-zeroed. r1 - dest, r2 - source
+catfs_namecpy:
+    push r4                          ; dest cursor
+    push r5                          ; count
+    mov r4, r1
+    mov r5, 0
+    .loop:
+        cmp r5, CATFS_NAMEMAX
+        juge .done
+        mov8 r0, [r2]
+        cmp r0, 0
+        je .done
+        mov8 [r4], r0
+        add r4, 1
+        add r2, 1
+        add r5, 1
+        jmp .loop
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Add a directory entry. Must run inside a transaction.
+; r1 - parent inode number, r2 - name, r3 - child inode number
+catfs_dir_add:
+    push r4                          ; name
+    push r5                          ; child inode
+    push r6                          ; entry index e
+    push r7                          ; entry address
+    mov r4, r2
+    mov r5, r3
+    call catfs_load_inode            ; r1 = parent inode -> catfs_iptr
+    mov r0, [catfs_iptr]
+    vload r0, r0, CI_SIZE
+    shr r0, DE_SHIFT                 ; nument
+    push r0                          ; [sp] = nument
+    mov r6, 0
+    .findloop:
+        mov r0, [sp]
+        cmp r6, r0
+        juge .append
+        mov r0, r6                   ; block boundary? load the dir data block
+        and r0, DE_PERBLK - 1
+        cmp r0, 0
+        jne .slot
+        mov r1, [catfs_iptr]
+        mov r2, r6
+        shr r2, DE_PERSHIFT
+        mov r3, 0
+        call catfs_map_block
+        mov [catfs_dirblk], r0
+        mov r1, r0
+        mov r2, catfs_dbuf
+        call catfs_txn_read
+        .slot:
+        mov r0, r6                   ; entry addr = dbuf + (e & 15) * 32
+        and r0, DE_PERBLK - 1
+        shl r0, DE_SHIFT
+        add r0, catfs_dbuf
+        mov r1, [r0]                 ; DE_INO
+        cmp r1, 0
+        je .place                    ; reuse this free slot (r0 = addr)
+        add r6, 1
+        jmp .findloop
+    .append:
+        mov r1, [catfs_iptr]         ; allocate/extend the dir data block
+        mov r2, r6
+        shr r2, DE_PERSHIFT
+        mov r3, 1
+        call catfs_map_block
+        mov [catfs_dirblk], r0
+        mov r1, r0
+        mov r2, catfs_dbuf
+        call catfs_txn_read
+        mov r0, [catfs_iptr]         ; grow the directory by one entry
+        vload r1, r0, CI_SIZE
+        add r1, DE_STRUCT
+        vstore r0, CI_SIZE, r1, r2
+        call catfs_store_inode
+        mov r0, r6                   ; entry addr in the (maybe new) block
+        and r0, DE_PERBLK - 1
+        shl r0, DE_SHIFT
+        add r0, catfs_dbuf
+    .place:
+        mov r7, r0                   ; entry address
+        mov r1, r7                   ; clear the whole 32-byte entry
+        mov r2, DE_STRUCT
+        call catfs_zerobuf
+        mov [r7], r5                 ; DE_INO = child
+        mov r1, r7                   ; copy the name into DE_NAME
+        add r1, DE_NAME
+        mov r2, r4
+        call catfs_namecpy
+        mov r1, [catfs_dirblk]       ; commit the entry to the block buffer
+        mov r2, catfs_dbuf
+        call catfs_txn_write
+    add sp, 4                        ; drop nument
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   VFS operations
+; ==========================
+
+; lookup(r1=dir, r2=name) -> r0 = child node (ref taken) or 0
+catfs_lookup:
+    push r4                          ; dir node
+    push r5                          ; name
+    push r6                          ; child inode
+    mov r4, r1
+    mov r5, r2
+    vload r1, r4, NODE_FSDATA
+    call catfs_load_inode
+    mov r1, [catfs_iptr]
+    mov r2, r5
+    call catfs_dir_find              ; r0 = child inode or 0
+    cmp r0, 0
+    je .none
+    mov r6, r0
+    mov r1, r6
+    call catfs_load_inode            ; r0 = child inode address
+    vload r1, r0, CI_TYPE
+    mov r2, r5
+    mov r3, r4
+    push r6
+    call catfs_makenode
+    add sp, 4
+    jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; readdir(r1=dir, r2=index) -> r0 = child node (ref taken) or 0 past the end
+catfs_readdir:
+    push r4                          ; dir node
+    push r5                          ; remaining index / entry addr
+    push r6                          ; entry index e / child inode
+    push r7                          ; nument
+    mov r4, r1
+    mov r5, r2
+    vload r1, r4, NODE_FSDATA
+    call catfs_load_inode
+    mov r0, [catfs_iptr]
+    vload r7, r0, CI_SIZE
+    shr r7, DE_SHIFT
+    mov r6, 0
+    .loop:
+        cmp r6, r7
+        juge .none
+        mov r0, r6
+        and r0, DE_PERBLK - 1
+        cmp r0, 0
+        jne .haveblk
+        mov r1, [catfs_iptr]
+        mov r2, r6
+        shr r2, DE_PERSHIFT
+        mov r3, 0
+        call catfs_map_block
+        cmp r0, 0
+        je .skip
+        mov r1, r0
+        mov r2, catfs_dbuf
+        call catfs_txn_read
+        .haveblk:
+        mov r0, r6
+        and r0, DE_PERBLK - 1
+        shl r0, DE_SHIFT
+        add r0, catfs_dbuf
+        mov r1, [r0]                 ; DE_INO
+        cmp r1, 0
+        je .next
+        cmp r5, 0
+        je .found
+        sub r5, 1
+        .next:
+        add r6, 1
+        jmp .loop
+        .skip:
+        add r6, DE_PERBLK
+        jmp .loop
+    .found:
+        mov r6, [r0]                 ; child inode
+        mov r5, r0                   ; entry address (name lives in catfs_dbuf)
+        mov r1, r6
+        call catfs_load_inode
+        vload r1, r0, CI_TYPE
+        mov r2, r5
+        add r2, DE_NAME
+        mov r3, r4
+        push r6
+        call catfs_makenode
+        add sp, 4
+        jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; read(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes read
+catfs_read:
+    push r4                          ; offset
+    push r5                          ; destination
+    push r6                          ; remaining
+    push r7                          ; total copied
+    mov r7, sp
+    add r7, 20
+    mov r7, [r7]                     ; len
+    mov r4, r2
+    mov r5, r3
+    mov r6, r7
+    vload r0, r1, NODE_FSDATA
+    mov r1, r0
+    call catfs_load_inode
+    mov r0, [catfs_iptr]
+    vload r0, r0, CI_SIZE
+    cmp r4, r0
+    juge .zero
+    sub r0, r4
+    cmp r6, r0
+    jule .lenok
+    mov r6, r0
+    .lenok:
+    mov r7, 0
+    .loop:
+        cmp r6, 0
+        je .finish
+        mov r1, [catfs_iptr]
+        mov r2, r4
+        shr r2, BLOCK_SHIFT
+        mov r3, 0
+        call catfs_map_block         ; r0 = fsblock (0 = hole)
+        mov r1, r4                   ; bo = off & 511
+        and r1, BLOCK_SIZE - 1
+        mov r2, BLOCK_SIZE
+        sub r2, r1
+        cmp r2, r6
+        jule .nok
+        mov r2, r6                   ; n = min(remaining, 512 - bo)
+        .nok:
+        cmp r0, 0
+        je .hole
+        push r1                      ; bo
+        push r2                      ; n
+        mov r1, r0
+        mov r2, catfs_dbuf
+        call catfs_txn_read
+        pop r2
+        pop r1
+        mov r3, catfs_dbuf
+        add r3, r1                   ; src = dbuf + bo
+        jmp .copy
+        .hole:
+        mov r3, catfs_zeros
+        .copy:
+        push r2                      ; n
+        mov r1, r5                   ; dest = buf
+        mov r0, r2
+        mov r2, r3                   ; src
+        mov r3, r0                   ; len = n
+        call catfs_cpy
+        pop r2                       ; n
+        add r4, r2
+        add r5, r2
+        sub r6, r2
+        add r7, r2
+        jmp .loop
+    .zero:
+    mov r7, 0
+    .finish:
+    mov r0, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; write(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes written
+catfs_write:
+    push r4                          ; offset
+    push r5                          ; source
+    push r6                          ; remaining
+    push r7                          ; total written
+    mov r7, sp
+    add r7, 20
+    mov r7, [r7]                     ; len
+    mov r4, r2
+    mov r5, r3
+    mov r6, r7
+    vload r0, r1, NODE_FSDATA
+    mov [catfs_curino], r0
+    call catfs_txn_begin
+    mov r1, [catfs_curino]
+    call catfs_load_inode
+    mov r7, 0
+    .loop:
+        cmp r6, 0
+        je .finish
+        mov r1, [catfs_iptr]
+        mov r2, r4
+        shr r2, BLOCK_SHIFT
+        mov r3, 1
+        call catfs_map_block         ; allocate a block
+        mov [catfs_t_fsblk], r0
+        mov r1, r4                   ; bo
+        and r1, BLOCK_SIZE - 1
+        mov [catfs_t_bo], r1
+        mov r2, BLOCK_SIZE
+        sub r2, r1
+        cmp r2, r6
+        jule .nok
+        mov r2, r6
+        .nok:
+        mov [catfs_t_n], r2
+        mov r1, [catfs_t_fsblk]      ; read-modify-write the block
+        mov r2, catfs_dbuf
+        call catfs_txn_read
+        mov r1, catfs_dbuf           ; overlay source -> dbuf + bo
+        mov r0, [catfs_t_bo]
+        add r1, r0
+        mov r2, r5
+        mov r3, [catfs_t_n]
+        call catfs_cpy
+        mov r1, [catfs_t_fsblk]      ; write the block back
+        mov r2, catfs_dbuf
+        call catfs_txn_write
+        mov r0, [catfs_t_n]          ; advance the cursors
+        add r4, r0
+        add r5, r0
+        sub r6, r0
+        add r7, r0
+        mov r0, [catfs_iptr]         ; grow the file if we passed the old EOF
+        vload r1, r0, CI_SIZE
+        cmp r4, r1
+        jule .nosize
+        vstore r0, CI_SIZE, r4, r2
+        .nosize:
+        mov r0, [catfs_txncount]     ; flush before the log fills
+        cmp r0, CATFS_MAXTXN - 6
+        jul .loop
+        call catfs_store_inode
+        call catfs_txn_commit
+        call catfs_txn_begin
+        mov r1, [catfs_curino]
+        call catfs_load_inode
+        jmp .loop
+    .finish:
+    call catfs_store_inode
+    call catfs_txn_commit
+    mov r0, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; create(r1=dir, r2=name, r3=type) -> r0 = new node (ref taken) or 0
+catfs_create:
+    push r4                          ; dir node
+    push r5                          ; name
+    push r6                          ; type
+    push r7                          ; new inode
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    call catfs_txn_begin
+    call catfs_alloc_inode
+    cmp r0, 0
+    je .fail
+    mov r7, r0
+    mov r1, r7                        ; initialise the new inode
+    call catfs_load_inode
+    mov r1, r0
+    mov r2, CATFS_ISIZE
+    call catfs_zerobuf
+    mov r0, [catfs_iptr]
+    vstore r0, CI_TYPE, r6, r1
+    vstore r0, CI_LINKS, 1, r1
+    call catfs_store_inode
+    vload r1, r4, NODE_FSDATA         ; link into the parent directory
+    mov r2, r5
+    mov r3, r7
+    call catfs_dir_add
+    call catfs_txn_commit
+    mov r1, r6                        ; hand back a VFS node
+    mov r2, r5
+    mov r3, r4
+    push r7
+    call catfs_makenode
+    add sp, 4
+    jmp .done
+    .fail:
+    call catfs_txn_commit
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; remove(r1=dir, r2=name) -> r0 = 0 on success, -1 if the name is absent
+catfs_remove:
+    push r4                          ; dir node
+    push r5                          ; name
+    push r6                          ; child inode
+    push r7                          ; entry index e
+    mov r4, r1
+    mov r5, r2
+    call catfs_txn_begin
+    vload r1, r4, NODE_FSDATA
+    call catfs_load_inode
+    mov r0, [catfs_iptr]
+    vload r0, r0, CI_SIZE
+    shr r0, DE_SHIFT
+    push r0                           ; [sp] = nument
+    mov r7, 0
+    .scan:
+        mov r0, [sp]
+        cmp r7, r0
+        juge .notfound
+        mov r0, r7
+        and r0, DE_PERBLK - 1
+        cmp r0, 0
+        jne .haveblk
+        mov r1, [catfs_iptr]
+        mov r2, r7
+        shr r2, DE_PERSHIFT
+        mov r3, 0
+        call catfs_map_block
+        cmp r0, 0
+        je .skip
+        mov [catfs_dirblk], r0
+        mov r1, r0
+        mov r2, catfs_dbuf
+        call catfs_txn_read
+        .haveblk:
+        mov r0, r7
+        and r0, DE_PERBLK - 1
+        shl r0, DE_SHIFT
+        add r0, catfs_dbuf
+        mov r1, [r0]                 ; DE_INO
+        cmp r1, 0
+        je .next
+        push r0
+        mov r1, r0
+        add r1, DE_NAME
+        mov r2, r5
+        call vfsstreq
+        pop r1                       ; entry addr
+        cmp r0, 0
+        je .next
+        mov r6, [r1]                 ; matched: child inode
+        mov [r1], 0                  ; clear the dir slot
+        mov r1, [catfs_dirblk]
+        mov r2, catfs_dbuf
+        call catfs_txn_write
+        jmp .freechild
+        .next:
+        add r7, 1
+        jmp .scan
+        .skip:
+        add r7, DE_PERBLK
+        jmp .scan
+    .freechild:
+        mov r1, r6                   ; free the child's data + inode
+        call catfs_load_inode
+        mov r7, 0
+        .dloop:
+            cmp r7, CATFS_DIRECT
+            juge .donedirect
+            mov r0, [catfs_iptr]
+            add r0, CI_DIRECT
+            mov r1, r7
+            shl r1, 2
+            add r0, r1
+            mov r1, [r0]
+            call catfs_free_block
+            add r7, 1
+            jmp .dloop
+        .donedirect:
+        mov r0, [catfs_iptr]
+        vload r1, r0, CI_INDIRECT
+        cmp r1, 0
+        je .noind
+        push r1                      ; indirect block
+        mov r2, catfs_blk
+        call catfs_txn_read
+        mov r7, 0
+        .iloop:
+            cmp r7, CATFS_PTRS
+            juge .doneind
+            mov r0, r7
+            shl r0, 2
+            add r0, catfs_blk
+            mov r1, [r0]
+            call catfs_free_block
+            add r7, 1
+            jmp .iloop
+        .doneind:
+        pop r1
+        call catfs_free_block
+        .noind:
+        mov r0, [catfs_iptr]         ; mark the inode free
+        vstore r0, CI_TYPE, 0, r1
+        call catfs_store_inode
+        mov r1, r6
+        call catfs_free_inode
+        call catfs_txn_commit
+        mov r0, 0
+        jmp .done
+    .notfound:
+    call catfs_txn_commit
+    mov r0, -1
+    .done:
+    add sp, 4                        ; drop nument
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; truncate(r1=node, r2=newlen) -> r0 = 0
+catfs_truncate:
+    push r4                          ; node
+    push r5                          ; new length
+    push r6                          ; last file-block index
+    push r7                          ; file-block cursor
+    mov r4, r1
+    mov r5, r2
+    call catfs_txn_begin
+    vload r1, r4, NODE_FSDATA
+    call catfs_load_inode
+    mov r7, r5                        ; first = ceil(newlen / 512)
+    add r7, BLOCK_SIZE - 1
+    shr r7, BLOCK_SHIFT
+    mov r0, [catfs_iptr]
+    vload r6, r0, CI_SIZE
+    add r6, BLOCK_SIZE - 1
+    shr r6, BLOCK_SHIFT               ; last (exclusive)
+    .loop:
+        cmp r7, r6
+        juge .done
+        mov r1, [catfs_iptr]
+        mov r2, r7
+        mov r3, 0
+        call catfs_map_block
+        cmp r0, 0
+        je .clearptr
+        mov r1, r0
+        call catfs_free_block
+        .clearptr:
+        cmp r7, CATFS_DIRECT
+        juge .clrind
+        mov r0, [catfs_iptr]         ; clear a direct pointer
+        add r0, CI_DIRECT
+        mov r1, r7
+        shl r1, 2
+        add r0, r1
+        mov [r0], 0
+        call catfs_store_inode
+        jmp .next
+        .clrind:
+        mov r0, [catfs_iptr]         ; clear an indirect pointer
+        vload r1, r0, CI_INDIRECT
+        cmp r1, 0
+        je .next
+        mov r2, catfs_blk
+        call catfs_txn_read
+        mov r0, r7
+        sub r0, CATFS_DIRECT
+        shl r0, 2
+        add r0, catfs_blk
+        mov [r0], 0
+        mov r0, [catfs_iptr]
+        vload r1, r0, CI_INDIRECT
+        mov r2, catfs_blk
+        call catfs_txn_write
+        .next:
+        add r7, 1
+        jmp .loop
+    .done:
+    mov r0, [catfs_iptr]
+    vstore r0, CI_SIZE, r5, r1
+    call catfs_store_inode
+    call catfs_txn_commit
+    mov r0, 0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Read a superblock field. r1 - byte offset -> r0 = value
+catfs_sbfield:
+    mov r0, catfs_sb
+    add r0, r1
+    mov r0, [r0]
+    ret
+
+
+; mountfn(r1=block-backed-file descriptor) -> r0 = root directory node
+catfs_mount:
+    push r4                          ; BF descriptor
+    mov r4, r1
+    vload r0, r4, BF_PORT
+    mov [catfs_port], r0
+    vload r0, r4, BF_BASE
+    mov [catfs_base], r0
+
+    mov r1, catfs_zeros              ; make sure the zero block really is zero
+    mov r2, BLOCK_SIZE
+    call catfs_zerobuf
+    call catfs_txn_begin             ; not mutating anything yet
+
+    mov r1, 0                        ; read + validate the superblock
+    mov r2, catfs_sb
+    call catfs_diskread
+    mov r0, [catfs_sb]
+    cmp r0, CATFS_MAGIC
+    je .magicok
+    kpanic CATFS_PANIC_MAGIC
+    .magicok:
+
+    mov r1, SB_TOTAL
+    call catfs_sbfield
+    mov [catfs_total], r0
+    mov r1, SB_ICOUNT
+    call catfs_sbfield
+    mov [catfs_icount], r0
+    mov r1, SB_IBM_START
+    call catfs_sbfield
+    mov [catfs_ibmstart], r0
+    mov r1, SB_IBM_BLOCKS
+    call catfs_sbfield
+    mov [catfs_ibmblocks], r0
+    mov r1, SB_DBM_START
+    call catfs_sbfield
+    mov [catfs_dbmstart], r0
+    mov r1, SB_DBM_BLOCKS
+    call catfs_sbfield
+    mov [catfs_dbmblocks], r0
+    mov r1, SB_IT_START
+    call catfs_sbfield
+    mov [catfs_itstart], r0
+    mov r1, SB_IT_BLOCKS
+    call catfs_sbfield
+    mov [catfs_itblocks], r0
+    mov r1, SB_DATA_START
+    call catfs_sbfield
+    mov [catfs_datastart], r0
+    mov r1, SB_DATA_BLOCKS
+    call catfs_sbfield
+    mov [catfs_datablocks], r0
+    mov r1, SB_J_START
+    call catfs_sbfield
+    mov [catfs_jstart], r0
+    mov r1, SB_J_BLOCKS
+    call catfs_sbfield
+    mov [catfs_jblocks], r0
+    mov r1, SB_ROOT_INO
+    call catfs_sbfield
+    mov [catfs_rootino], r0
+
+    call catfs_recover               ; replay a half-finished transaction
+
+    mov r1, NODE_DIR                 ; build the root node
+    mov r2, 0
+    mov r3, 0
+    call vfsnodenew
+    cmp r0, 0
+    je .fail
+    push r0
+    vstore r0, NODE_OPS, catfs_ops, r1
+    mov r1, [catfs_rootino]
+    vstore r0, NODE_FSDATA, r1, r2
+    mov r1, [catfs_rootino]
+    call catfs_load_inode
+    vload r1, r0, CI_SIZE
+    pop r0
+    vstore r0, NODE_SIZE, r1, r2
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r4
+    ret
+
+
+catfs_ops:
+    d32 catfs_lookup                 ; OP_LOOKUP
+    d32 catfs_read                   ; OP_READ
+    d32 catfs_write                  ; OP_WRITE
+    d32 catfs_create                 ; OP_CREATE
+    d32 catfs_remove                 ; OP_REMOVE
+    d32 catfs_readdir                ; OP_READDIR
+    d32 catfs_truncate               ; OP_TRUNCATE
+    d32 0                            ; OP_STAT
+    d32 0                            ; OP_SYNC (writes are already durable)
+
+catfs_name:
+    dstr "catfs\0"

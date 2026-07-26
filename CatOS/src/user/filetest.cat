@@ -1,0 +1,47 @@
+; Proves the file-descriptor syscalls end to end, all in user mode: create a
+; file on the (on-disk, journaled) root fs, write to it, seek back, read it, then
+; list a directory. r6/r7 hold state because they survive syscalls; r1-r4 do not.
+#include "sys.cat"
+
+    ; create + open /data.txt for read/write
+    sys_open ftpath, O_RDWR + O_CREATE
+    mov r6, r0                    ; fd
+    cmp r6, -1
+    je ftfail
+
+    sys_write r6, ftmsg, 4        ; write "TEST"
+    sys_seek r6, 0, SEEK_SET      ; rewind
+    sys_read r6, ftbuf, 4         ; read it back
+    mov r0, ftbuf
+    mov r0, [r0]
+    sys_print r0                  ; expect 0x54534554 ("TEST")
+    sys_close r6
+
+    ; count the entries in /bin via readdir
+    sys_open ftbin, O_READ
+    mov r6, r0                    ; dir fd
+    mov r7, 0                     ; entry count
+ftrd:
+    sys_readdir r6, ftname, 32
+    cmp r0, 1
+    jne ftrddone
+    add r7, 1
+    jmp ftrd
+ftrddone:
+    sys_print r7                  ; number of programs in /bin
+    sys_close r6
+
+    sys_exit 0
+ftfail:
+    sys_exit 0xFF
+
+ftpath:
+    dstr "/data.txt\0"
+ftbin:
+    dstr "/bin\0"
+ftmsg:
+    d32 0x54534554               ; "TEST"
+ftbuf:
+    res8 8
+ftname:
+    res8 32

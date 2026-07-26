@@ -1,0 +1,212 @@
+; ==========================
+;   CatOS hardware manager
+; ==========================
+; Talks to the hardware-manager serial device (port 0 by convention) to
+; enumerate the machine's serial devices, and keeps a registry mapping a
+; device type to a driver "bind" routine. `devscan` walks the enumerated
+; devices and hands each one to the matching driver, which typically publishes
+; a node under /dev. Devices with no registered driver are skipped.
+;
+; Enumeration uses the hardware manager's "list devices" command only (it emits
+; a count followed by a (port, type) pair per device); the write-0 auto-probe
+; is not used because not every device supports it.
+
+#define HWMAN_PORT, 0            ; the hardware manager lives here by convention
+#define HWMAN_LIST, 1            ; list devices
+#define HWMAN_HALT, 2            ; freeze the machine
+#define HWMAN_SHUTDOWN, 3        ; power off
+#define HWMAN_RESET, 4           ; reset to initial CPU state
+
+#define HW_MAX_DEVS, 32          ; enumerated device table capacity
+#define HW_MAX_DRIVERS, 16       ; driver registry capacity
+
+; enumerated device record
+#define HWDEV_PORT, 0
+#define HWDEV_TYPE, 4
+#define HWDEV_STRUCT, 8
+
+; driver registry record
+#define HWDRV_TYPE, 0
+#define HWDRV_BIND, 4
+#define HWDRV_STRUCT, 8
+
+
+hwdevcount:
+    d32 0
+hwdrvcount:
+    d32 0
+hwdevs:
+    res8 HW_MAX_DEVS * HWDEV_STRUCT
+hwdrivers:
+    res8 HW_MAX_DRIVERS * HWDRV_STRUCT
+
+
+; Enumerate the attached devices into the hwdevs table.
+; returns r0 = device count (clamped to HW_MAX_DEVS)
+hwscan:
+    push r4                      ; count
+    push r5                      ; index
+    push r6                      ; write cursor
+    out HWMAN_PORT, HWMAN_LIST
+    in r4, HWMAN_PORT             ; device count
+    cmp r4, HW_MAX_DEVS
+    jule .okcount
+    mov r4, HW_MAX_DEVS           ; ignore any beyond our table
+    .okcount:
+    mov [hwdevcount], r4
+    mov r6, hwdevs
+    mov r5, 0
+    .loop:
+        cmp r5, r4
+        juge .done
+        in r1, HWMAN_PORT         ; port
+        in r2, HWMAN_PORT         ; type
+        vstore r6, HWDEV_PORT, r1, r3
+        vstore r6, HWDEV_TYPE, r2, r3
+        add r6, HWDEV_STRUCT
+        add r5, 1
+        jmp .loop
+    .done:
+    mov r0, r4
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Register a driver for a device type.
+; r1 - device type
+; r2 - bind routine: bindfn(r1=port, r2=unitIndex)
+; returns r0 = 0 on success, -1 if the registry is full
+drvregister:
+    push r4                      ; count
+    mov r4, [hwdrvcount]
+    cmp r4, HW_MAX_DRIVERS
+    juge .full
+    mov r0, r4
+    shl r0, 3                     ; * HWDRV_STRUCT (8)
+    add r0, hwdrivers
+    vstore r0, HWDRV_TYPE, r1, r3
+    vstore r0, HWDRV_BIND, r2, r3
+    add r4, 1
+    mov [hwdrvcount], r4
+    mov r0, 0
+    jmp .done
+    .full:
+    mov r0, -1
+    .done:
+    pop r4
+    ret
+
+
+; Find a driver bind routine for a device type.
+; r1 - type
+; returns r0 = bind routine, or 0 if none registered
+hwfinddriver:
+    push r4                      ; remaining
+    push r5                      ; cursor
+    push r6                      ; type
+    mov r6, r1
+    mov r4, [hwdrvcount]
+    mov r5, hwdrivers
+    .loop:
+        cmp r4, 0
+        je .none
+        vload r0, r5, HWDRV_TYPE
+        cmp r0, r6
+        je .found
+        add r5, HWDRV_STRUCT
+        sub r4, 1
+        jmp .loop
+    .found:
+    vload r0, r5, HWDRV_BIND
+    jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Count devices in hwdevs[0 .. index-1] whose type matches, so each bound
+; device of a type gets a stable unit number (disk0, disk1, ...).
+; r1 - type
+; r2 - index (exclusive upper bound)
+; returns r0 = count
+hwcountbefore:
+    push r4                      ; type
+    push r5                      ; limit
+    push r6                      ; j
+    push r7                      ; cursor
+    mov r4, r1
+    mov r5, r2
+    mov r0, 0
+    mov r6, 0
+    mov r7, hwdevs
+    .loop:
+        cmp r6, r5
+        juge .done
+        vload r1, r7, HWDEV_TYPE
+        cmp r1, r4
+        jne .skip
+        add r0, 1
+        .skip:
+        add r7, HWDEV_STRUCT
+        add r6, 1
+        jmp .loop
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Bind a driver to every enumerated device that has one. Call after hwscan and
+; after all drvregister calls.
+devscan:
+    push r4                      ; device count
+    push r5                      ; index
+    push r6                      ; device cursor
+    push r7                      ; bind routine
+    mov r4, [hwdevcount]
+    mov r5, 0
+    mov r6, hwdevs
+    .loop:
+        cmp r5, r4
+        juge .done
+        vload r1, r6, HWDEV_TYPE
+        call hwfinddriver         ; r0 = bindfn or 0
+        cmp r0, 0
+        je .next                  ; no driver for this type -> skip
+        mov r7, r0
+        vload r1, r6, HWDEV_TYPE   ; unit number = matches seen before this one
+        mov r2, r5
+        call hwcountbefore
+        mov r2, r0                ; unit index
+        vload r1, r6, HWDEV_PORT
+        call r7                   ; bindfn(port, unit)
+        .next:
+        add r6, HWDEV_STRUCT
+        add r5, 1
+        jmp .loop
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Power controls (thin wrappers over the hardware manager).
+hwhalt:
+    out HWMAN_PORT, HWMAN_HALT
+    ret
+hwshutdown:
+    out HWMAN_PORT, HWMAN_SHUTDOWN
+    ret
+hwreset:
+    out HWMAN_PORT, HWMAN_RESET
+    ret

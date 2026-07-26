@@ -1,0 +1,142 @@
+; ==========================
+;   Hello-world filesystem
+; ==========================
+; The smallest possible VFS driver: a read-only filesystem whose root
+; directory holds exactly one file, "hello", containing a fixed greeting.
+; It exists to demonstrate the driver ABI documented in vfs.cat - lookup,
+; read and readdir wired through a vtable - and nothing more.
+;
+; Include this after vfs.cat (it uses the NODE_*, OP_* constants and the
+; vload/vstore macros defined there). Register and mount it with:
+;
+;     mov r1, hellofs_name
+;     mov r2, hellofs_mount
+;     call vfsregister
+;     mov r1, somepath          ; e.g. "/"
+;     mov r2, hellofs_name
+;     mov r3, 0                 ; no backing device
+;     call vfsmount
+
+#define HELLO_MSG_LEN, hellofs_msg_end - hellofs_msg
+
+
+; Build the root directory node. mountfn(r1=device) -> r0 = root node.
+hellofs_mount:
+    mov r1, NODE_DIR
+    mov r2, 0                ; the root has no name of its own
+    mov r3, 0                ; and no parent
+    call vfsnodenew
+    cmp r0, 0
+    je .done
+    vstore r0, NODE_OPS, hellofs_ops, r1
+    .done:
+    ret
+
+
+; lookup(r1=dir, r2=name) -> r0 = child node, or 0 if there is no such child.
+; The only name this filesystem knows is "hello".
+hellofs_lookup:
+    push r4                  ; dir
+    push r5                  ; name
+    mov r4, r1
+    mov r5, r2
+
+    mov r1, r5               ; is the caller asking for "hello"?
+    mov r2, hellofs_fname
+    call vfsstreq
+    cmp r0, 0
+    je .none
+
+    mov r1, NODE_FILE        ; materialise the file node
+    mov r2, hellofs_fname
+    mov r3, r4               ; parent is the directory we were called on
+    call vfsnodenew
+    cmp r0, 0
+    je .none
+    vstore r0, NODE_OPS, hellofs_ops, r1
+    vstore r0, NODE_SIZE, HELLO_MSG_LEN, r1
+    vstore r0, NODE_FSDATA, hellofs_msg, r1   ; content lives in the ROM image
+    jmp .done
+
+    .none:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; readdir(r1=dir, r2=index) -> r0 = child node, or 0 past the end.
+; Index 0 is "hello"; everything else is the end of the directory.
+hellofs_readdir:
+    cmp r2, 0
+    jne .end
+    mov r2, hellofs_fname    ; reuse lookup to build the entry
+    jmp hellofs_lookup       ; tail call - r1 (dir) is already in place
+    .end:
+    mov r0, 0
+    ret
+
+
+; read(r1=node, r2=offset, r3=buf, [sp]=len) -> r0 = bytes read.
+; Copies out of the greeting held in NODE_FSDATA, clamped to the file size.
+hellofs_read:
+    push r4                  ; node
+    push r5                  ; offset
+    push r6                  ; buffer
+    push r7                  ; length
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    mov r7, sp               ; len is the stacked 4th argument:
+    add r7, 20               ; 4 pushes (16) + return address (4)
+    mov r7, [r7]
+
+    vload r0, r4, NODE_SIZE
+    cmp r5, r0
+    juge .zero               ; offset at or past EOF -> nothing to read
+    sub r0, r5               ; bytes available from the offset
+    cmp r7, r0
+    jule .lenok
+    mov r7, r0               ; clamp the request to what's left
+    .lenok:
+    cmp r7, 0
+    je .zero
+
+    vload r1, r4, NODE_FSDATA
+    add r1, r5               ; source = content + offset
+    mov r0, r6               ; cpy destination is r0
+    cpy r1, r7
+    mov r0, r7
+    jmp .done
+    .zero:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Driver vtable (see the slot offsets in vfs.cat). Read-only, so the mutating
+; slots are left 0 and the core reports them as unsupported.
+hellofs_ops:
+    d32 hellofs_lookup       ; OP_LOOKUP
+    d32 hellofs_read         ; OP_READ
+    d32 0                    ; OP_WRITE
+    d32 0                    ; OP_CREATE
+    d32 0                    ; OP_REMOVE
+    d32 hellofs_readdir      ; OP_READDIR
+    d32 0                    ; OP_TRUNCATE
+    d32 0                    ; OP_STAT
+    d32 0                    ; OP_SYNC
+
+hellofs_name:
+    dstr "hellofs\0"
+hellofs_fname:
+    dstr "hello\0"
+hellofs_msg:
+    dstr "Hello, World!\n"
+hellofs_msg_end:
+    d8 0                     ; terminator so the greeting is also a C string

@@ -1,0 +1,51 @@
+; echo - write each argument to stdout, separated by spaces, then a newline.
+; The kernel starts us with r1 = argc, r2 = argv (argv[0] is "echo"), so we skip
+; index 0 and print argv[1..argc-1]. r5-r7 survive syscalls, so argc/argv/index
+; live there across the sys_write calls.
+#include "sys.cat"
+
+main:
+    mov r5, r1                       ; argc
+    mov r6, r2                       ; argv
+    mov r7, 1                        ; current argument index
+
+.loop:
+    cmp r7, r5
+    juge .done
+    cmp r7, 1                        ; a space before every argument but the first
+    je .nospace
+    sys_write 1, spacech, 1
+.nospace:
+    mov r1, r7                       ; argv[r7] -> string pointer
+    shl r1, 2
+    add r1, r6
+    mov r1, [r1]
+    call strlen                      ; r0 = length, r1 preserved
+    sys_write 1, r1, r0
+    add r7, 1
+    jmp .loop
+
+.done:
+    sys_write 1, newline, 1
+    sys_exit 0
+
+
+; strlen(r1) -> r0 = length excluding the terminator. Leaves r1 untouched.
+strlen:
+    mov r0, 0
+    mov r2, r1
+    .sl:
+        mov8 r3, [r2]
+        cmp r3, 0
+        je .sldone
+        add r0, 1
+        add r2, 1
+        jmp .sl
+    .sldone:
+    ret
+
+
+spacech:
+    dstr " "
+newline:
+    dstr "\n"

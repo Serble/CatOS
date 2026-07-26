@@ -1,0 +1,139 @@
+; ==========================
+;   CatOS interrupt manager
+; ==========================
+; Owns the one and only interrupt table and lets any subsystem register a
+; handler for an interrupt code. Drivers no longer touch `setit` themselves;
+; they call intregister and the manager keeps the shared table up to date.
+;
+;
+; -- The table --------------------------------------------------------------
+;
+; The CPU expects the interrupt table to be a 1-byte entry count followed by
+; that many 5-byte entries, each a 1-byte interrupt code and a 4-byte handler
+; pointer (see the interrupts documentation). We keep one such table here,
+; sized for INT_MAX_ENTRIES handlers, and point the `it` register at it once
+; from intinit.
+;
+;
+; -- Writing a handler ------------------------------------------------------
+;
+; A registered handler IS the raw interrupt handler: the CPU jumps straight to
+; it and it must return with `iret`. When an interrupt preempts kernel code
+; the hardware saves only `ip`, so a handler has to preserve everything else
+; itself. The int_prologue / int_epilogue macros do exactly that - bracket a
+; handler with them and write ordinary code in between:
+;
+;     my_handler:
+;         int_prologue
+;         ; ... do work, call normal procs (they preserve r4-r7) ...
+;         int_epilogue          ; restores state and irets
+;
+;
+; -- Usage ------------------------------------------------------------------
+;
+;     call intinit                     ; once, during boot
+;     mov r1, 0x71                     ; interrupt code
+;     mov r2, my_handler               ; handler address
+;     call intregister                 ; r0 = 0 ok, -1 if the table is full
+
+
+#define INT_MAX_ENTRIES, 32      ; how many handlers the table can hold
+#define INT_ENTRY_SIZE, 5        ; 1 byte code + 4 byte handler pointer
+
+
+; Save the full interrupt-time state (flags + all general registers). Pair
+; with int_epilogue. Use at the very top of a handler.
+#macro int_prologue, 0
+    push fl
+    push r0
+    push r1
+    push r2
+    push r3
+    push r4
+    push r5
+    push r6
+    push r7
+#endmacro
+
+; Restore the state saved by int_prologue and return from the interrupt.
+#macro int_epilogue, 0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    pop r3
+    pop r2
+    pop r1
+    pop r0
+    pop fl
+    iret
+#endmacro
+
+
+; ---- the shared interrupt table ----
+int_table:
+    d8 0                         ; entry count (the CPU reads this first)
+int_table_entries:
+    res8 INT_MAX_ENTRIES * INT_ENTRY_SIZE
+
+
+; Initialise the interrupt manager: start with no handlers and install the
+; table into the `it` register. Call once during boot before registering any
+; handler.
+intinit:
+    mov r0, 0
+    mov8 [int_table], r0         ; zero the entry count
+    setit int_table              ; this is now the system interrupt table
+    ret
+
+
+; Register (or replace) a handler for an interrupt code.
+; r1 - interrupt code (0-255)
+; r2 - handler address (must end in iret; wrap it with int_prologue/epilogue)
+; returns r0 = 0 on success, -1 if the table is full
+intregister:
+    push r4                      ; code
+    push r5                      ; handler
+    push r6                      ; current entry pointer
+    push r7                      ; entry count
+    mov r4, r1
+    mov r5, r2
+
+    mov8 r7, [int_table]         ; current entry count
+    mov r6, int_table_entries
+    mov r0, 0                    ; index
+    .scan:
+        cmp r0, r7
+        juge .append             ; walked every entry, none matched
+        mov8 r1, [r6]            ; this entry's code
+        cmp r1, r4
+        je .replace
+        add r6, INT_ENTRY_SIZE
+        add r0, 1
+        jmp .scan
+
+    .replace:
+        add r6, 1                ; step past the code byte to the handler slot
+        mov [r6], r5             ; overwrite the handler
+        mov r0, 0
+        jmp .done
+
+    .append:
+        cmp r7, INT_MAX_ENTRIES
+        juge .full               ; no room left
+        mov8 [r6], r4            ; r6 already points at the first free slot
+        add r6, 1
+        mov [r6], r5             ; handler pointer (4 bytes)
+        add r7, 1
+        mov8 [int_table], r7     ; publish the new count
+        mov r0, 0
+        jmp .done
+
+    .full:
+        mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret

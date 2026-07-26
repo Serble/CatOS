@@ -1,0 +1,122 @@
+; ==========================
+;   CatOS boot device discovery
+; ==========================
+; Works out where the kernel came from. The firmware leaves the boot disk's
+; serial port in r2 when it jumps to us; boot.cat saves it into bootdiskport as
+; its very first instruction. From there we read that disk's partition table
+; (block 0) and locate the raw-data (type 0) partition the kernel lives on. That
+; partition is what gets mounted read/write at /sys.
+;
+; Note: this is deliberately NOT how the root "/" is chosen. The kernel's
+; partition is not a filesystem and cannot be "/"; a real disk-backed root will
+; need an on-disk filesystem and a dedicated root-partition type, chosen
+; independently of the boot disk. That is future work.
+;
+; Requires: disk.cat (disk_readblock, bf_new).
+
+#define PT_MAGIC, 51             ; partition-table magic (low uint; high uint is 0)
+#define PT_COUNT_OFF, 0x0C       ; partition count field
+#define PT_ENTRIES_OFF, 0x20     ; first partition entry
+#define PT_ENTRY_SIZE, 12
+#define PE_TYPE, 0
+#define PE_START, 4
+#define PE_COUNT, 8
+#define PART_TYPE_RAW, 0         ; raw data / application (the kernel)
+#define PART_TYPE_CATFS, 1       ; a CatFS filesystem (see CatFS.md)
+
+
+bootdiskport:
+    d32 0                        ; boot disk serial port (saved at OS entry)
+ptbuf:
+    res8 512                     ; partition table scratch
+sys_bf:
+    d32 0                        ; block-backed-file descriptor for /sys
+catfs_bf:
+    d32 0                        ; block-backed-file descriptor for the CatFS root
+disk_extent_blocks:
+    d32 0                        ; highest start+count seen (whole-disk size guess)
+
+
+; Read the boot disk's partition table and locate the kernel partition.
+; returns r0 = 0 on success (sys_bf + disk_extent_blocks filled), -1 on failure
+bootdev_probe:
+    push r4                      ; port
+    push r5                      ; partitions remaining
+    push r6                      ; entry cursor
+    push r7                      ; found-raw flag
+    mov r4, [bootdiskport]
+
+    mov r1, r4                   ; read block 0 into ptbuf
+    mov r2, ptbuf
+    mov r3, 0
+    call disk_readblock
+
+    mov r0, [ptbuf]              ; validate magic (low uint == 51, high uint == 0)
+    cmp r0, PT_MAGIC
+    jne .bad
+    mov r6, ptbuf
+    add r6, 4
+    mov r0, [r6]
+    cmp r0, 0
+    jne .bad
+
+    mov r6, ptbuf                ; partition count
+    add r6, PT_COUNT_OFF
+    mov r5, [r6]
+
+    mov r6, ptbuf                ; first entry
+    add r6, PT_ENTRIES_OFF
+    mov r7, 0                    ; not found yet
+    .loop:
+        cmp r5, 0
+        je .doneloop
+        vload r0, r6, PE_TYPE
+        cmp r0, PART_TYPE_RAW
+        jne .chkcatfs
+        cmp r7, 0
+        jne .track               ; only take the first raw partition
+        vload r2, r6, PE_START   ; build the /sys descriptor
+        vload r3, r6, PE_COUNT
+        mov r1, r4
+        call bf_new
+        cmp r0, 0
+        je .bad
+        mov [sys_bf], r0
+        mov r7, 1
+        jmp .track
+        .chkcatfs:
+        cmp r0, PART_TYPE_CATFS  ; first CatFS partition -> the root device
+        jne .track
+        mov r0, [catfs_bf]
+        cmp r0, 0
+        jne .track
+        vload r2, r6, PE_START
+        vload r3, r6, PE_COUNT
+        mov r1, r4
+        call bf_new
+        mov [catfs_bf], r0
+        .track:
+        vload r0, r6, PE_START   ; extend the whole-disk size estimate
+        vload r1, r6, PE_COUNT
+        add r0, r1
+        mov r2, [disk_extent_blocks]
+        cmp r0, r2
+        jule .noext
+        mov [disk_extent_blocks], r0
+        .noext:
+        add r6, PT_ENTRY_SIZE
+        sub r5, 1
+        jmp .loop
+    .doneloop:
+    cmp r7, 0
+    je .bad                      ; no raw partition -> can't locate the kernel
+    mov r0, 0
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret

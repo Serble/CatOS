@@ -1,0 +1,40 @@
+; ==========================
+;   Kernel panic
+; ==========================
+; Last-resort failure handling. When the kernel reaches a state it cannot
+; recover from, it calls panic with a numeric code. Panic makes a best-effort
+; attempt to report that code and then stops the machine for good - it never
+; returns.
+;
+; The code is reported with the debug-number interrupt (0x90). That interrupt
+; only produces output when the VM is launched with testing interrupts enabled
+; (--test-ints); otherwise the report is silently skipped and panic still
+; halts. We deliberately avoid the 0x80 "write string" interrupt here, as it
+; is slated for removal.
+;
+; Halting is done by masking interrupts and spinning forever. The `int 0x81`
+; halt interrupt is unreliable until an interrupt table is installed (with no
+; table the CPU ignores it), so a hard spin is the dependable way to stop.
+;
+; Usage:
+;     mov r1, SOME_CODE
+;     call panic                 ; never returns
+; or, more briefly:
+;     kpanic SOME_CODE
+
+
+; kpanic CODE - load a panic code and panic. Never returns.
+; $1 - panic code (register or immediate)
+#macro kpanic, 1
+    mov r1, $1
+    call panic
+#endmacro
+
+
+; Report a failure code and halt the machine. Never returns.
+; r1 - panic code
+panic:
+    int 0x90                 ; best-effort report of the code (needs --test-ints)
+    di                       ; mask interrupts; nothing else should run now
+    .halt:
+    jmp .halt                ; spin forever - the machine is dead
