@@ -64,7 +64,8 @@ else
     # install the userland into /bin
     python3 tools/mkfs_catfs.py --disk "$DISK_IMG" --partition "$CATFS_PARTITION"
     python3 tools/catfs_import.py --disk "$DISK_IMG" --partition "$CATFS_PARTITION" \
-        --mkdir /bin --mkdir /dev --mkdir /sys $(bin_puts)
+        --mkdir /bin --mkdir /dev --mkdir /sys --mkdir /home --mkdir /conf \
+        --put "$CONF_SRC_DIR/init.conf":/conf/init.conf $(bin_puts)
 fi
 
 echo "Built $DISK_IMG"

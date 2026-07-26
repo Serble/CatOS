@@ -14,10 +14,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # --- source locations -------------------------------------------------------
 KERNEL_SRC="src/kernel/boot.cat"     # top-level kernel unit (pulls in the rest)
 USER_SRC_DIR="src/user"              # one .cat per user-mode program
+CONF_SRC_DIR="src/conf"              # files installed into the root fs /conf
 
 # The user-mode programs installed into /bin, each assembled as its own unit so
 # its addresses are 0-based (correct once loaded at user vaddr 0).
-APPS="idle init sh echo ls cat touch ef condemo hello counter spin filetest argtest sigdemo time sleep"
+APPS="idle init sh echo ls cat touch ef condemo hello counter spin filetest argtest sigdemo time sleep poweroff"
 
 # --- build outputs ----------------------------------------------------------
 BUILD_DIR="build"

@@ -200,34 +200,31 @@ rppu_scroll:
     ret
 
 
-; Expand one 8-bit font row (1bpp, MSB = left) into 4 tile bytes (4bpp, 2px per
-; byte, high nibble = left pixel; nibble 1 = foreground, 0 = background).
-; r1 = font byte, r2 = destination address (writes [r2 .. r2+3])
+; Expand one 8-bit font row (1bpp, MSB = left) into 8 tile bytes (4bpp, 2px per
+; byte; nibble 1 = foreground, 0 = background). Each source pixel is doubled
+; horizontally so the 8px-wide glyph fills the whole 16px tile cell - otherwise
+; only the left half is used and every character has an 8px dead gap after it.
+; r1 = font byte, r2 = destination address (writes [r2 .. r2+7])
 rppu_expand_byte:
     push r4                      ; byte value
     push r5                      ; destination
-    push r6                      ; byte index 0..3
+    push r6                      ; source pixel index 0..7
     push r7                      ; assembled byte
     mov r4, r1
     mov r5, r2
     mov r6, 0
     .loop:
-        cmp r6, 4
+        cmp r6, 8
         juge .done
-        mov r0, r6               ; high-pixel bit index = 7 - r6*2
-        umul r0, 2
-        mov r1, 7
-        sub r1, r0
-        mov r7, r4               ; high nibble
+        mov r1, 7                ; source pixel bit = 7 - r6 (MSB = left)
+        sub r1, r6
+        mov r7, r4
         shr r7, r1
-        and r7, 1
-        shl r7, 4
-        sub r1, 1                ; low-pixel bit index
-        mov r0, r4
-        shr r0, r1
-        and r0, 1
+        and r7, 1                ; r7 = this pixel (0 or 1)
+        mov r0, r7               ; duplicate it into both nibbles: 0x00 or 0x11,
+        shl r0, 4                ; so the pixel spans two output pixels (2x wide)
         or r7, r0
-        mov r0, r5               ; store the byte
+        mov r0, r5
         add r0, r6
         mov8 [r0], r7
         add r6, 1
@@ -240,8 +237,8 @@ rppu_expand_byte:
     ret
 
 
-; Upload the whole font into the tile set: glyph N becomes tile N, drawn in the
-; left 8 columns of the 16x16 cell (right 8 columns stay background).
+; Upload the whole font into the tile set: glyph N becomes tile N, scaled 2x
+; horizontally so it fills the full 16x16 cell (no dead space between glyphs).
 rppu_load_font:
     push r4                      ; glyph index
     push r5                      ; row index
@@ -270,7 +267,7 @@ rppu_load_font:
             add r7, r0
             add r7, FB_TILESET
 
-            mov r1, r6           ; expand the 8 glyph bits into 4 tile bytes
+            mov r1, r6           ; expand the 8 glyph bits into 8 tile bytes
             mov r2, r7
             call rppu_expand_byte
 

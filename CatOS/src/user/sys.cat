@@ -28,6 +28,9 @@
 #define SYS_CREATE, 13
 #define SYS_SIGNAL, 14
 #define SYS_KILL, 15
+#define SYS_CHDIR, 16
+#define SYS_GETCWD, 17
+#define SYS_POWEROFF, 18
 
 ; open() modes (bitfield) and seek() whence, matching the kernel VFS
 #define O_READ, 1
@@ -204,5 +207,32 @@
     mov r3, $2
     mov r2, $1
     mov r1, SYS_KILL
+    syscall
+#endmacro
+
+; ---- working directory ----
+; chdir(path) -> 0/-1. Sets the process working directory. $1 = path (relative
+; paths are resolved against the current directory). Fails if the path does not
+; name an existing directory.
+#macro sys_chdir, 1
+    mov r2, $1
+    mov r1, SYS_CHDIR
+    syscall
+#endmacro
+
+; getcwd(buf, cap) -> 0/-1. Writes the working directory (an absolute, null-
+; terminated path) into buf. $1 = buffer, $2 = capacity in bytes.
+#macro sys_getcwd, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_GETCWD
+    syscall
+#endmacro
+
+; ---- power ----
+; poweroff() -> does not return. Powers the machine off via the kernel, which
+; asks the hardware manager to shut down.
+#macro sys_poweroff, 0
+    mov r1, SYS_POWEROFF
     syscall
 #endmacro

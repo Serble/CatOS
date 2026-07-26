@@ -1,14 +1,399 @@
 ; ==========================
 ;   init - the first process
 ; ==========================
-; The kernel bootstraps this process directly; it launches the rest of userland
-; from the filesystem and supervises it. Here it runs the interactive shell,
-; relaunching it if it ever exits. init itself never exits.
+; The kernel bootstraps this process directly; it then reads /conf/init.conf and
+; launches the services listed there. Each line is "<action> <path> [args...]":
+;
+;   bg       spawn once and do not wait (long-running background daemons)
+;   respawn  spawn and restart it if it ever exits abnormally (crash / fault /
+;            kill). A clean exit (code 0, e.g. the shell's "exit") is treated as
+;            deliberate and is NOT restarted.
+;
+; Blank lines and '#' comments are ignored. init supervises the respawn services;
+; once they have all exited (or been retired) there is nothing left to run and
+; init idles forever. If the config file is missing (or lists no respawn service)
+; init falls back to respawning /bin/sh so the system is always usable.
 #include "sys.cat"
 
-init_loop:
-    sys_spawnwait sh_path
-    jmp init_loop
+#define CFGBUF, 1024            ; bytes of config file we will read
+#define MAXLINE_ARGS, 8         ; tokens (argv slots) per line
+#define MAX_RESPAWN, 8          ; supervised respawn services
+#define ROW_BYTES, 32           ; MAXLINE_ARGS pointers per respawn argv row
 
+main:
+    sys_open cfgpath, O_READ
+    mov r5, r0                       ; fd (survives syscalls)
+    cmp r5, -1
+    je .noconfig
+
+    mov r6, 0                        ; total bytes read so far
+    .rdloop:
+        mov r0, CFGBUF               ; remaining capacity (keep 1 for the null)
+        sub r0, 1
+        sub r0, r6
+        cmp r0, 0
+        jile .rddone
+        mov r1, cfgbuf               ; destination = cfgbuf + total
+        add r1, r6
+        mov r4, r0                   ; len
+        mov r3, r1                   ; buf
+        mov r2, r5                   ; fd
+        mov r1, SYS_READ
+        syscall
+        cmp r0, 0
+        jile .rddone
+        add r6, r0
+        jmp .rdloop
+    .rddone:
+    sys_close r5
+    mov r0, cfgbuf                   ; null-terminate the whole file
+    add r0, r6
+    mov8 [r0], 0
+    call parse_config
+    jmp supervise
+
+    .noconfig:
+    call default_config
+    jmp supervise
+
+
+; Walk the config buffer line by line, terminating each line in place and
+; handing it to handle_line.
+parse_config:
+    push r4                          ; line start
+    push r5                          ; line-end cursor
+    push r7                          ; separator that ended the line
+    mov r4, cfgbuf
+    .lines:
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .done                     ; end of file
+        mov r5, r4
+        .findnl:
+            mov8 r0, [r5]
+            cmp r0, 0
+            je .lineend
+            cmp r0, 10               ; '\n'
+            je .lineend
+            add r5, 1
+            jmp .findnl
+        .lineend:
+        mov8 r7, [r5]                ; remember 0 (EOF) vs '\n'
+        mov8 [r5], 0                 ; terminate this line
+        mov r1, r4
+        call handle_line
+        cmp r7, 0
+        je .done                     ; that was the last line
+        add r5, 1
+        mov r4, r5
+        jmp .lines
+    .done:
+    pop r7
+    pop r5
+    pop r4
+    ret
+
+
+; Parse one already-terminated line and act on it.
+handle_line:
+    mov r2, line_argv
+    call tokenize                    ; r0 = argc, line_argv null-terminated
+    cmp r0, 0
+    je .ret                          ; blank line
+    mov r1, [line_argv]              ; comment? (first token starts with '#')
+    mov8 r0, [r1]
+    cmp r0, 35
+    je .ret
+
+    mov r1, [line_argv]              ; action == "bg"?
+    mov r2, kw_bg
+    call streq
+    cmp r0, 1
+    je .dobg
+    mov r1, [line_argv]              ; action == "respawn"?
+    mov r2, kw_respawn
+    call streq
+    cmp r0, 1
+    je .dorespawn
+    jmp .ret                         ; unknown action -> ignore
+
+    .dobg:
+    mov r1, line_argv                ; need a command (argv[1])
+    add r1, 4
+    mov r0, [r1]
+    cmp r0, 0
+    je .ret
+    mov r3, r1                       ; argv = &line_argv[1]
+    mov r2, r0                       ; path = line_argv[1]
+    mov r1, SYS_SPAWN
+    syscall                          ; fire and forget
+    jmp .ret
+
+    .dorespawn:
+    mov r1, line_argv
+    add r1, 4
+    mov r0, [r1]
+    cmp r0, 0
+    je .ret
+    call respawn_add
+    .ret:
+    ret
+
+
+; Record the current line's command (argv[1..]) as a supervised service, copying
+; its argv pointers into a persistent row, then spawn it and store its pid.
+respawn_add:
+    push r4
+    push r5
+    push r6
+    mov r6, [nrespawn]
+    cmp r6, MAX_RESPAWN
+    juge .ret                        ; table full
+
+    mov r4, r6                       ; dest row = respawn_pool + n*ROW_BYTES
+    umul r4, ROW_BYTES
+    add r4, respawn_pool
+    mov r5, line_argv                ; src = &line_argv[1] (skip the action)
+    add r5, 4
+    .copy:
+        mov r0, [r5]
+        mov [r4], r0
+        cmp r0, 0
+        je .copied
+        add r4, 4
+        add r5, 4
+        jmp .copy
+    .copied:
+
+    mov r4, r6                       ; argv base for this service
+    umul r4, ROW_BYTES
+    add r4, respawn_pool
+    mov r2, [r4]                     ; path = row[0]
+    mov r3, r4                       ; argv = row
+    mov r1, SYS_SPAWN
+    syscall                          ; r0 = pid
+
+    mov r1, r6                       ; respawn_pid[n] = pid
+    umul r1, 4
+    add r1, respawn_pid
+    mov [r1], r0
+    mov r1, r6                       ; respawn_argvbase[n] = argv base
+    umul r1, 4
+    add r1, respawn_argvbase
+    mov [r1], r4
+    mov r1, r6                       ; respawn_active[n] = 1
+    umul r1, 4
+    add r1, respawn_active
+    mov [r1], 1
+    mov r0, [nactive]                ; one more service to supervise
+    add r0, 1
+    mov [nactive], r0
+    add r6, 1                        ; nrespawn++
+    mov [nrespawn], r6
+    .ret:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Fallback used when there is no config file or it named no respawn service:
+; supervise a single /bin/sh.
+default_config:
+    mov r1, respawn_pool             ; argv = { "/bin/sh", NULL }
+    mov r0, sh_path
+    mov [r1], r0
+    mov r1, respawn_pool
+    add r1, 4
+    mov [r1], 0
+    mov r0, respawn_pool             ; respawn_argvbase[0] = row 0
+    mov [respawn_argvbase], r0
+    mov r0, 1                        ; respawn_active[0] = 1
+    mov [respawn_active], r0
+    mov r2, sh_path                  ; spawn it
+    mov r3, respawn_pool
+    mov r1, SYS_SPAWN
+    syscall
+    mov [respawn_pid], r0
+    mov r0, 1
+    mov [nrespawn], r0
+    mov [nactive], r0
+    ret
+
+
+; Supervise the respawn services. A service that exits abnormally (nonzero exit
+; code: a crash, fault, or kill) is relaunched so the system heals itself. A
+; service that exits cleanly (code 0 - e.g. the shell's "exit" builtin) is a
+; deliberate exit and is retired, not restarted. Once every service has been
+; retired there is nothing left to run, so init idles quietly forever.
+supervise:
+    mov r0, [nrespawn]
+    cmp r0, 0
+    jne .loop
+    call default_config              ; guarantee a shell if nothing was configured
+    .loop:
+    mov r0, [nactive]                ; nothing left to supervise -> idle
+    cmp r0, 0
+    je .idle
+    mov r6, 0
+    .each:
+        mov r0, [nrespawn]
+        cmp r6, r0
+        juge .loop                   ; wrap around
+        mov r1, r6                   ; skip retired services
+        umul r1, 4
+        add r1, respawn_active
+        mov r0, [r1]
+        cmp r0, 0
+        je .next
+        mov r1, r6                   ; wait on respawn_pid[r6]
+        umul r1, 4
+        add r1, respawn_pid
+        mov r2, [r1]
+        mov r1, SYS_WAIT
+        syscall                      ; blocks until the service exits; r0 = code
+        cmp r0, 0
+        je .retire                   ; clean exit -> stop supervising it
+        mov r1, r6                   ; abnormal exit -> relaunch it
+        umul r1, 4
+        add r1, respawn_argvbase
+        mov r7, [r1]
+        mov r2, [r7]                 ; path
+        mov r3, r7                   ; argv
+        mov r1, SYS_SPAWN
+        syscall                      ; r0 = new pid
+        mov r1, r6
+        umul r1, 4
+        add r1, respawn_pid
+        mov [r1], r0
+        jmp .next
+        .retire:
+        mov r1, r6                   ; respawn_active[r6] = 0
+        umul r1, 4
+        add r1, respawn_active
+        mov [r1], 0
+        mov r0, [nactive]
+        sub r0, 1
+        mov [nactive], r0
+        .next:
+        add r6, 1
+        jmp .each
+    .idle:
+        sys_yield
+        jmp .idle
+
+
+; tokenize(r1 = line, r2 = argv array) -> r0 = argc. Splits the line on runs of
+; whitespace, null-terminating each token in place and writing a pointer to each
+; into the argv array, which is then null-terminated.
+tokenize:
+    push r4                          ; cursor
+    push r5                          ; argc
+    push r6                          ; argv base
+    push r7                          ; slot address
+    mov r4, r1
+    mov r5, 0
+    mov r6, r2
+    .skip:
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .fin
+        cmp r0, 32                   ; space
+        je .white
+        cmp r0, 9                    ; tab
+        je .white
+        cmp r0, 13                   ; CR (tolerate CRLF files)
+        je .white
+        jmp .tok
+        .white:
+        add r4, 1
+        jmp .skip
+    .tok:
+        cmp r5, MAXLINE_ARGS
+        juge .fin
+        mov r7, r5
+        shl r7, 2
+        add r7, r6
+        mov [r7], r4
+        add r5, 1
+    .scan:
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .fin
+        cmp r0, 32
+        je .term
+        cmp r0, 9
+        je .term
+        cmp r0, 13
+        je .term
+        add r4, 1
+        jmp .scan
+    .term:
+        mov8 [r4], 0
+        add r4, 1
+        jmp .skip
+    .fin:
+    mov r7, r5                        ; null-terminate the pointer array
+    shl r7, 2
+    add r7, r6
+    mov [r7], 0
+    mov r0, r5
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; streq(r1, r2) -> r0 = 1 if the null-terminated strings match, else 0.
+streq:
+    push r4
+    push r5
+    mov r4, r1
+    mov r5, r2
+    .cmp:
+        mov8 r0, [r4]
+        mov8 r3, [r5]
+        cmp r0, r3
+        jne .ne
+        cmp r0, 0
+        je .yes
+        add r4, 1
+        add r5, 1
+        jmp .cmp
+    .yes:
+    mov r0, 1
+    jmp .done
+    .ne:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+cfgpath:
+    dstr "/conf/init.conf\0"
 sh_path:
     dstr "/bin/sh\0"
+kw_bg:
+    dstr "bg\0"
+kw_respawn:
+    dstr "respawn\0"
+
+nrespawn:
+    d32 0
+nactive:
+    d32 0
+cfgbuf:
+    res8 CFGBUF
+line_argv:
+    res32 MAXLINE_ARGS + 1
+respawn_pool:
+    res32 MAX_RESPAWN * MAXLINE_ARGS
+respawn_pid:
+    res32 MAX_RESPAWN
+respawn_argvbase:
+    res32 MAX_RESPAWN
+respawn_active:
+    res32 MAX_RESPAWN

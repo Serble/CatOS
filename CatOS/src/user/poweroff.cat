@@ -1,0 +1,15 @@
+; poweroff - power the machine off.
+;
+; Asks the kernel to shut the machine down through the hardware manager. The
+; syscall does not return; the message below is the last thing printed.
+#include "sys.cat"
+
+main:
+    sys_write 1, msg, msg_end - msg
+    sys_poweroff
+    ; not reached
+    sys_exit 0
+
+msg:
+    dstr "Powering off...\n"
+msg_end:

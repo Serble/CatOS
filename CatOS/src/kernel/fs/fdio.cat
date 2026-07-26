@@ -93,6 +93,8 @@ sys_open_h:
     cmp r0, 0
     jne .fail
     mov r1, spawn_pathbuf
+    call abspath                 ; root relative paths against the cwd
+    mov r1, r0
     mov r2, r4                   ; mode
     call vfsopen                 ; r0 = handle or -1
     cmp r0, -1
@@ -285,6 +287,8 @@ sys_create_h:
     cmp r0, 0
     jne .fail
     mov r1, spawn_pathbuf
+    call abspath                 ; root relative paths against the cwd
+    mov r1, r0
     mov r2, r4
     call vfscreate               ; r0 = node (ref taken) or 0
     cmp r0, 0
@@ -295,4 +299,230 @@ sys_create_h:
     jmp sysret
     .fail:
     mov r0, -1
+    jmp sysret
+
+
+; ---------------------------------------------------------------------------
+; Working directory support
+; ---------------------------------------------------------------------------
+; The kernel keeps a canonical absolute path string per process (PCB_CWD).
+; Relative paths coming in from user space are joined onto it here, at the
+; syscall boundary, so the VFS layer only ever sees absolute paths and its
+; tested invariants are untouched.
+
+; scratch buffers for path rooting / canonicalisation
+abspathbuf:
+    res8 VFS_PATH_MAX
+normbuf:
+    res8 VFS_PATH_MAX
+
+; Turn a (possibly relative) path into an absolute one using the caller's cwd.
+; r1 - path (kernel buffer, null-terminated)
+; returns r0 = pointer to an absolute path: the input itself when it was
+;         already absolute (or there is no process context), otherwise
+;         abspathbuf holding cwd + "/" + path.
+; Preserves r4-r7.
+abspath:
+    mov8 r0, [r1]
+    cmp r0, 47                   ; leading '/' -> already absolute
+    je .asis
+    mov r2, [curproc]
+    cmp r2, 0
+    je .asis                     ; no cwd context (early boot) -> as-is
+    push r4                      ; last cwd char written
+    push r5                      ; scratch char
+    push r6                      ; remaining capacity
+    add r2, PCB_CWD              ; r2 = cwd source cursor
+    mov r3, abspathbuf           ; r3 = destination cursor
+    mov r6, VFS_PATH_MAX
+    sub r6, 1                    ; keep one byte for the terminator
+    mov r4, 0
+    .cwd:
+        cmp r6, 0
+        je .term
+        mov8 r5, [r2]
+        cmp r5, 0
+        je .cwddone
+        mov8 [r3], r5
+        mov r4, r5
+        add r2, 1
+        add r3, 1
+        sub r6, 1
+        jmp .cwd
+    .cwddone:
+    cmp r4, 47                   ; separator, unless cwd already ended in '/'
+    je .cpysrc
+    cmp r6, 0
+    je .term
+    mov8 [r3], 47
+    add r3, 1
+    sub r6, 1
+    .cpysrc:
+    .src:
+        cmp r6, 0
+        je .term
+        mov8 r5, [r1]
+        cmp r5, 0
+        je .term
+        mov8 [r3], r5
+        add r1, 1
+        add r3, 1
+        sub r6, 1
+        jmp .src
+    .term:
+    mov8 [r3], 0
+    mov r0, abspathbuf
+    pop r6
+    pop r5
+    pop r4
+    ret
+    .asis:
+    mov r0, r1
+    ret
+
+
+; Lexically canonicalise an absolute path (like path.Clean): collapse "//",
+; drop ".", and pop the previous component on "..". Never touches the disk.
+; r1 - absolute path (kernel buffer)
+; returns r0 = normbuf, a canonical absolute path.
+; Preserves r4-r7.
+pathnorm:
+    push r4                      ; component start
+    push r5                      ; component end
+    push r6                      ; component length
+    push r7                      ; scratch
+    mov r3, normbuf              ; output write cursor
+    .comploop:
+        .skipslash:
+            mov8 r0, [r1]
+            cmp r0, 47
+            jne .compstart
+            add r1, 1
+            jmp .skipslash
+        .compstart:
+        cmp r0, 0
+        je .finish
+        mov r4, r1               ; component = [r4, r5)
+        mov r5, r1
+        .findend:
+            mov8 r0, [r5]
+            cmp r0, 0
+            je .haveend
+            cmp r0, 47
+            je .haveend
+            add r5, 1
+            jmp .findend
+        .haveend:
+        mov r6, r5
+        sub r6, r4               ; component length
+        mov r1, r5               ; advance scan for the next round
+        cmp r6, 1                ; "." -> skip
+        jne .notdot
+        mov8 r0, [r4]
+        cmp r0, 46
+        je .comploop
+        .notdot:
+        cmp r6, 2                ; ".." -> pop
+        jne .emit
+        mov8 r0, [r4]
+        cmp r0, 46
+        jne .emit
+        mov r7, r4
+        add r7, 1
+        mov8 r0, [r7]
+        cmp r0, 46
+        jne .emit
+        cmp r3, normbuf          ; at root already: stay
+        je .comploop
+        .popback:
+            sub r3, 1
+            mov8 r0, [r3]
+            cmp r0, 47
+            jne .popback
+        jmp .comploop
+        .emit:
+        mov8 [r3], 47            ; write "/component"
+        add r3, 1
+        mov r7, r4
+        .emitc:
+            cmp r7, r5
+            je .comploop
+            mov8 r0, [r7]
+            mov8 [r3], r0
+            add r7, 1
+            add r3, 1
+            jmp .emitc
+    .finish:
+    cmp r3, normbuf              ; empty result -> "/"
+    jne .notempty
+    mov8 [r3], 47
+    add r3, 1
+    .notempty:
+    mov8 [r3], 0
+    mov r0, normbuf
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; SYS_CHDIR: r2 = path (user pointer). Roots and canonicalises the path,
+; verifies it names an existing directory, and stores it as the caller's
+; working directory. Returns 0 on success, -1 on failure.
+sys_chdir_h:
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, spawn_pathbuf
+    call abspath
+    mov r1, r0
+    call pathnorm                ; r0 = normbuf (canonical, survives vfsresolve)
+    mov r1, normbuf
+    call vfsresolve              ; r0 = node (ref) or 0
+    cmp r0, 0
+    je .fail
+    mov r5, r0                   ; node
+    vload r1, r5, NODE_TYPE
+    cmp r1, NODE_DIR
+    jne .notdir
+    mov r1, normbuf              ; store canonical path into PCB_CWD
+    mov r2, [curproc]
+    add r2, PCB_CWD
+    mov r3, VFS_PATH_MAX
+    sub r3, 1
+    .store:
+        cmp r3, 0
+        je .storedone
+        mov8 r0, [r1]
+        mov8 [r2], r0
+        cmp r0, 0
+        je .storedone
+        add r1, 1
+        add r2, 1
+        sub r3, 1
+        jmp .store
+    .storedone:
+    mov8 [r2], 0
+    mov r1, r5
+    call vfsnodeunref
+    mov r0, 0
+    jmp sysret
+    .notdir:
+    mov r1, r5
+    call vfsnodeunref
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_GETCWD: r2 = user buffer, r3 = capacity. Copies the caller's working
+; directory out to user space. Returns 0 on success, -1 if it did not fit.
+sys_getcwd_h:
+    mov r1, [curproc]
+    add r1, PCB_CWD
+    call copyoutstr              ; r2 = user buffer, r3 = capacity
     jmp sysret

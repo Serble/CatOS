@@ -56,6 +56,9 @@
 #define SYS_CREATE, 13        ; create a file or directory
 #define SYS_SIGNAL, 14        ; install a signal disposition (signal.cat)
 #define SYS_KILL, 15          ; send a signal to a process (signal.cat)
+#define SYS_CHDIR, 16         ; change the working directory (fdio.cat)
+#define SYS_GETCWD, 17        ; read the working directory (fdio.cat)
+#define SYS_POWEROFF, 18      ; power the machine off via the hardware manager
 
 
 ; Register the syscall dispatcher. Call once at boot, after intinit.
@@ -117,6 +120,12 @@ syscall_handler:
     je sys_signal_h
     cmp r1, SYS_KILL
     je sys_kill_h
+    cmp r1, SYS_CHDIR
+    je sys_chdir_h
+    cmp r1, SYS_GETCWD
+    je sys_getcwd_h
+    cmp r1, SYS_POWEROFF
+    je sys_poweroff_h
     cmp r1, SYS_PRINT
     je .print
     cmp r1, SYS_TEST
@@ -131,3 +140,12 @@ syscall_handler:
     int 0x90
     mov r0, 0
     jmp sysret
+
+
+; SYS_POWEROFF: power the machine off through the hardware manager. Does not
+; return; if the hardware somehow keeps running we freeze the machine instead.
+sys_poweroff_h:
+    call hwshutdown
+    call hwhalt
+    .spin:
+    jmp .spin

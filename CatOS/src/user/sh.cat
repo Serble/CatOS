@@ -3,15 +3,17 @@
 ; Each iteration prints a prompt, reads a line from stdin (the console delivers a
 ; whole line on Enter), splits it into whitespace-separated tokens, and runs the
 ; first token as a program from /bin, passing the tokens as argv. It then waits
-; for the child before prompting again. The built-in "exit" ends the shell.
+; for the child before prompting again. The built-in "exit" ends the shell,
+; "cd" changes the working directory, and "pwd" prints it.
 ;
-; There is no current-working-directory concept in the kernel yet, so commands
-; are always resolved as /bin/<name> and any path arguments are absolute.
+; Commands are resolved as /bin/<name>. Path arguments may be relative; the
+; kernel roots them against the process working directory (see "cd"/"pwd").
 #include "sys.cat"
 
 #define MAXARGS, 8                   ; most tokens on one line (argv slots)
 #define LINEBUF, 128                 ; longest input line
 #define PATHBUF, 64                  ; "/bin/" + command name
+#define CWDBUF, 128                  ; buffer for pwd
 
 main:
 .prompt:
@@ -43,6 +45,18 @@ main:
     cmp r0, 1
     je .doexit
 
+    mov r1, [argvec]                 ; built-in: cd
+    mov r2, cdcmd
+    call streq
+    cmp r0, 1
+    je .docd
+
+    mov r1, [argvec]                 ; built-in: pwd
+    mov r2, pwdcmd
+    call streq
+    cmp r0, 1
+    je .dopwd
+
     call buildpath                   ; pathbuf = "/bin/" + argv[0]
     mov r3, argvec                   ; spawn it with the whole argv
     mov r2, pathbuf
@@ -61,6 +75,38 @@ main:
 
 .doexit:
     sys_exit 0
+
+.docd:
+    mov r0, argvec                   ; argv[1]
+    add r0, 4
+    mov r0, [r0]
+    cmp r0, 0
+    jne .cdgo
+    mov r0, rootpath                 ; bare "cd" -> go to "/"
+    .cdgo:
+    sys_chdir r0
+    cmp r0, -1
+    je .cderr
+    jmp .prompt
+    .cderr:
+    sys_write 1, cdmsg, cdmsg_end - cdmsg
+    jmp .prompt
+
+.dopwd:
+    sys_getcwd cwdbuf, CWDBUF
+    mov r5, cwdbuf                    ; measure the returned string
+    mov r6, 0
+    .pwdlen:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .pwdwrite
+        add r5, 1
+        add r6, 1
+        jmp .pwdlen
+    .pwdwrite:
+    sys_write 1, cwdbuf, r6
+    sys_write 1, newline, 1
+    jmp .prompt
 
 
 ; Split a null-terminated line at r1 into tokens, writing a pointer to each into
@@ -179,6 +225,17 @@ binprefix:
     dstr "/bin/\0"
 exitcmd:
     dstr "exit\0"
+cdcmd:
+    dstr "cd\0"
+pwdcmd:
+    dstr "pwd\0"
+rootpath:
+    dstr "/\0"
+cdmsg:
+    dstr "cd: no such directory\n"
+cdmsg_end:
+newline:
+    dstr "\n"
 
 argvec:
     res32 MAXARGS + 1
@@ -186,3 +243,5 @@ linebuf:
     res8 LINEBUF
 pathbuf:
     res8 PATHBUF
+cwdbuf:
+    res8 CWDBUF

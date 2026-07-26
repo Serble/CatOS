@@ -60,7 +60,9 @@
 #define PCB_SIGSAVE, 156        ; saved interrupt frame while a handler runs (for
                                 ; sigreturn); FRM_SIZE bytes, padded to 56
 #define PCB_SIGINFR, 212        ; nonzero while a signal handler is running
-#define PCB_STRUCT, 216         ; total PCB size
+#define PCB_CWD, 216            ; canonical working-directory string, VFS_PATH_MAX
+                                ; bytes (always absolute, no trailing slash but "/")
+#define PCB_STRUCT, 472         ; total PCB size (PCB_CWD + VFS_PATH_MAX == 216 + 256)
 
 ; ---- interrupt-frame field offsets (from the frame base) ----
 #define FRM_MARKER, 0           ; 1 byte
@@ -281,7 +283,7 @@ proc_create:
     ; so a fresh process must not inherit the previous occupant's handlers).
     mov r1, r4
     add r1, PCB_SIGH
-    mov r2, PCB_STRUCT - PCB_SIGH
+    mov r2, PCB_CWD - PCB_SIGH
     call proc_memzero
 
     ; start with an empty fd table (every slot free = -1)
@@ -302,6 +304,34 @@ proc_create:
     mov r1, r4
     call proc_open_console
     .noconsole:
+
+    ; working directory: inherit the parent's (the spawning process is curproc),
+    ; or default to the root "/" for the very first process (curproc == 0).
+    mov r1, [curproc]
+    cmp r1, 0
+    je .cwdroot
+    add r1, PCB_CWD              ; source: parent's cwd
+    mov r2, r4
+    add r2, PCB_CWD             ; dest: child's cwd
+    mov r0, VFS_PATH_MAX
+    .cwdcopy:
+        cmp r0, 0
+        je .cwddone
+        mov8 r3, [r1]
+        mov8 [r2], r3
+        cmp r3, 0
+        je .cwddone
+        add r1, 1
+        add r2, 1
+        sub r0, 1
+        jmp .cwdcopy
+    .cwdroot:
+    mov r0, r4
+    add r0, PCB_CWD
+    mov8 [r0], 47               ; '/'
+    add r0, 1
+    mov8 [r0], 0
+    .cwddone:
 
     mov r1, PROC_READY
     mov [r4], r1                 ; publish as runnable
