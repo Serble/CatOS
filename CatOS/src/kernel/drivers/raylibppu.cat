@@ -1,12 +1,22 @@
 ; ==========================
 ;   CatOS Raylib PPU driver (display + keyboard)
 ; ==========================
-; A backend for the device-agnostic console (console.cat). It drives the
-; CatMachine Raylib PPU as both the text display and the keyboard input source.
-; The console never names this driver directly - it registers through
-; console_set_display / console_input_char - so a different display (a serial
-; terminal, a real framebuffer, ...) can replace it without touching the console
-; or the rest of the OS.
+; A backend for the device-agnostic console (console.cat) and display service
+; (gfx/display.cat). It drives the CatMachine Raylib PPU as the text display, the
+; linear framebuffer, the keyboard and the pointer.
+;
+; Nothing above this file names this driver. It publishes itself three ways and is
+; reached only through those:
+;
+;   * display_register(rppu_gfx_ops) - the display device vtable: mode switching,
+;     present, screen size, and the console vtable for its text mode;
+;   * console_input_char - keyboard characters into the line discipline, via
+;     input_hotkey first so the screen's owner gets the keys it grabbed;
+;   * pointer_move / pointer_button - pointer state into the display service.
+;
+; So a serial terminal, a plain framebuffer or a different PPU can replace any one
+; of those roles without the console, the surface service or the window manager
+; changing at all.
 ;
 ;
 ; -- Display: the tiled PPU mode ---------------------------------------------
@@ -33,16 +43,29 @@
 ; -- Input: the keyboard ------------------------------------------------------
 ;
 ; The keyboard device raises interrupt 0x70 and exposes (eventType, keycode)
-; pairs read with `in`. The ISR drains them, maps key-down Raylib keycodes to
-; ASCII, and feeds them to the console line discipline.
+; pairs read with `in`. The ISR drains them, offers each key-down to input_hotkey
+; first, and otherwise maps Raylib keycodes to ASCII and feeds them to the console
+; line discipline.
+;
+; The hotkey check has to happen here, in the ISR, because the line discipline is
+; downstream and would swallow anything the screen's owner wanted. What it does
+; NOT do is decide which keys are special - it just asks. The keycodes in the grab
+; table are ones a window manager passed down, and they are Raylib keycodes only
+; because this is the driver that produced them.
 
 #define GFX_TYPE, 0xFF64BEF9     ; PPU graphics device type
 #define KBD_TYPE, 0x2EB3AD76     ; PPU keyboard device type
+#define MOUSE_TYPE, 0x25A3E57D   ; PPU mouse device type
 #define INT_KBD, 0x70            ; keyboard input interrupt
+#define INT_MOUSE, 0x73          ; mouse input interrupt (0x70 kbd, 0x71 timer, 0x72 disk)
+
 
 #define GFX_CMD_UPDATE, 1        ; UpdateDisplay command
 #define GFX_CMD_SETMODE, 2       ; ChangeDisplayMode command
-#define RPPU_MODE, 0x11          ; Tiled512X384
+#define RPPU_MODE, 0x11          ; Tiled512X384 (the text console mode)
+#define RPPU_MODE_LINEAR, 0x01   ; Raw512X384: a flat 512x384 BGRX framebuffer
+#define RPPU_LIN_W, 512          ; linear framebuffer width
+#define RPPU_LIN_H, 384          ; linear framebuffer height
 
 #define FB_PALETTE, 4
 #define FB_TILESET, 516
@@ -64,8 +87,11 @@ rppu_gfxport:
     d32 0
 rppu_kbdport:
     d32 0
+rppu_mouseport:
+    d32 0
 rppu_fb:
     d32 0                        ; framebuffer base (guest physical address)
+
 
 
 ; ==========================
@@ -107,10 +133,8 @@ rppu_gfx_bind:
     mov r3, r4
     call rppu_setmode
 
-    mov r1, rppu_disp_ops        ; hand ourselves to the console
-    mov r2, TILE_COLS
-    mov r3, TILE_ROWS
-    call console_set_display
+    mov r1, rppu_gfx_ops         ; publish ourselves as the display device; that
+    call display_register        ; also hands our text mode to the console
     .done:
     pop r5
     pop r4
@@ -130,6 +154,31 @@ rppu_setmode:
 
 ; DISP_PRESENT: flush the framebuffer to the window (blocks until rendered).
 rppu_present:
+    mov r1, [rppu_gfxport]
+    out r1, GFX_CMD_UPDATE
+    ret
+
+
+; Switch the PPU to the linear (Raw512X384) framebuffer at r1 and show it. Used
+; by the graphical desktop: the compositor's pixels are copied into this buffer
+; and presented. r1 = framebuffer physical address. Returns device status in r0.
+rppu_set_linear:
+    mov r3, r1
+    mov r1, [rppu_gfxport]
+    mov r2, RPPU_MODE_LINEAR
+    call rppu_setmode
+    mov r1, [rppu_gfxport]
+    out r1, GFX_CMD_UPDATE
+    ret
+
+
+; Switch the PPU back to the tiled text console and repaint it. The console's
+; tile framebuffer (rppu_fb) was never freed, so its contents are still valid.
+rppu_set_tiled:
+    mov r1, [rppu_gfxport]
+    mov r2, RPPU_MODE
+    mov r3, [rppu_fb]
+    call rppu_setmode
     mov r1, [rppu_gfxport]
     out r1, GFX_CMD_UPDATE
     ret
@@ -284,11 +333,22 @@ rppu_load_font:
     ret
 
 
-rppu_disp_ops:
+rppu_disp_ops:                   ; the console's display vtable (see console.cat)
     d32 rppu_putc                ; DISP_PUTC
     d32 rppu_scroll              ; DISP_SCROLL
     d32 rppu_clear               ; DISP_CLEAR
     d32 rppu_present             ; DISP_PRESENT
+
+
+rppu_gfx_ops:                    ; the display device record (see gfx/display.cat)
+    d32 rppu_set_linear          ; GDEV_LINEAR
+    d32 rppu_set_tiled           ; GDEV_TEXT
+    d32 rppu_present             ; GDEV_PRESENT
+    d32 rppu_disp_ops            ; GDEV_TEXTOPS
+    d32 TILE_COLS                ; GDEV_TCOLS
+    d32 TILE_ROWS                ; GDEV_TROWS
+    d32 RPPU_LIN_W               ; GDEV_W
+    d32 RPPU_LIN_H               ; GDEV_H
 
 
 ; ==========================
@@ -357,12 +417,70 @@ rppu_kbd_isr:
         in r6, r4                ; keycode (consume it either way)
         cmp r5, 1                ; only act on key-down
         jne .drain
+        mov r1, r6               ; a key the screen's owner grabbed goes to it and
+        call input_hotkey        ; never reaches the console
+        cmp r0, 0
+        jne .drain
         mov r1, r6
         call rppu_keymap
         cmp r0, 0
         je .drain
         mov r1, r0
         call console_input_char
+        jmp .drain
+    .done:
+    int_epilogue
+
+
+; ---- mouse -----------------------------------------------------------------
+; Bind the PPU mouse: give it a distinct interrupt code (the keyboard already
+; owns 0x70) and install the ISR. r1 = port, r2 = unit index.
+rppu_mouse_bind:
+    mov [rppu_mouseport], r1
+    out r1, INT_MOUSE            ; tell the device which interrupt to raise
+    mov r1, INT_MOUSE
+    mov r2, rppu_mouse_isr
+    call intregister
+    ret
+
+
+; Interrupt 0x73 handler: drain (type, value) pairs and publish them through the
+; display service's pointer interface, which is where anything that cares reads
+; from. type 2 = move (value = x | y<<16), type 1 = button down, type 0 = button
+; up (value = raylib button index).
+rppu_mouse_isr:
+    int_prologue
+    mov r4, [rppu_mouseport]
+    .drain:
+        in r0, r4                ; event type (0xFFFFFFFF = queue empty)
+        cmp r0, -1
+        je .done
+        mov r5, r0
+        in r6, r4                ; value
+        cmp r5, 2
+        je .move
+        cmp r5, 1
+        je .btndown
+        cmp r5, 0
+        je .btnup
+        jmp .drain
+        .move:
+        mov r1, r6
+        and r1, 0xFFFF           ; x = low 16 bits
+        mov r2, r6
+        shr r2, 16               ; y = high 16 bits
+        and r2, 0xFFFF
+        call pointer_move
+        jmp .drain
+        .btndown:
+        mov r1, r6               ; button index
+        mov r2, 1
+        call pointer_button
+        jmp .drain
+        .btnup:
+        mov r1, r6
+        mov r2, 0
+        call pointer_button
         jmp .drain
     .done:
     int_epilogue

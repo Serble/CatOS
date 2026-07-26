@@ -1,0 +1,754 @@
+; stopwatch - a GUI stopwatch. An ordinary userland program with a window.
+;
+;   +--------------------------+
+;   |        01:23.45          |
+;   |   [ START ]  [ RESET ]   |
+;   +--------------------------+
+;
+; It creates one surface, draws into its own buffer, and commits. It knows nothing
+; about which window manager is running: under desktop.cat it is a page, under
+; tile.cat it is a tile that gets resized to fit, and it behaves correctly either
+; way because it only ever asks the kernel two questions about itself:
+;
+;   wconfig  how big am I right now?      -> re-lay the buttons out
+;   winput   where is the pointer on me?  -> in MY coordinates, so a hit test is
+;                                            just a rectangle compare
+;
+; The window manager does the routing; a client never sees screen coordinates and
+; never needs to know where it was put.
+;
+; Timing is the CPU's `uptms` (uptime in milliseconds, r1:r0), which is unprivileged
+; and needs no syscall. Only the low word is used, which wraps after ~49 days.
+;
+; Pixels are only committed when the drawn result would actually differ - the
+; displayed time, the button labels or the size - so a stopped stopwatch costs the
+; window manager nothing to show.
+#include "sys.cat"
+
+#define WANT_W, 260                  ; the size we would like
+#define WANT_H, 132
+#define MAX_BYTES, 786432            ; 512 * 384 * 4 - any size we could be granted
+
+#define GW, 8                        ; the console font is 8x16, 1bpp
+#define GH, 16
+#define FONT_GLYPHS, 129
+#define TSCALE, 3                    ; the clock is drawn at 3x, so 24x48 per digit
+#define TCHARS, 8                    ; "MM:SS.CC"
+
+#define BTN_H, 26
+#define BTN_MARGIN, 10
+
+#define BG_COLOUR, 0x00202A33
+#define TIME_COLOUR, 0x00E8F0F5
+#define BTN_RUN, 0x00A5423A          ; the button says STOP while running
+#define BTN_IDLE, 0x003A6EA5         ; ... and START while stopped
+#define BTN_RESET, 0x00404E5A
+#define BTN_TEXT, 0x00FFFFFF
+
+main:
+    sys_sbrk MAX_BYTES
+    cmp r0, -1
+    je .fail
+    mov [winbuf], r0
+
+    sys_wcreate WANT_W, WANT_H
+    cmp r0, -1
+    je .fail
+    mov r7, r0                       ; our surface id (survives syscalls)
+
+    .loop:
+        mov r1, r7
+        call resync                  ; adopt whatever size we have been granted
+        mov r1, r7
+        call handle_click            ; act on a press inside one of our buttons
+        call fmt_now                 ; render the current elapsed time to timebuf
+        call changed                 ; anything different from what is on screen?
+        cmp r0, 0
+        je .idle
+        call redraw
+        mov r3, [winbuf]
+        mov r2, r7
+        mov r1, SYS_WCOMMIT
+        syscall
+        .idle:
+        sys_yield
+        jmp .loop
+
+    .fail:
+        sys_exit 1
+
+
+; ==========================
+;   State
+; ==========================
+
+; Total elapsed milliseconds -> r0.
+elapsed:
+    mov r0, [accum]
+    mov r1, [running]
+    cmp r1, 0
+    je .done                         ; stopped: just what we banked
+    uptms                            ; running: plus the current stretch
+    mov r1, [started]
+    sub r0, r1
+    mov r1, [accum]
+    add r0, r1
+    .done:
+    ret
+
+
+start_stop:
+    mov r0, [running]
+    cmp r0, 0
+    jne .stop
+    uptms                            ; start: remember when
+    mov [started], r0
+    mov r0, 1
+    mov [running], r0
+    ret
+    .stop:
+    call elapsed                     ; stop: bank what has run so far
+    mov [accum], r0
+    mov r0, 0
+    mov [running], r0
+    ret
+
+
+; Back to zero. A running stopwatch keeps running, from zero.
+reset:
+    mov r0, 0
+    mov [accum], r0
+    uptms
+    mov [started], r0
+    ret
+
+
+; ==========================
+;   Size and input
+; ==========================
+
+; Adopt the size the window manager has granted us, and lay the buttons out inside
+; it. Only the config counter moving means anything changed. r1 = sid
+resync:
+    sys_wconfig r1, cfgbuf
+    cmp r0, -1
+    je .done
+    mov r0, cfgbuf
+    add r0, 8
+    mov r0, [r0]                     ; config counter
+    mov r1, [lastcfg]
+    cmp r0, r1
+    je .done
+    mov [lastcfg], r0
+    mov r0, [cfgbuf]
+    mov [winw], r0
+    mov r0, cfgbuf
+    add r0, 4
+    mov r0, [r0]
+    mov [winh], r0
+    call relayout
+    mov r0, 1                        ; force a redraw at the new size
+    mov [dirty], r0
+    .done:
+    ret
+
+
+; Place the two buttons: side by side along the bottom, sharing the width.
+relayout:
+    push r4                          ; usable width
+    mov r4, [winw]
+    sub r4, BTN_MARGIN * 3           ; margin, gap, margin
+    cmp r4, 2
+    jige .ok
+    mov r4, 2
+    .ok:
+    mov r0, r4                       ; each button takes half
+    mov r1, 2
+    udiv r0, r1
+    mov [btnw], r0
+    mov r0, [winh]                   ; sitting above the bottom margin
+    sub r0, BTN_H
+    sub r0, BTN_MARGIN
+    mov [btny], r0
+    mov [btn1x], BTN_MARGIN
+    mov r0, [btnw]
+    add r0, BTN_MARGIN * 2
+    mov [btn2x], r0
+    pop r4
+    ret
+
+
+; Read the pointer as it stands over us and act on a fresh press. r1 = sid
+handle_click:
+    push r4                          ; buttons this frame
+    sys_winput r1, inbuf
+    cmp r0, -1
+    je .done
+    mov r0, inbuf
+    add r0, 8
+    mov r4, [r0]
+    mov r0, r4                       ; only the press edge counts, so holding the
+    and r0, 1                        ; button down does not retrigger
+    cmp r0, 0
+    je .store
+    mov r0, [prevbtn]
+    and r0, 1
+    cmp r0, 0
+    jne .store
+    call hit_test
+    .store:
+    mov [prevbtn], r4
+    .done:
+    pop r4
+    ret
+
+
+; Which button is the pointer in, if any? The coordinates are already ours, so this
+; is just two rectangle compares - no screen geometry involved.
+hit_test:
+    push r4                          ; x
+    push r5                          ; y
+    mov r4, [inbuf]
+    mov r5, inbuf
+    add r5, 4
+    mov r5, [r5]
+    mov r0, [btny]                   ; both buttons share a row
+    cmp r5, r0
+    jil .done
+    add r0, BTN_H
+    cmp r5, r0
+    jige .done
+    mov r0, [btn1x]                  ; start / stop
+    cmp r4, r0
+    jil .done
+    mov r1, [btnw]
+    add r1, r0
+    cmp r4, r1
+    jil .startstop
+    mov r0, [btn2x]                  ; reset
+    cmp r4, r0
+    jil .done
+    mov r1, [btnw]
+    add r1, r0
+    cmp r4, r1
+    jige .done
+    call reset
+    jmp .done
+    .startstop:
+    call start_stop
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Formatting
+; ==========================
+
+; Render the elapsed time into timebuf as "MM:SS.CC".
+fmt_now:
+    push r4                          ; total milliseconds
+    push r5                          ; scratch
+    call elapsed
+    mov r4, r0
+    mov r0, r4                       ; centiseconds = (ms / 10) % 100
+    mov r1, 10
+    udiv r0, r1
+    mov r1, 100
+    udiv r0, r1                      ; r1 = remainder
+    mov r5, r1
+    mov r0, r4                       ; whole seconds
+    mov r1, 1000
+    udiv r0, r1
+    mov r1, 60
+    udiv r0, r1                      ; r0 = minutes, r1 = seconds
+    cmp r0, 99                       ; the display has room for two digits
+    jule .mok
+    mov r0, 99
+    .mok:
+    push r1                          ; seconds
+    mov r1, r0
+    mov r2, timebuf
+    call two_digits
+    mov r0, timebuf
+    add r0, 2
+    mov8 [r0], 58                    ; ':'
+    pop r1                           ; seconds
+    mov r2, timebuf
+    add r2, 3
+    call two_digits
+    mov r0, timebuf
+    add r0, 5
+    mov8 [r0], 46                    ; '.'
+    mov r1, r5                       ; centiseconds
+    mov r2, timebuf
+    add r2, 6
+    call two_digits
+    mov r0, timebuf
+    add r0, 8
+    mov8 [r0], 0
+    pop r5
+    pop r4
+    ret
+
+
+; Two zero-padded decimal digits of r1 at r2.
+two_digits:
+    mov r0, r1
+    mov r1, 10
+    udiv r0, r1                      ; r0 = tens, r1 = units
+    add r0, 48
+    add r1, 48
+    mov8 [r2], r0
+    add r2, 1
+    mov8 [r2], r1
+    ret
+
+
+; Would the window look different from what we last committed? Compares the drawn
+; text and the running state, so a stopped stopwatch commits nothing at all.
+changed:
+    push r4
+    mov r4, 0
+    mov r0, [dirty]
+    cmp r0, 0
+    je .text
+    mov r4, 1
+    .text:
+    mov r1, timebuf
+    mov r2, lasttime
+    call streq
+    cmp r0, 1
+    je .runstate
+    mov r4, 1
+    .runstate:
+    mov r0, [running]
+    mov r1, [lastrunning]
+    cmp r0, r1
+    je .done
+    mov r4, 1
+    .done:
+    mov r0, r4
+    pop r4
+    ret
+
+
+; streq(r1, r2) -> r0 = 1 if the null-terminated strings match.
+streq:
+    push r4
+    push r5
+    mov r4, r1
+    mov r5, r2
+    .cmp:
+        mov8 r0, [r4]
+        mov8 r3, [r5]
+        cmp r0, r3
+        jne .ne
+        cmp r0, 0
+        je .yes
+        add r4, 1
+        add r5, 1
+        jmp .cmp
+    .yes:
+    mov r0, 1
+    jmp .done
+    .ne:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Drawing
+; ==========================
+
+redraw:
+    push r4                          ; pen x
+    call clear_win
+
+    mov r0, [winw]                   ; centre the clock horizontally
+    mov r1, TCHARS * GW * TSCALE
+    sub r0, r1
+    cmp r0, 0
+    jige .xok
+    mov r0, 0                        ; too narrow to centre: start at the edge
+    .xok:
+    mov r1, 2
+    udiv r0, r1
+    mov r4, r0
+    mov r0, [btny]                   ; and vertically in the space above the buttons
+    mov r1, GH * TSCALE
+    sub r0, r1
+    cmp r0, 0
+    jige .yok
+    mov r0, 0
+    .yok:
+    mov r1, 2
+    udiv r0, r1
+    mov [gy], r0
+    mov [gc], TIME_COLOUR
+    mov [gscale], TSCALE
+    mov r1, timebuf
+    mov r2, r4
+    call draw_text
+
+    mov r0, [running]                ; the action button
+    cmp r0, 0
+    je .idle
+    mov [fc], BTN_RUN
+    mov r0, stopmsg
+    jmp .paint
+    .idle:
+    mov [fc], BTN_IDLE
+    mov r0, startmsg
+    .paint:
+    push r0
+    mov r0, [btn1x]
+    mov [fx], r0
+    mov r0, [btny]
+    mov [fy], r0
+    mov r0, [btnw]
+    mov [fw], r0
+    mov [fh], BTN_H
+    call fill_rect
+    pop r1
+    mov r0, [btn1x]
+    call centre_label
+
+    mov [fc], BTN_RESET              ; the reset button
+    mov r0, [btn2x]
+    mov [fx], r0
+    mov r0, [btny]
+    mov [fy], r0
+    mov r0, [btnw]
+    mov [fw], r0
+    mov [fh], BTN_H
+    call fill_rect
+    mov r1, resetmsg
+    mov r0, [btn2x]
+    call centre_label
+
+    mov r0, 0                        ; remember what is now on screen
+    mov [dirty], r0
+    mov r0, [running]
+    mov [lastrunning], r0
+    mov r1, timebuf
+    mov r2, lasttime
+    call strcpy
+    pop r4
+    ret
+
+
+; Draw label r1 centred in the button whose left edge is r0.
+centre_label:
+    push r4                          ; button left
+    push r5                          ; label
+    push r6                          ; length
+    mov r4, r0
+    mov r5, r1
+    mov r6, 0
+    .len:
+        mov r0, r5
+        add r0, r6
+        mov8 r0, [r0]
+        cmp r0, 0
+        je .have
+        add r6, 1
+        jmp .len
+    .have:
+    umul r6, GW                      ; pixel width at 1x
+    mov r0, [btnw]
+    sub r0, r6
+    cmp r0, 0
+    jige .xok
+    mov r0, 0                        ; label wider than the button: flush left
+    .xok:
+    mov r1, 2
+    udiv r0, r1
+    add r0, r4                       ; pen x
+    mov r1, [btny]                   ; (BTN_H - GH) / 2 = 5, vertically centred
+    add r1, 5
+    mov [gy], r1
+    mov [gc], BTN_TEXT
+    mov [gscale], 1
+    mov r2, r0
+    mov r1, r5
+    call draw_text
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Draw a null-terminated string. r1 = string, r2 = pen x. Uses gy, gc, gscale.
+draw_text:
+    push r4                          ; cursor
+    push r5                          ; pen x
+    push r6                          ; advance
+    mov r4, r1
+    mov r5, r2
+    mov r6, [gscale]
+    umul r6, GW
+    .each:
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .done
+        mov [gch], r0
+        mov [gx], r5
+        call draw_glyph
+        add r5, r6
+        add r4, 1
+        jmp .each
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; One glyph, scaled by gscale. Inputs (globals): gx, gy, gch, gc, gscale.
+draw_glyph:
+    push r4                          ; glyph row
+    push r5                          ; that row's font byte
+    push r6                          ; bit index
+    push r7                          ; scale
+    mov r0, [gch]
+    cmp r0, FONT_GLYPHS
+    juge .done
+    umul r0, GH
+    add r0, font
+    mov [gsrc], r0
+    mov r7, [gscale]
+    mov r4, 0
+    .rows:
+        cmp r4, GH
+        juge .done
+        mov r5, [gsrc]
+        add r5, r4
+        mov8 r5, [r5]
+        cmp r5, 0
+        je .nextrow                  ; blank row
+        mov r6, 0
+        .bits:
+            cmp r6, GW
+            juge .nextrow
+            mov r0, 7                ; leftmost pixel is bit 7
+            sub r0, r6
+            mov r1, r5
+            shr r1, r0
+            and r1, 1
+            cmp r1, 0
+            je .nextbit
+            mov r0, r6               ; one scale x scale block per set pixel
+            umul r0, r7
+            mov r1, [gx]
+            add r0, r1
+            mov [fx], r0
+            mov r0, r4
+            umul r0, r7
+            mov r1, [gy]
+            add r0, r1
+            mov [fy], r0
+            mov [fw], r7
+            mov [fh], r7
+            mov r0, [gc]
+            mov [fc], r0
+            call fill_rect
+            .nextbit:
+            add r6, 1
+            jmp .bits
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Solid rectangle, clipped to the window. Inputs (globals): fx, fy, fw, fh, fc.
+fill_rect:
+    push r4                          ; row
+    push r5                          ; py
+    push r6                          ; clipped width
+    push r7                          ; column counter
+    mov r4, 0
+    .rows:
+        mov r0, [fh]
+        cmp r4, r0
+        juge .done
+        mov r5, [fy]
+        add r5, r4
+        cmp r5, 0
+        jil .next
+        mov r0, [winh]
+        cmp r5, r0
+        juge .done
+        mov r6, [fw]
+        mov r0, [fx]
+        add r0, r6
+        mov r1, [winw]
+        cmp r0, r1
+        jule .wok
+        mov r6, [winw]
+        mov r0, [fx]
+        sub r6, r0
+        .wok:
+        cmp r6, 0
+        jile .next
+        mov r0, r5                   ; dst = winbuf + (py*w + x)*4
+        mov r1, [winw]
+        umul r0, r1
+        mov r1, [fx]
+        add r0, r1
+        umul r0, 4
+        mov r2, [winbuf]
+        add r0, r2
+        mov r1, [fc]
+        mov r7, r6
+        .cols:
+            mov [r0], r1
+            add r0, 4
+            sub r7, 1
+            cmp r7, 0
+            jne .cols
+        .next:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Fill the whole window with the background, by the doubling copy trick.
+clear_win:
+    push r4                          ; span filled
+    push r5                          ; remaining
+    push r6                          ; total bytes
+    mov r6, [winw]
+    mov r0, [winh]
+    umul r6, r0
+    umul r6, 4
+    cmp r6, 0
+    je .done
+    mov r0, [winbuf]
+    mov [r0], BG_COLOUR
+    mov r4, 4
+    .fill:
+        cmp r4, r6
+        juge .done
+        mov r5, r6
+        sub r5, r4
+        cmp r4, r5
+        jule .use
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r5
+        jmp .done
+        .use:
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r4
+        add r4, r4
+        jmp .fill
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; strcpy(r1 = src, r2 = dst), terminator included.
+strcpy:
+    .l:
+        mov8 r0, [r1]
+        mov8 [r2], r0
+        cmp r0, 0
+        je .done
+        add r1, 1
+        add r2, 1
+        jmp .l
+    .done:
+    ret
+
+
+startmsg:
+    dstr "START\0"
+stopmsg:
+    dstr "STOP\0"
+resetmsg:
+    dstr "RESET\0"
+
+font:
+    dfile "../../build/font.bin"
+
+
+; ---- state ----
+winbuf:
+    d32 0                            ; the sbrk'd pixel buffer
+winw:
+    d32 WANT_W                       ; the size we are currently drawing at
+winh:
+    d32 WANT_H
+lastcfg:
+    d32 0
+running:
+    d32 0
+accum:
+    d32 0                            ; milliseconds banked by previous runs
+started:
+    d32 0                            ; uptms when the current run began
+prevbtn:
+    d32 0
+dirty:
+    d32 1                            ; force the first frame
+lastrunning:
+    d32 -1
+btnw:
+    d32 0                            ; button geometry, recomputed on resize
+btny:
+    d32 0
+btn1x:
+    d32 0
+btn2x:
+    d32 0
+cfgbuf:
+    res8 12                          ; wconfig: width, height, config counter
+inbuf:
+    res8 12                          ; winput: x, y, buttons
+timebuf:
+    res8 12
+lasttime:
+    res8 12
+fx:
+    d32 0
+fy:
+    d32 0
+fw:
+    d32 0
+fh:
+    d32 0
+fc:
+    d32 0
+gx:
+    d32 0
+gy:
+    d32 0
+gch:
+    d32 0
+gc:
+    d32 0
+gscale:
+    d32 1
+gsrc:
+    d32 0

@@ -27,4 +27,4 @@ catlaunch run --rom "$FIRMWARE_BIN" \
     -d Disk "file:$DISK,picosPerBlock:10" \
     -d Timer \
     -d RaylibPpu \
-    --test-ints -m 1048576 --fast
+    --test-ints -m 33554432 --fast

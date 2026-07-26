@@ -21,6 +21,21 @@
 ;   DISP_SCROLL scroll()                        move everything up one row
 ;   DISP_CLEAR  clear()                         blank the whole screen
 ;   DISP_PRESENT present()                       flush the backbuffer to screen
+;
+;
+; -- The text mirror ---------------------------------------------------------
+;
+; Alongside whatever the backend does, the console keeps its own plain character
+; grid (console_cells, packed at the live geometry). That grid is what makes the
+; console renderable by something other than its backend: SYS_CONREAD hands a
+; snapshot of it - dimensions, cursor and all - to a user program, so a graphical
+; program can draw the shell itself while the display is in a mode its text
+; backend cannot drive.
+;
+; While another process holds the screen, the display service registers
+; console_null_ops here - a backend that draws nowhere - at whatever geometry that
+; process asked for. The console stays completely live, it just has no hardware
+; behind it until the screen is handed back.
 
 #define DISP_PUTC, 0
 #define DISP_SCROLL, 4
@@ -29,6 +44,9 @@
 
 #define CON_LINE_MAX, 255        ; longest editable input line
 #define CON_RING_SIZE, 512       ; completed-input byte ring capacity
+#define CON_MAX_COLS, 64         ; mirror capacity - must fit every backend's
+#define CON_MAX_ROWS, 24         ; geometry (32x24 tiled, 64x23 graphical)
+#define CON_HDR, 20              ; SYS_CONREAD header: cols, rows, col, row, seq
 
 
 ; ---- state ----
@@ -54,6 +72,18 @@ console_line:
     res8 CON_LINE_MAX + 1
 console_ring:
     res8 CON_RING_SIZE
+console_cells:
+    res8 CON_MAX_COLS * CON_MAX_ROWS   ; the text mirror (see the header)
+console_scratch:
+    res8 CON_MAX_COLS * CON_MAX_ROWS   ; the old grid while it is being reflowed
+console_rf_ocols:
+    d32 0                        ; reflow: the geometry the scratch copy is at
+console_rf_first:
+    d32 0                        ; reflow: first old row carried to the new grid
+console_seq:
+    d32 0                        ; bumped on every change to what the console shows,
+                                 ; so a reader can tell "nothing happened" in one
+                                 ; compare instead of diffing the whole grid
 
 consolepath:
     dstr "/dev/console\0"
@@ -105,18 +135,326 @@ disp_present:
     ret
 
 
-; Register a display backend and its size in character cells. Clears the screen.
+; A backend that draws nowhere. Registered while another process owns the screen
+; (see gfx_acquire_h): the mirror still tracks every character, so the console is
+; live and readable through SYS_CONREAD, it simply has no hardware behind it.
+console_null_noop:
+    ret
+
+console_null_ops:
+    d32 console_null_noop        ; DISP_PUTC
+    d32 console_null_noop        ; DISP_SCROLL
+    d32 console_null_noop        ; DISP_CLEAR
+    d32 console_null_noop        ; DISP_PRESENT
+
+
+; Register a display backend and its size in character cells, reflowing the
+; session onto the new grid and repainting the backend from it.
+;
+; The mirror is packed at the live geometry, so changing geometry means rebuilding
+; it. Rather than throw the session away we keep the block of rows ending at the
+; cursor - everything you can currently see, oldest lines dropped first if the new
+; grid is shorter - and truncate columns. That is what makes entering and leaving
+; a graphical program taking the screen seamless: your shell is still there, at a
+; different size, on both sides of the switch.
 ; r1 - display vtable, r2 - columns, r3 - rows
 console_set_display:
+    push r4                      ; new columns
+    push r5                      ; new rows
+    push r6                      ; rows carried over
+    push r7                      ; row index
     mov [console_disp], r1
-    mov [console_cols], r2
-    mov [console_rows], r3
+    mov r4, r2
+    mov r5, r3
+    mov r0, [console_seq]        ; a geometry change invalidates everything a reader
+    add r0, 1                    ; may have cached
+    mov [console_seq], r0
+    mov r0, [console_cols]
+    mov [console_rf_ocols], r0
+    call console_mirror_save     ; the old grid, at the old geometry
+
+    mov r0, [console_row]        ; first = max(0, cursor row - (new rows - 1))
+    mov r1, r5
+    sub r1, 1
+    cmp r0, r1
+    juge .clip
+    mov r0, 0
+    jmp .havefirst
+    .clip:
+    sub r0, r1
+    .havefirst:
+    mov [console_rf_first], r0
+    mov r6, [console_rows]       ; count = min(old rows - first, new rows)
+    sub r6, r0
+    cmp r6, r5
+    jule .havecount
+    mov r6, r5
+    .havecount:
+    cmp r6, 0
+    jile .nocarry
+
+    mov r0, [console_row]        ; the cursor moves with its block of rows
+    mov r1, [console_rf_first]
+    sub r0, r1
+    mov [console_row], r0
+    mov r0, [console_col]        ; and is pulled inside the narrower grid
+    cmp r0, r4
+    jul .colok
+    mov r0, r4
+    sub r0, 1
+    .colok:
+    mov [console_col], r0
+    jmp .adopt
+
+    .nocarry:                    ; nothing to keep (first registration)
+    mov r6, 0
     mov r0, 0
     mov [console_col], r0
     mov [console_row], r0
+
+    .adopt:
+    mov [console_cols], r4
+    mov [console_rows], r5
+    call console_mirror_clear
+    mov r7, 0
+    .rows:
+        cmp r7, r6
+        juge .paint
+        mov r1, r7
+        call console_reflow_row
+        add r7, 1
+        jmp .rows
+    .paint:
     call disp_clear
+    call console_repaint
     call disp_present
+    pop r7
+    pop r6
+    pop r5
+    pop r4
     ret
+
+
+; ==========================
+;   Text mirror
+; ==========================
+
+; Record one glyph in the mirror. Out-of-range cells are dropped rather than
+; scribbling past the grid. r1 = col, r2 = row, r3 = char
+console_mirror_putc:
+    mov r0, [console_cols]
+    umul r0, r2                  ; row * cols
+    add r0, r1                   ; + col
+    cmp r0, CON_MAX_COLS * CON_MAX_ROWS
+    juge .oob
+    add r0, console_cells
+    mov8 [r0], r3
+    .oob:
+    ret
+
+
+; Copy the live mirror aside so console_set_display can reflow it onto a new
+; geometry without reading and writing the same grid at two different strides.
+console_mirror_save:
+    mov r0, console_scratch
+    mov r1, console_cells
+    cpy r1, CON_MAX_COLS * CON_MAX_ROWS
+    ret
+
+
+; Copy one carried row out of the saved grid and into the reflowed mirror,
+; truncating to whichever grid is narrower. r1 = row index (source rows start at
+; console_rf_first; destinations are top-aligned).
+console_reflow_row:
+    push r4                      ; source address
+    push r5                      ; destination address
+    push r6                      ; columns to copy
+    mov r0, [console_rf_first]
+    add r0, r1                   ; source row
+    mov r4, [console_rf_ocols]
+    umul r0, r4
+    add r0, console_scratch
+    mov r4, r0
+    mov r0, r1                   ; destination row = the same index
+    mov r5, [console_cols]
+    umul r0, r5
+    add r0, console_cells
+    mov r5, r0
+    mov r6, [console_rf_ocols]   ; min(old columns, new columns)
+    mov r0, [console_cols]
+    cmp r6, r0
+    jule .have
+    mov r6, r0
+    .have:
+    cmp r6, 0
+    je .done
+    mov r0, r5
+    mov r1, r4
+    mov r2, r6
+    cpy r1, r2
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Push every non-blank mirror cell at the backend, so a display that has just been
+; registered shows the session instead of an empty screen.
+console_repaint:
+    push r4                      ; row
+    push r5                      ; column
+    push r6                      ; row base in the mirror
+    push r7                      ; character
+    mov r4, 0
+    .rows:
+        mov r0, [console_rows]
+        cmp r4, r0
+        juge .done
+        mov r6, r4
+        mov r0, [console_cols]
+        umul r6, r0
+        add r6, console_cells
+        mov r5, 0
+        .cols:
+            mov r0, [console_cols]
+            cmp r5, r0
+            juge .nextrow
+            mov r0, r6
+            add r0, r5
+            mov8 r7, [r0]
+            cmp r7, 32
+            jule .nextcol        ; blank / control -> leave the cell cleared
+            mov r1, r5
+            mov r2, r4
+            mov r3, r7
+            call disp_putc
+            .nextcol:
+            add r5, 1
+            jmp .cols
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Blank the whole mirror (the full capacity, not just the live geometry, so no
+; stale characters survive a geometry change).
+console_mirror_clear:
+    push r4
+    mov r0, console_cells
+    mov r4, CON_MAX_COLS * CON_MAX_ROWS
+    .loop:
+        mov8 [r0], 32
+        add r0, 1
+        sub r4, 1
+        cmp r4, 0
+        jne .loop
+    pop r4
+    ret
+
+
+; Shift the mirror up one row and blank the last one. Copied row by row so the
+; source and destination of each `cpy` never overlap.
+console_mirror_scroll:
+    push r4                      ; row index
+    push r5                      ; bytes per row (= columns)
+    push r6                      ; rows
+    mov r5, [console_cols]
+    mov r6, [console_rows]
+    mov r4, 0
+    .rows:
+        mov r0, r6
+        sub r0, 1
+        cmp r4, r0
+        juge .blank
+        mov r0, r4               ; dst = cells + row*cols
+        umul r0, r5
+        add r0, console_cells
+        mov r1, r4               ; src = cells + (row+1)*cols
+        add r1, 1
+        umul r1, r5
+        add r1, console_cells
+        cpy r1, r5
+        add r4, 1
+        jmp .rows
+    .blank:
+    mov r0, r6                   ; blank the now-duplicated last row
+    sub r0, 1
+    umul r0, r5
+    add r0, console_cells
+    mov r1, r5
+    .clr:
+        cmp r1, 0
+        je .done
+        mov8 [r0], 32
+        add r0, 1
+        sub r1, 1
+        jmp .clr
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; SYS_CONREAD (r2 = dst, r3 = capacity): snapshot the console into the caller's
+; buffer as a CON_HDR header - columns, rows, cursor column, cursor row, change
+; counter - followed by columns*rows characters, row-major. A reader that has seen
+; the same counter before knows the console is unchanged and can skip redrawing it.
+; Returns the number of bytes written, or -1 if the buffer is too small or out of
+; bounds.
+sys_conread_h:
+    push r4                      ; user destination
+    push r5                      ; grid bytes
+    mov r4, r2
+    mov r5, [console_rows]
+    mov r0, [console_cols]
+    umul r5, r0                  ; rows * cols
+    mov r0, r5
+    add r0, CON_HDR              ; total bytes the caller must have room for
+    cmp r3, r0
+    jul .fail
+    mov r1, r4                   ; validate the whole destination range
+    mov r2, r0
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r1, r0                   ; write the header
+    mov r0, [console_cols]
+    mov [r1], r0
+    add r1, 4
+    mov r0, [console_rows]
+    mov [r1], r0
+    add r1, 4
+    mov r0, [console_col]
+    mov [r1], r0
+    add r1, 4
+    mov r0, [console_row]
+    mov [r1], r0
+    add r1, 4
+    mov r0, [console_seq]
+    mov [r1], r0
+    add r1, 4
+    mov r0, r1                   ; then the grid itself
+    mov r1, console_cells
+    mov r2, r5
+    cpy r1, r2
+    mov r0, r5
+    add r0, CON_HDR
+    pop r5
+    pop r4
+    jmp sysret
+    .fail:
+    mov r0, -1
+    pop r5
+    pop r4
+    jmp sysret
 
 
 ; ==========================
@@ -129,6 +467,9 @@ console_set_display:
 console_putc:
     push r4
     mov r4, r1
+    mov r0, [console_seq]        ; the grid or the cursor is about to move; bumping
+    add r0, 1                    ; here (rather than in the mirror writes) also
+    mov [console_seq], r0        ; catches a bare newline moving the cursor
     cmp r4, 10                   ; \n
     je .newline
     cmp r4, 13                   ; \r -> ignore
@@ -140,6 +481,10 @@ console_putc:
     mov r2, [console_row]
     mov r3, r4
     call disp_putc
+    mov r1, [console_col]        ; ... and record it in the mirror
+    mov r2, [console_row]
+    mov r3, r4
+    call console_mirror_putc
     mov r0, [console_col]
     add r0, 1
     mov [console_col], r0
@@ -158,6 +503,10 @@ console_putc:
     mov r2, [console_row]
     mov r3, 32
     call disp_putc
+    mov r1, [console_col]
+    mov r2, [console_row]
+    mov r3, 32
+    call console_mirror_putc
     jmp .ret
 
     .newline:
@@ -169,6 +518,7 @@ console_putc:
     cmp r0, r1
     jul .setrow
     call disp_scroll             ; off the bottom -> scroll, stay on last row
+    call console_mirror_scroll
     mov r0, [console_rows]
     sub r0, 1
     .setrow:

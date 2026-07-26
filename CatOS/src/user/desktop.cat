@@ -1,0 +1,1008 @@
+; desktop - the CatOS graphical shell. An ordinary userland program.
+;
+; It grows its own memory (sbrk) to obtain a full-screen framebuffer plus a
+; scratch buffer, then points the display hardware straight at that framebuffer
+; (gacquire) - so from then on the screen simply *is* this process's memory. The
+; kernel does no drawing at all: every pixel below is pushed by plain stores and
+; the `cpy` instruction, here in userland.
+;
+;
+; -- Pages, not windows -------------------------------------------------------
+;
+; The screen is 512x384. That is far too small to float overlapping windows on,
+; so the desktop is paged instead: one full-screen page at a time, with a tab bar
+; along the bottom to move between them.
+;
+;   page 0        the text console - i.e. the shell. The PPU is in linear mode so
+;                 the tile engine that normally draws the console is not running;
+;                 instead the kernel keeps a plain character grid (see the text
+;                 mirror in kernel/io/console.cat) and hands it over with conread,
+;                 and we rasterise it here with our own copy of the console font.
+;   pages 1..n    one per live surface. Any program that calls wcreate gets a page;
+;                 it commits pixels into its surface and we pull them out with
+;                 wread and centre them in the content area.
+;
+; So "spawn a window" and "spawn a page" are the same act, and a client needs to
+; know nothing about paging - gdemo is unchanged in that respect.
+;
+;
+; -- Input --------------------------------------------------------------------
+;
+; Left/Right arrow change page. Those two keycodes never reach the console: the
+; keyboard ISR diverts them to the window manager while the screen is owned, and
+; we drain them with gkey. Every other key goes to the console line discipline as
+; usual, which is exactly what makes page 0 a working shell.
+;
+; Clicking a tab also switches to it. F1 quits and hands the screen back to the
+; text console; the pointer deliberately cannot, so a misplaced click never throws
+; you out of the desktop.
+#include "sys.cat"
+
+#define FBW, 512
+#define FBH, 384
+#define FB_BYTES, 786432             ; FBW * FBH * 4 (the framebuffer)
+#define BAR_H, 16                    ; tab bar along the bottom
+#define CONTENT_H, 368               ; FBH - BAR_H: the page area above the bar
+#define CONTENT_BYTES, 753664        ; FBW * CONTENT_H * 4 (also the biggest surface)
+#define ARENA_BYTES, 1540096         ; FB_BYTES + CONTENT_BYTES
+
+#define MAXREC, 8                    ; must match the kernel's MAX_SURF
+#define WREC_BYTES, 24               ; sid, w, h, reqw, reqh, seq
+#define WREC_W, 4                    ; offsets within one record
+#define WREC_H, 8
+#define WREC_SEQ, 20
+
+; ---- the console page ----
+#define GW, 8                        ; glyph width
+#define GH, 16                       ; glyph height
+#define CON_COLS, 64                 ; FBW / GW        (must match wm.cat's
+#define CON_ROWS, 23                 ; CONTENT_H / GH   CON_GCOLS / CON_GROWS)
+#define CON_HDR, 20                  ; conread header: cols, rows, cursor col/row, seq
+#define CON_SEQ_OFF, 16              ; the change counter within that header
+#define CONBUF_BYTES, 1492           ; CON_HDR + CON_COLS * CON_ROWS
+#define FONT_GLYPHS, 129             ; glyphs the converted font provides
+
+#define KEY_RIGHT, 262               ; raylib keycodes, claimed with keygrab
+#define KEY_LEFT, 263
+#define KEY_F1, 290                  ; quit back to the raw text console
+#define CON_GEOM, 4194327            ; (CON_COLS << 16) | CON_ROWS, for gacquire
+
+#define TAB_W, 56                    ; one tab button, including its 2px gutter
+
+#define BG_COLOUR, 0x001E2A38        ; dark slate page background
+#define BAR_BG, 0x000E141B           ; behind the tabs
+#define TAB_ON, 0x003A6EA5           ; the current page's tab
+#define TAB_OFF, 0x00243544
+#define TEXT_ON, 0x00FFFFFF
+#define TEXT_OFF, 0x008FA6BC
+#define CURSOR_COLOUR, 0x00FFFFFF
+
+main:
+    sys_sbrk ARENA_BYTES             ; r0 = base of the new region, or -1
+    cmp r0, -1
+    je .fail
+    mov [fbptr], r0                  ; framebuffer first
+    add r0, FB_BYTES
+    mov [surfptr], r0                ; surface scratch after it
+
+    sys_gacquire [fbptr], CON_GEOM   ; scan the display out of our own buffer, and
+    cmp r0, -1                       ; ask for a console sized to our content area
+    je .fail
+
+    sys_keygrab KEY_LEFT, 1          ; claim the keys we page with, so the shell on
+    sys_keygrab KEY_RIGHT, 1         ; page 0 never sees them
+    sys_keygrab KEY_F1, 1            ; ... and the one that gets you out
+
+    .loop:
+        call read_pages
+        call handle_keys             ; F1 is the only way out
+        cmp r0, 1
+        je .quit
+        call handle_mouse
+        call clamp_page
+        call post_input              ; clicks must reach clients on skipped frames
+        call need_redraw             ; r0 = 0 when last frame is still correct
+        cmp r0, 0
+        je .flush
+        call clear_content
+        call draw_page
+        call draw_bar
+        call draw_cursor
+        .flush:
+        sys_gpresent                 ; always: the present blocks until the display
+        sys_yield                    ; has taken the frame, which paces this loop
+        jmp .loop
+
+    .quit:
+        sys_grelease
+        sys_exit 0
+
+    .fail:
+        sys_exit 1
+
+
+; ==========================
+;   Page list and input
+; ==========================
+
+; Refresh the page list: page 0 is always the console, then one page per live
+; surface, so pagecount = surfaces + 1.
+read_pages:
+    sys_wlist wlistbuf, MAXREC
+    cmp r0, 0
+    jige .ok
+    mov r0, 0                        ; treat an error as "no surfaces"
+    .ok:
+    add r0, 1
+    mov [pagecount], r0
+    ret
+
+
+; Drain the keys the ISR diverted to us. Left/Right step one page and stop at the
+; ends rather than wrapping; F1 asks to quit. -> r0 = 1 if F1 was pressed.
+handle_keys:
+    push r4                          ; keycode
+    push r5                          ; quit requested
+    mov r5, 0
+    .drain:
+        sys_gkey
+        cmp r0, -1
+        je .done                     ; ring empty
+        mov r4, r0
+        cmp r4, KEY_F1
+        je .wantquit
+        cmp r4, KEY_LEFT
+        je .left
+        cmp r4, KEY_RIGHT
+        je .right
+        jmp .drain
+        .wantquit:
+        mov r5, 1
+        jmp .drain
+        .left:
+        mov r0, [page]
+        cmp r0, 0
+        je .drain
+        sub r0, 1
+        mov [page], r0
+        jmp .drain
+        .right:
+        mov r0, [page]
+        add r0, 1
+        mov r1, [pagecount]
+        cmp r0, r1
+        juge .drain
+        mov [page], r0
+        jmp .drain
+    .done:
+    mov r0, r5
+    pop r5
+    pop r4
+    ret
+
+
+; Poll the pointer and act on a left-click in the tab bar, on the press edge only
+; so holding the button does not retrigger every frame. The pointer cannot quit -
+; F1 is the only way out, so a stray click can never drop you off the desktop.
+handle_mouse:
+    push r4                          ; this frame's button mask
+    sys_mouse mousebuf
+    mov r0, mousebuf
+    add r0, 8
+    mov r4, [r0]
+    mov r0, r4                       ; bit 0 = left button
+    and r0, 1
+    cmp r0, 0
+    je .store                        ; not pressed
+    mov r1, [prevbtn]
+    and r1, 1
+    cmp r1, 0
+    jne .store                       ; still held from last frame -> not an edge
+    call tab_hit
+    .store:
+    mov [prevbtn], r4
+    pop r4
+    ret
+
+
+; If the pointer is over the tab bar, switch to whichever tab it is on.
+tab_hit:
+    mov r0, mousebuf
+    add r0, 4
+    mov r0, [r0]                     ; y
+    cmp r0, CONTENT_H
+    jul .done                        ; above the bar -> not a tab click
+    mov r0, mousebuf
+    mov r0, [r0]                     ; x
+    mov r1, TAB_W
+    udiv r0, r1                      ; r0 = tab index (r1 takes the remainder)
+    mov r1, [pagecount]
+    cmp r0, r1
+    juge .done                       ; past the last tab
+    mov [page], r0
+    .done:
+    ret
+
+
+; ==========================
+;   Change detection
+; ==========================
+; Composing a frame costs a 736KB clear, a full glyph pass or a 300KB window fetch
+; and blit, and the tab bar - and the overwhelming majority of frames are identical
+; to the one before. So each source of change carries a counter or a value we can
+; compare in a few instructions, and if none of them moved we present the frame we
+; already have and do none of that work.
+;
+; The content check runs unconditionally rather than short-circuiting, because a
+; window can commit new pixels in the same frame that the pointer moves, and
+; noticing only the pointer would leave the window a frame stale.
+
+; -> r0 = 1 if anything on screen has changed since the last frame.
+need_redraw:
+    push r4                          ; accumulated "something changed"
+    mov r4, 0
+    mov r0, 0
+    mov [needread], r0
+
+    mov r0, [page]                   ; whatever is in the content area
+    cmp r0, 0
+    je .console
+    call check_surface
+    jmp .common
+    .console:
+    call check_console
+    .common:
+    or r4, r0
+
+    mov r0, [page]                   ; which page, and how many tabs
+    mov r1, [lastpage]
+    mov [lastpage], r0
+    cmp r0, r1
+    je .c1
+    mov r4, 1
+    .c1:
+    mov r0, [pagecount]
+    mov r1, [lastcount]
+    mov [lastcount], r0
+    cmp r0, r1
+    je .c2
+    mov r4, 1
+    .c2:
+    mov r0, mousebuf                 ; the cursor is drawn into the frame, so any
+    mov r0, [r0]                     ; pointer movement means a redraw
+    mov r1, [lastmx]
+    mov [lastmx], r0
+    cmp r0, r1
+    je .c3
+    mov r4, 1
+    .c3:
+    mov r0, mousebuf
+    add r0, 4
+    mov r0, [r0]
+    mov r1, [lastmy]
+    mov [lastmy], r0
+    cmp r0, r1
+    je .c4
+    mov r4, 1
+    .c4:
+    mov r0, r4
+    pop r4
+    ret
+
+
+; Snapshot the console and report whether it changed. Reads it every frame - the
+; grid is only ~1.5KB - so draw_console can just use the buffer we filled here.
+; Uses only r0-r3 so need_redraw's accumulator survives.
+check_console:
+    call read_console
+    mov r0, conbuf
+    add r0, CON_SEQ_OFF
+    mov r0, [r0]
+    mov r1, [lastconseq]
+    mov [lastconseq], r0
+    cmp r0, r1
+    je .same
+    mov r0, 1
+    ret
+    .same:
+    mov r0, 0
+    ret
+
+
+; Report whether the current page's window has committed new pixels, and if so set
+; needread so draw_surface pulls them across. A different surface in this slot also
+; counts as new - the id is a slot index and gets recycled.
+; Uses only r0-r3.
+check_surface:
+    mov r0, [page]
+    sub r0, 1                        ; page 1 is record 0
+    umul r0, WREC_BYTES
+    add r0, wlistbuf
+    mov r2, r0                       ; this page's wlist record
+    mov r0, [r2]                     ; sid
+    mov r1, [lastsid]
+    mov [lastsid], r0
+    cmp r0, r1
+    jne .fetch
+    mov r0, r2
+    add r0, WREC_SEQ
+    mov r0, [r0]                     ; commit counter
+    mov r1, [lastseq]
+    mov [lastseq], r0
+    cmp r0, r1
+    jne .fetch
+    mov r0, 0
+    ret
+    .fetch:
+    mov r0, r2                       ; keep the counter in step on this path too
+    add r0, WREC_SEQ
+    mov r0, [r0]
+    mov [lastseq], r0
+    mov r0, 1
+    mov [needread], r0
+    ret
+
+
+; Pull the console grid into conbuf. On failure present an empty grid rather than
+; drawing whatever the buffer happened to hold.
+read_console:
+    sys_conread conbuf, CONBUF_BYTES
+    cmp r0, -1
+    jne .ok
+    mov r0, 0
+    mov [conbuf], r0                 ; zero columns and rows
+    mov r1, conbuf
+    add r1, 4
+    mov [r1], r0
+    .ok:
+    ret
+
+
+; Route the pointer to the window on the current page, in its own coordinates, and
+; tell every other window it does not have it. Runs every frame, before the redraw
+; decision - a click has to be delivered even on a frame we would otherwise skip,
+; and the program acting on it will bump its commit counter and cause the redraw.
+post_input:
+    push r4                          ; index
+    push r5                          ; record
+    push r6                          ; this page's record, or 0
+    mov r6, 0
+    mov r0, [page]
+    cmp r0, 0
+    je .scan                         ; the console page owns no surface
+    sub r0, 1
+    umul r0, WREC_BYTES
+    add r0, wlistbuf
+    mov r6, r0
+    .scan:
+    mov r4, 0
+    .each:
+        mov r0, [pagecount]
+        sub r0, 1                    ; surfaces = pages - the console page
+        cmp r4, r0
+        juge .done
+        mov r5, r4
+        umul r5, WREC_BYTES
+        add r5, wlistbuf
+        cmp r5, r6
+        je .visible
+        mov r0, -1                   ; not the page on screen: no pointer
+        mov [postbuf], r0
+        mov r1, postbuf
+        add r1, 4
+        mov [r1], r0
+        add r1, 4
+        mov [r1], 0
+        jmp .send
+        .visible:
+        call surface_rect            ; where we drew it: sx, sy
+        mov r0, mousebuf             ; local x = pointer x - sx
+        mov r0, [r0]
+        mov r1, [sx]
+        sub r0, r1
+        mov [postbuf], r0
+        mov r1, mousebuf             ; local y = pointer y - sy
+        add r1, 4
+        mov r1, [r1]
+        mov r2, [sy]
+        sub r1, r2
+        mov r2, postbuf
+        add r2, 4
+        mov [r2], r1
+        mov r2, postbuf              ; buttons only while actually inside it
+        add r2, 8
+        mov [r2], 0
+        cmp r0, 0
+        jil .send
+        cmp r1, 0
+        jil .send
+        mov r3, r5
+        add r3, WREC_W
+        mov r3, [r3]
+        cmp r0, r3
+        juge .send
+        mov r3, r5
+        add r3, WREC_H
+        mov r3, [r3]
+        cmp r1, r3
+        juge .send
+        mov r1, mousebuf
+        add r1, 8
+        mov r1, [r1]
+        mov [r2], r1
+        .send:
+        mov r0, [r5]                 ; sid
+        sys_wpost r0, postbuf
+        add r4, 1
+        jmp .each
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Where the current page's window is drawn: centred in the content area. Writes
+; sx, sy. Uses the record at r6.
+surface_rect:
+    mov r0, r6
+    add r0, WREC_W
+    mov r0, [r0]
+    mov r1, FBW
+    sub r1, r0
+    mov r2, 2
+    udiv r1, r2
+    mov [sx], r1
+    mov r0, r6
+    add r0, WREC_H
+    mov r0, [r0]
+    mov r1, CONTENT_H
+    sub r1, r0
+    mov r2, 2
+    udiv r1, r2
+    mov [sy], r1
+    ret
+
+
+; Keep the selection inside the live page list - the page we were on disappears
+; when the program owning it exits.
+clamp_page:
+    mov r0, [page]
+    mov r1, [pagecount]
+    cmp r0, r1
+    jul .done
+    sub r1, 1
+    mov [page], r1
+    .done:
+    ret
+
+
+; ==========================
+;   Drawing
+; ==========================
+
+; Draw whichever page is current into the content area.
+draw_page:
+    mov r0, [page]
+    cmp r0, 0
+    je draw_console
+    jmp draw_surface
+
+
+; Page 0: rasterise the character grid check_console already fetched into conbuf,
+; then underline the cursor cell. Blank cells are skipped - the background is
+; already there.
+draw_console:
+    push r4                          ; row
+    push r5                          ; column
+    push r6                          ; address of the row in the grid
+    push r7                          ; columns
+    mov r7, [conbuf]                 ; columns
+    mov r0, conbuf
+    add r0, 4
+    mov r0, [r0]
+    mov [conrows], r0
+    mov r4, 0
+    .rows:
+        mov r0, [conrows]
+        cmp r4, r0
+        juge .cursor
+        mov r6, r4                   ; grid + row*cols
+        umul r6, r7
+        add r6, conbuf
+        add r6, CON_HDR
+        mov r5, 0
+        .cols:
+            cmp r5, r7
+            juge .nextrow
+            mov r0, r6
+            add r0, r5
+            mov8 r0, [r0]            ; the character in this cell
+            cmp r0, 32
+            jule .nextcol            ; blank / control -> nothing to draw
+            mov [gch], r0
+            mov r0, r5
+            umul r0, GW
+            mov [gx], r0
+            mov r0, r4
+            umul r0, GH
+            mov [gy], r0
+            mov [gc], TEXT_ON
+            call draw_glyph
+            .nextcol:
+            add r5, 1
+            jmp .cols
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .cursor:
+    mov r0, conbuf                   ; a two-pixel underline in the cursor cell
+    add r0, 8
+    mov r0, [r0]                     ; cursor column
+    umul r0, GW
+    mov [fx], r0
+    mov r0, conbuf
+    add r0, 12
+    mov r0, [r0]                     ; cursor row
+    umul r0, GH
+    add r0, GH - 2
+    mov [fy], r0
+    mov [fw], GW
+    mov [fh], 2
+    mov [fc], CURSOR_COLOUR
+    call fill_rect
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; A surface page: blit the client's pixels centred in the content area. The fetch
+; out of the kernel (wread - a copy of the whole window) only happens when the
+; client has actually committed a new frame; otherwise the scratch buffer still
+; holds its pixels and we redraw straight from that.
+draw_surface:
+    push r4                          ; this page's wlist record
+    push r6                          ; surface_rect's input
+    mov r0, [page]
+    sub r0, 1                        ; page 1 is record 0
+    umul r0, WREC_BYTES
+    add r0, wlistbuf
+    mov r4, r0
+    mov r0, [needread]
+    cmp r0, 0
+    je .havepixels
+    mov r0, [r4]                     ; sid
+    sys_wread r0, [surfptr]
+    cmp r0, -1
+    je .done
+    .havepixels:
+    mov r0, r4                       ; the size it currently has
+    add r0, WREC_W
+    mov r0, [r0]
+    mov [bw], r0
+    mov r0, r4
+    add r0, WREC_H
+    mov r0, [r0]
+    mov [bh], r0
+    mov r6, r4                       ; centred, the same way post_input assumes
+    call surface_rect
+    mov r0, [sx]
+    mov [bx], r0
+    mov r0, [sy]
+    mov [by], r0
+    mov r0, [surfptr]
+    mov [bsrc], r0
+    call blit_rect
+    .done:
+    pop r6
+    pop r4
+    ret
+
+
+; The tab bar: one button per page, the current one highlighted, labelled "sh"
+; for the console and "w<n>" for surface page n.
+draw_bar:
+    push r4                          ; page index
+    push r5                          ; tab left edge
+    mov [fx], 0                      ; the strip behind the buttons
+    mov [fy], CONTENT_H
+    mov [fw], FBW
+    mov [fh], BAR_H
+    mov [fc], BAR_BG
+    call fill_rect
+    mov r4, 0
+    .tabs:
+        mov r0, [pagecount]
+        cmp r4, r0
+        juge .done
+        mov r5, r4
+        umul r5, TAB_W
+        mov r0, r5
+        add r0, TAB_W
+        cmp r0, FBW
+        jug .done                    ; no room left for another button
+        mov r0, r5                   ; the button, with a 1px gutter each side
+        add r0, 1
+        mov [fx], r0
+        mov [fy], CONTENT_H
+        mov [fw], TAB_W - 2
+        mov [fh], BAR_H
+        mov r0, [page]
+        cmp r0, r4
+        je .on
+        mov [fc], TAB_OFF
+        jmp .paint
+        .on:
+        mov [fc], TAB_ON
+        .paint:
+        call fill_rect
+        mov r1, r5                   ; centre a two-glyph label in the button
+        add r1, 20
+        mov r2, r4
+        call draw_tab_label
+        add r4, 1
+        jmp .tabs
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Draw one tab's label. r1 = left pixel, r2 = page index.
+draw_tab_label:
+    push r4                          ; pen x
+    push r5                          ; page index
+    mov r4, r1
+    mov r5, r2
+    mov [gy], CONTENT_H
+    mov r0, [page]
+    cmp r0, r5
+    je .on
+    mov [gc], TEXT_OFF
+    jmp .draw
+    .on:
+    mov [gc], TEXT_ON
+    .draw:
+    cmp r5, 0
+    je .console
+    mov [gch], 119                   ; 'w'
+    mov [gx], r4
+    call draw_glyph
+    mov r0, r5                       ; the page number, single digit
+    add r0, 48
+    mov [gch], r0
+    mov r0, r4
+    add r0, GW
+    mov [gx], r0
+    call draw_glyph
+    jmp .done
+    .console:
+    mov [gch], 115                   ; 's'
+    mov [gx], r4
+    call draw_glyph
+    mov [gch], 104                   ; 'h'
+    mov r0, r4
+    add r0, GW
+    mov [gx], r0
+    call draw_glyph
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Draw the mouse cursor: a small filled block at the pointer position.
+draw_cursor:
+    mov r0, mousebuf
+    mov r0, [r0]                     ; x
+    mov [fx], r0
+    mov r0, mousebuf
+    add r0, 4
+    mov r0, [r0]                     ; y
+    mov [fy], r0
+    mov [fw], 6
+    mov [fh], 9
+    mov [fc], CURSOR_COLOUR
+    call fill_rect
+    ret
+
+
+; Clear the page area (everything above the tab bar) to BG_COLOUR using the
+; doubling copy trick: seed one pixel, then repeatedly copy the filled span onto
+; itself so it fills in ~log2(N) fast `cpy` blocks.
+clear_content:
+    push r4
+    push r5
+    mov r0, [fbptr]
+    mov [r0], BG_COLOUR              ; seed pixel
+    mov r4, 4
+    .fill:
+        cmp r4, CONTENT_BYTES
+        juge .done
+        mov r5, CONTENT_BYTES
+        sub r5, r4                   ; remaining
+        cmp r4, r5
+        jule .use
+        mov r0, [fbptr]
+        add r0, r4
+        mov r1, [fbptr]
+        cpy r1, r5
+        jmp .done
+        .use:
+        mov r0, [fbptr]
+        add r0, r4
+        mov r1, [fbptr]
+        cpy r1, r4
+        add r4, r4
+        jmp .fill
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Primitives
+; ==========================
+
+; Draw one 8x16 glyph from the embedded console font. Inputs (globals): gx, gy
+; (top-left pixel), gch (character), gc (colour). Rows whose font byte is zero
+; are skipped - most of a glyph is empty and the console is redrawn every frame,
+; so this is the hot loop.
+draw_glyph:
+    push r4                          ; glyph row
+    push r5                          ; the row's font byte
+    push r6                          ; destination address of the row
+    push r7                          ; bit index within the row
+    mov r0, [gch]
+    cmp r0, FONT_GLYPHS
+    juge .done                       ; unmapped code -> draw nothing
+    umul r0, GH
+    add r0, font                     ; font + ch*16
+    mov [gsrc], r0
+    mov r4, 0
+    .rows:
+        cmp r4, GH
+        juge .done
+        mov r0, [gy]
+        add r0, r4                   ; py
+        cmp r0, FBH
+        juge .done                   ; off the bottom of the screen
+        mov r5, [gsrc]
+        add r5, r4
+        mov8 r5, [r5]                ; 1bpp row, MSB = leftmost pixel
+        cmp r5, 0
+        je .nextrow                  ; blank row
+        umul r0, FBW                 ; dst = fbptr + (py*FBW + gx)*4
+        mov r1, [gx]
+        add r0, r1
+        umul r0, 4
+        mov r6, [fbptr]
+        add r6, r0
+        mov r7, 0
+        .bits:
+            cmp r7, GW
+            juge .nextrow
+            mov r0, 7                ; leftmost pixel is bit 7
+            sub r0, r7
+            mov r1, r5
+            shr r1, r0
+            and r1, 1
+            cmp r1, 0
+            je .nextbit
+            mov r0, [gx]
+            add r0, r7
+            cmp r0, FBW
+            juge .nextrow            ; ran off the right edge
+            mov r0, r7
+            umul r0, 4
+            add r0, r6
+            mov r1, [gc]
+            mov [r0], r1
+            .nextbit:
+            add r7, 1
+            jmp .bits
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Fill a rectangle with a solid colour, clipped to the screen. Inputs (globals):
+; fx, fy, fw, fh, fc. Assumes x, y >= 0.
+fill_rect:
+    push r4                          ; row
+    push r5                          ; py
+    push r6                          ; clipped width
+    push r7                          ; column counter
+    mov r4, 0
+    .rows:
+        mov r0, [fh]
+        cmp r4, r0
+        juge .done
+        mov r5, [fy]
+        add r5, r4                   ; py
+        cmp r5, FBH
+        juge .done
+        mov r6, [fw]
+        mov r0, [fx]
+        add r0, r6
+        cmp r0, FBW
+        jule .wok
+        mov r6, FBW
+        mov r0, [fx]
+        sub r6, r0
+        .wok:
+        cmp r6, 0
+        jile .next
+        mov r0, r5                   ; dst = fbptr + (py*FBW + x)*4
+        umul r0, FBW
+        mov r1, [fx]
+        add r0, r1
+        umul r0, 4
+        mov r2, [fbptr]
+        add r0, r2
+        mov r1, [fc]
+        mov r7, r6
+        .cols:
+            mov [r0], r1
+            add r0, 4
+            sub r7, 1
+            cmp r7, 0
+            jne .cols
+        .next:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Blit a w x h image into the content area, clipped so it can never overwrite the
+; tab bar. Inputs (globals): bsrc, bx, by, bw, bh. Assumes x, y >= 0.
+blit_rect:
+    push r4                          ; row
+    push r5                          ; py
+    push r6                          ; clipped width
+    push r7                          ; src base
+    mov r4, 0
+    .rows:
+        mov r0, [bh]
+        cmp r4, r0
+        juge .done
+        mov r5, [by]
+        add r5, r4                   ; py
+        cmp r5, CONTENT_H
+        juge .done
+        mov r6, [bw]
+        mov r0, [bx]
+        add r0, r6
+        cmp r0, FBW
+        jule .wok
+        mov r6, FBW
+        mov r0, [bx]
+        sub r6, r0
+        .wok:
+        cmp r6, 0
+        jile .next
+        mov r0, r5                   ; dst = fbptr + (py*FBW + x)*4
+        umul r0, FBW
+        mov r1, [bx]
+        add r0, r1
+        umul r0, 4
+        mov r2, [fbptr]
+        add r0, r2                   ; R0 = dst
+        mov r1, r4                   ; src = bsrc + (row * bw)*4
+        mov r2, [bw]
+        umul r1, r2
+        umul r1, 4
+        mov r7, [bsrc]
+        add r1, r7                   ; R1 = src
+        mov r2, r6                   ; length = clipped width * 4
+        umul r2, 4
+        cpy r1, r2
+        .next:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ---- the console font -------------------------------------------------------
+; The same 8x16 1bpp blob the kernel's PPU driver embeds, so the console page
+; looks exactly like the text console it stands in for. Path is relative to this
+; source file (src/user/).
+font:
+    dfile "../../build/font.bin"
+
+
+; ---- state ------------------------------------------------------------------
+fbptr:
+    d32 0                            ; base of our framebuffer (in our own memory)
+surfptr:
+    d32 0                            ; base of the surface scratch buffer
+page:
+    d32 0                            ; the page on screen (0 = console)
+pagecount:
+    d32 1                            ; console + live surfaces
+prevbtn:
+    d32 0                            ; last frame's buttons, for press-edge detection
+conrows:
+    d32 0                            ; rows in the last console snapshot
+; ---- what the frame on screen was composed from (see need_redraw) ----
+lastpage:
+    d32 -1                           ; -1 so the first frame always draws
+lastcount:
+    d32 0
+lastmx:
+    d32 -1
+lastmy:
+    d32 -1
+lastconseq:
+    d32 0
+lastsid:
+    d32 -1                           ; slot ids are recycled, so track it explicitly
+lastseq:
+    d32 0
+needread:
+    d32 0                            ; this frame needs a wread (new client pixels)
+sx:
+    d32 0                            ; where the current page's window is drawn
+sy:
+    d32 0
+postbuf:
+    res8 12                          ; wpost: x, y, buttons
+mousebuf:
+    res8 12                          ; x, y, buttons
+wlistbuf:
+    res8 MAXREC * WREC_BYTES
+conbuf:
+    res8 CONBUF_BYTES                ; conread header + character grid
+; fill_rect inputs
+fx:
+    d32 0
+fy:
+    d32 0
+fw:
+    d32 0
+fh:
+    d32 0
+fc:
+    d32 0
+; blit_rect inputs
+bsrc:
+    d32 0
+bx:
+    d32 0
+by:
+    d32 0
+bw:
+    d32 0
+bh:
+    d32 0
+; draw_glyph inputs
+gx:
+    d32 0
+gy:
+    d32 0
+gch:
+    d32 0
+gc:
+    d32 0
+gsrc:
+    d32 0                            ; font address of the glyph being drawn

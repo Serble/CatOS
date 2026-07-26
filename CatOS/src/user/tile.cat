@@ -1,0 +1,742 @@
+; tile - a tiling window manager for CatOS. An ordinary userland program.
+;
+; A deliberately different window manager from desktop.cat, written to prove that
+; nothing in the kernel is specific to one:
+;
+;   * desktop.cat pages - one window on screen at a time, a tab bar, arrow keys.
+;     tile.cat shows every window at once in a grid, has no tab bar, and grabs a
+;     different (much smaller) set of keys - just F1.
+;   * desktop.cat wants a 64x23 console to draw the shell on page 0. tile.cat never
+;     shows the console, so it passes 0 for the console geometry at gacquire and
+;     leaves it exactly as it was.
+;   * desktop.cat accepts whatever size a program asked for and centres it.
+;     tile.cat overrides every window's size with wresize, so each one is reshaped
+;     to fit its cell and redraws itself at that size.
+;
+; The two share no code and make opposite choices, and the kernel needed no change
+; to host either.
+;
+; Because it never draws the console, there is no shell prompt while it is running:
+; start the programs you want to see first, then start this. F1 quits and hands the
+; screen straight back to the text console; the pointer cannot quit, so a stray
+; click never strands you. Quitting does not disturb the clients - their surfaces
+; belong to them, so they carry on running and reappear the next time a window
+; manager starts.
+;
+;   $ bg gdemo
+;   $ bg gdemo
+;   $ bg tile
+#include "sys.cat"
+
+#define MAXFB, 786432                ; 512 * 384 * 4 - the largest screen we handle
+#define ARENA_BYTES, 1572864         ; framebuffer + a scratch of the same size
+
+#define MAXREC, 8                    ; must match the kernel's MAX_SURF
+#define WREC_BYTES, 24               ; sid, w, h, reqw, reqh, seq
+#define WREC_W, 4
+#define WREC_H, 8
+#define WREC_SEQ, 20
+
+#define KEY_F1, 290                  ; quit back to the raw text console
+#define GAP, 4                       ; gutter around each tile
+#define GW, 8                        ; glyph size, for the "no windows" message
+#define GH, 16
+#define FONT_GLYPHS, 129
+
+#define BG_COLOUR, 0x00161C22        ; behind the tiles
+#define FRAME_ON, 0x003A6EA5         ; 1px frame around each tile
+#define TEXT_COLOUR, 0x008FA6BC
+#define CURSOR_COLOUR, 0x00FFFFFF
+
+main:
+    sys_sbrk ARENA_BYTES
+    cmp r0, -1
+    je .fail
+    mov [fbptr], r0
+    add r0, MAXFB
+    mov [scratch], r0
+
+    sys_gacquire [fbptr], 0          ; 0 = leave the console's geometry alone; we
+    cmp r0, -1                       ; never draw it, so it is none of our business
+    je .fail
+    mov r1, r0                       ; the screen size the kernel handed back
+    shr r1, 16
+    mov [scrw], r1
+    mov r1, r0
+    and r1, 0xFFFF
+    mov [scrh], r1
+
+    sys_keygrab KEY_F1, 1            ; the one key we want; the shell keeps the rest
+
+    .loop:
+        call poll_keys               ; r0 = 1 to quit
+        cmp r0, 1
+        je .quit
+        call read_mouse
+        sys_wlist wlistbuf, MAXREC
+        cmp r0, 0
+        jige .havecount
+        mov r0, 0
+        .havecount:
+        mov [nwin], r0
+        call layout                  ; grant every window its cell
+        call post_input              ; and route the pointer into it
+        call clear_fb
+        call draw_tiles
+        call draw_cursor
+        sys_gpresent
+        sys_yield
+        jmp .loop
+
+    .quit:
+        sys_grelease
+        sys_exit 0
+
+    .fail:
+        sys_exit 1
+
+
+; Drain the keys we grabbed. F1 is the way out, and it is the only key we take -
+; everything else still reaches the shell reading the (invisible) console.
+; -> r0 = 1 to quit
+poll_keys:
+    push r4
+    mov r4, 0
+    .drain:
+        sys_gkey
+        cmp r0, -1
+        je .done
+        cmp r0, KEY_F1
+        jne .drain
+        mov r4, 1
+        jmp .drain
+    .done:
+    mov r0, r4
+    pop r4
+    ret
+
+
+; Refresh the pointer position so the cursor can be drawn. Clicks do nothing here:
+; this window manager has no controls to click, and quitting is F1's job alone.
+read_mouse:
+    sys_mouse mousebuf
+    ret
+
+
+; ==========================
+;   Layout
+; ==========================
+
+; Choose a grid for the current window count and write the column/row counts and
+; the cell size into globals. A square-ish grid, biased to more columns because the
+; screen is wider than it is tall.
+grid_for:
+    mov r0, [nwin]
+    mov r1, 1                        ; columns
+    cmp r0, 2
+    jul .have
+    mov r1, 2
+    cmp r0, 4
+    jule .have
+    mov r1, 3
+    .have:
+    mov [gcols], r1
+    mov r0, [nwin]                   ; rows = ceil(n / cols)
+    add r0, r1
+    sub r0, 1
+    udiv r0, r1
+    cmp r0, 1
+    juge .rowsok
+    mov r0, 1
+    .rowsok:
+    mov [grows], r0
+    mov r0, [scrw]                   ; cell size = screen / grid
+    mov r1, [gcols]
+    udiv r0, r1
+    mov [cellw], r0
+    mov r0, [scrh]
+    mov r1, [grows]
+    udiv r0, r1
+    mov [cellh], r0
+    ret
+
+
+; Give every window the size of its cell, minus the gutter and frame. wresize is a
+; no-op when the size already matches, so this can run unconditionally every frame;
+; the client notices through wconfig and redraws itself to fit.
+layout:
+    push r4                          ; index
+    push r5                          ; record
+    push r6                          ; tile width
+    push r7                          ; tile height
+    call grid_for
+    mov r6, [cellw]
+    sub r6, GAP * 2
+    mov r7, [cellh]
+    sub r7, GAP * 2
+    cmp r6, 1
+    jile .done                       ; cells too small to bother with
+    cmp r7, 1
+    jile .done
+    mov r4, 0
+    .each:
+        mov r0, [nwin]
+        cmp r4, r0
+        juge .done
+        mov r5, r4
+        umul r5, WREC_BYTES
+        add r5, wlistbuf
+        mov r0, r5                   ; already the right size? wresize will notice
+        add r0, WREC_W
+        mov r0, [r0]
+        mov r1, r6
+        cmp r0, r1
+        jne .set
+        mov r0, r5
+        add r0, WREC_H
+        mov r0, [r0]
+        cmp r0, r7
+        je .next
+        .set:
+        mov r0, r6                   ; packed (w << 16) | h
+        shl r0, 16
+        or r0, r7
+        mov r1, [r5]                 ; sid
+        sys_wresize r1, r0
+        cmp r0, -1
+        je .next
+        mov r0, r5                   ; the listing we read before the resize is now
+        add r0, WREC_W               ; stale; correct it so this frame draws the
+        mov [r0], r6                 ; window at the size it actually has
+        mov r0, r5
+        add r0, WREC_H
+        mov [r0], r7
+        .next:
+        add r4, 1
+        jmp .each
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Hand the pointer to whichever tile it is over, in that window's own coordinates,
+; and tell the rest they do not have it. We are the only thing that knows where the
+; tiles are, so we do the hit-testing.
+post_input:
+    push r4                          ; index
+    push r5                          ; record
+    push r6                          ; tile origin x
+    push r7                          ; tile origin y
+    mov r4, 0
+    .each:
+        mov r0, [nwin]
+        cmp r4, r0
+        juge .done
+        mov r5, r4
+        umul r5, WREC_BYTES
+        add r5, wlistbuf
+
+        mov r0, r4                   ; tile origin, same layout as draw_tiles
+        mov r1, [gcols]
+        udiv r0, r1                  ; r0 = row, r1 = column
+        mov r6, r1
+        mov r7, r0
+        mov r0, r6
+        mov r1, [cellw]
+        umul r0, r1
+        add r0, GAP
+        mov r6, r0
+        mov r0, r7
+        mov r1, [cellh]
+        umul r0, r1
+        add r0, GAP
+        mov r7, r0
+
+        mov r0, mousebuf             ; local coordinates
+        mov r0, [r0]
+        sub r0, r6
+        mov [postbuf], r0
+        mov r1, mousebuf
+        add r1, 4
+        mov r1, [r1]
+        sub r1, r7
+        mov r2, postbuf
+        add r2, 4
+        mov [r2], r1
+        mov r2, postbuf              ; buttons only while inside this tile
+        add r2, 8
+        mov [r2], 0
+        cmp r0, 0
+        jil .send
+        cmp r1, 0
+        jil .send
+        mov r3, r5
+        add r3, WREC_W
+        mov r3, [r3]
+        cmp r0, r3
+        juge .send
+        mov r3, r5
+        add r3, WREC_H
+        mov r3, [r3]
+        cmp r1, r3
+        juge .send
+        mov r1, mousebuf
+        add r1, 8
+        mov r1, [r1]
+        mov [r2], r1
+        .send:
+        mov r0, [r5]                 ; sid
+        sys_wpost r0, postbuf
+        add r4, 1
+        jmp .each
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Drawing
+; ==========================
+
+; Fetch each window and blit it into its cell, with a one-pixel frame around it.
+; A window is drawn at whatever size it currently reports, which may lag our
+; resize by a frame while the client catches up - so we clip rather than assume.
+draw_tiles:
+    push r4                          ; index
+    push r5                          ; record
+    push r6                          ; cell column
+    push r7                          ; cell row
+    mov r0, [nwin]
+    cmp r0, 0
+    jile .empty
+    mov r4, 0
+    .each:
+        mov r0, [nwin]
+        cmp r4, r0
+        juge .done
+        mov r5, r4
+        umul r5, WREC_BYTES
+        add r5, wlistbuf
+
+        mov r0, r4                   ; cell row / column
+        mov r1, [gcols]
+        udiv r0, r1                  ; r0 = row, r1 = column
+        mov r7, r0
+        mov r6, r1
+
+        mov r0, r6                   ; x = column * cellw + GAP
+        mov r1, [cellw]
+        umul r0, r1
+        add r0, GAP
+        mov [bx], r0
+        mov r0, r7                   ; y = row * cellh + GAP
+        mov r1, [cellh]
+        umul r0, r1
+        add r0, GAP
+        mov [by], r0
+
+        mov r0, r5                   ; the size the window actually has now
+        add r0, WREC_W
+        mov r0, [r0]
+        mov [bw], r0
+        mov r0, r5
+        add r0, WREC_H
+        mov r0, [r0]
+        mov [bh], r0
+
+        call draw_frame              ; frame first, the window covers its inside
+
+        mov r0, [r5]                 ; sid
+        sys_wread r0, [scratch]
+        cmp r0, -1
+        je .next
+        mov r0, [scratch]
+        mov [bsrc], r0
+        call blit_rect
+        .next:
+        add r4, 1
+        jmp .each
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+    .empty:
+    call draw_empty
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; A one-pixel frame just outside the window rectangle (bx, by, bw, bh).
+draw_frame:
+    mov r0, [bx]
+    sub r0, 1
+    mov [fx], r0
+    mov r0, [by]
+    sub r0, 1
+    mov [fy], r0
+    mov r0, [bw]
+    add r0, 2
+    mov [fw], r0
+    mov r0, [bh]
+    add r0, 2
+    mov [fh], r0
+    mov [fc], FRAME_ON
+    call fill_rect
+    ret
+
+
+; With nothing to tile, say so - and say how to get out, because this window
+; manager deliberately never draws the console, so the only way back to a shell
+; prompt is to quit.
+draw_empty:
+    mov r1, emptymsg1
+    mov r2, 16
+    call draw_text
+    mov r1, emptymsg2
+    mov r2, 48
+    call draw_text
+    mov r1, emptymsg3
+    mov r2, 68
+    call draw_text
+    ret
+
+
+; Draw a null-terminated string. r1 = string, r2 = top pixel row.
+draw_text:
+    push r4                          ; message cursor
+    push r5                          ; pen x
+    mov r4, r1
+    mov [gy], r2
+    mov r5, 16
+    mov [gc], TEXT_COLOUR
+    .each:
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .done
+        mov [gch], r0
+        mov [gx], r5
+        call draw_glyph
+        add r5, GW
+        add r4, 1
+        jmp .each
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+draw_cursor:
+    mov r0, mousebuf
+    mov r0, [r0]
+    mov [fx], r0
+    mov r0, mousebuf
+    add r0, 4
+    mov r0, [r0]
+    mov [fy], r0
+    mov [fw], 6
+    mov [fh], 9
+    mov [fc], CURSOR_COLOUR
+    call fill_rect
+    ret
+
+
+; Clear the whole screen with the doubling copy trick: seed one pixel, then copy
+; the filled span onto itself until it covers the frame.
+clear_fb:
+    push r4                          ; span filled so far
+    push r5                          ; remaining
+    push r6                          ; total bytes
+    mov r6, [scrw]
+    mov r0, [scrh]
+    umul r6, r0
+    umul r6, 4
+    mov r0, [fbptr]
+    mov [r0], BG_COLOUR
+    mov r4, 4
+    .fill:
+        cmp r4, r6
+        juge .done
+        mov r5, r6
+        sub r5, r4
+        cmp r4, r5
+        jule .use
+        mov r0, [fbptr]
+        add r0, r4
+        mov r1, [fbptr]
+        cpy r1, r5
+        jmp .done
+        .use:
+        mov r0, [fbptr]
+        add r0, r4
+        mov r1, [fbptr]
+        cpy r1, r4
+        add r4, r4
+        jmp .fill
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Primitives
+; ==========================
+
+; One 8x16 glyph. Inputs (globals): gx, gy, gch, gc.
+draw_glyph:
+    push r4                          ; glyph row
+    push r5                          ; font byte
+    push r6                          ; row destination
+    push r7                          ; bit index
+    mov r0, [gch]
+    cmp r0, FONT_GLYPHS
+    juge .done
+    umul r0, GH
+    add r0, font
+    mov [gsrc], r0
+    mov r4, 0
+    .rows:
+        cmp r4, GH
+        juge .done
+        mov r0, [gy]
+        add r0, r4
+        mov r1, [scrh]
+        cmp r0, r1
+        juge .done
+        mov r5, [gsrc]
+        add r5, r4
+        mov8 r5, [r5]
+        cmp r5, 0
+        je .nextrow
+        mov r1, [scrw]
+        umul r0, r1
+        mov r1, [gx]
+        add r0, r1
+        umul r0, 4
+        mov r6, [fbptr]
+        add r6, r0
+        mov r7, 0
+        .bits:
+            cmp r7, GW
+            juge .nextrow
+            mov r0, 7
+            sub r0, r7
+            mov r1, r5
+            shr r1, r0
+            and r1, 1
+            cmp r1, 0
+            je .nextbit
+            mov r0, [gx]
+            add r0, r7
+            mov r1, [scrw]
+            cmp r0, r1
+            juge .nextrow
+            mov r0, r7
+            umul r0, 4
+            add r0, r6
+            mov r1, [gc]
+            mov [r0], r1
+            .nextbit:
+            add r7, 1
+            jmp .bits
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Solid rectangle, clipped to the screen. Inputs (globals): fx, fy, fw, fh, fc.
+fill_rect:
+    push r4                          ; row
+    push r5                          ; py
+    push r6                          ; clipped width
+    push r7                          ; column counter
+    mov r4, 0
+    .rows:
+        mov r0, [fh]
+        cmp r4, r0
+        juge .done
+        mov r5, [fy]
+        add r5, r4
+        mov r0, [scrh]
+        cmp r5, r0
+        juge .done
+        mov r6, [fw]
+        mov r0, [fx]
+        add r0, r6
+        mov r1, [scrw]
+        cmp r0, r1
+        jule .wok
+        mov r6, [scrw]
+        mov r0, [fx]
+        sub r6, r0
+        .wok:
+        cmp r6, 0
+        jile .next
+        mov r0, r5
+        mov r1, [scrw]
+        umul r0, r1
+        mov r1, [fx]
+        add r0, r1
+        umul r0, 4
+        mov r2, [fbptr]
+        add r0, r2
+        mov r1, [fc]
+        mov r7, r6
+        .cols:
+            mov [r0], r1
+            add r0, 4
+            sub r7, 1
+            cmp r7, 0
+            jne .cols
+        .next:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Blit bw x bh pixels from bsrc to (bx, by), clipped to the screen.
+blit_rect:
+    push r4                          ; row
+    push r5                          ; py
+    push r6                          ; clipped width
+    push r7                          ; scratch
+    mov r4, 0
+    .rows:
+        mov r0, [bh]
+        cmp r4, r0
+        juge .done
+        mov r5, [by]
+        add r5, r4
+        mov r0, [scrh]
+        cmp r5, r0
+        juge .done
+        mov r6, [bw]
+        mov r0, [bx]
+        add r0, r6
+        mov r1, [scrw]
+        cmp r0, r1
+        jule .wok
+        mov r6, [scrw]
+        mov r0, [bx]
+        sub r6, r0
+        .wok:
+        cmp r6, 0
+        jile .next
+        mov r0, r5                   ; dst = fbptr + (py*scrw + bx)*4
+        mov r1, [scrw]
+        umul r0, r1
+        mov r1, [bx]
+        add r0, r1
+        umul r0, 4
+        mov r2, [fbptr]
+        add r0, r2
+        mov r1, r4                   ; src = bsrc + (row * bw)*4
+        mov r2, [bw]
+        umul r1, r2
+        umul r1, 4
+        mov r7, [bsrc]
+        add r1, r7
+        mov r2, r6                   ; length = clipped width * 4
+        umul r2, 4
+        cpy r1, r2
+        .next:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+emptymsg1:
+    dstr "tile: nothing to tile.\0"
+emptymsg2:
+    dstr "Press F1 to quit back to the shell.\0"
+emptymsg3:
+    dstr "Then: bg gdemo   (twice), then: bg tile\0"
+
+; the same console font the kernel's PPU driver embeds
+font:
+    dfile "../../build/font.bin"
+
+
+; ---- state ----
+fbptr:
+    d32 0
+scratch:
+    d32 0                            ; where a window's pixels are fetched into
+scrw:
+    d32 0                            ; screen size, from gacquire
+scrh:
+    d32 0
+nwin:
+    d32 0
+gcols:
+    d32 1                            ; the grid
+grows:
+    d32 1
+cellw:
+    d32 0
+cellh:
+    d32 0
+mousebuf:
+    res8 12
+wlistbuf:
+    res8 MAXREC * WREC_BYTES
+postbuf:
+    res8 12                          ; wpost: x, y, buttons
+fx:
+    d32 0
+fy:
+    d32 0
+fw:
+    d32 0
+fh:
+    d32 0
+fc:
+    d32 0
+bsrc:
+    d32 0
+bx:
+    d32 0
+by:
+    d32 0
+bw:
+    d32 0
+bh:
+    d32 0
+gx:
+    d32 0
+gy:
+    d32 0
+gch:
+    d32 0
+gc:
+    d32 0
+gsrc:
+    d32 0

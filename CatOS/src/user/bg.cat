@@ -1,0 +1,160 @@
+; bg - start a program and hand the terminal straight back.
+;
+;   bg <command> [args...]
+;
+; The shell waits for every command it runs, so starting something long-lived
+; from it - a graphical app that puts up a desktop page, say - leaves you with no
+; prompt until that program exits, and nothing to type into to get one. bg breaks
+; the chain: it spawns the program and exits immediately, so the shell's wait()
+; returns at once while the program carries on running.
+;
+; The command is resolved as /bin/<name>, or used as-is if it already starts with
+; "/". Everything after it is passed through as the child's argv, so the program
+; sees its own name in argv[0] exactly as it would if the shell had run it.
+;
+; The shell's own "cmd &" does the same job; bg is the version that works from
+; anywhere a program can be spawned, and it prints the new pid.
+#include "sys.cat"
+
+#define PATHBUF, 64                  ; "/bin/" + command name
+#define NUMBUF, 12                   ; pid in decimal
+
+main:
+    mov r5, r1                       ; argc (r5-r7 survive syscalls; r4 does not,
+    mov r6, r2                       ; argv  sys_write passes the length in it)
+    cmp r5, 2
+    jil .usage
+
+    mov r0, r6                       ; argv[1] = the command to run
+    add r0, 4
+    mov r1, [r0]
+    call buildpath                   ; -> pathbuf
+
+    mov r3, r6                       ; the child's argv is our argv[1..]: the
+    add r3, 4                        ; kernel already null-terminated the array
+    mov r2, pathbuf
+    mov r1, SYS_SPAWN
+    syscall
+    cmp r0, -1
+    je .nostart
+    mov r7, r0                       ; the new pid
+
+    sys_write 1, startmsg, startmsg_end - startmsg
+    mov r1, r7
+    mov r2, numbuf
+    call itoa                        ; r0 = digits written
+    sys_write 1, numbuf, r0
+    sys_write 1, newline, 1
+    sys_exit 0
+
+.usage:
+    sys_write 1, usagemsg, usagemsg_end - usagemsg
+    sys_exit 1
+
+.nostart:
+    sys_write 1, nsmsg, nsmsg_end - nsmsg
+    sys_exit 1
+
+
+; Build pathbuf: the command name as given if it is already absolute, otherwise
+; "/bin/" + the name. r1 = the name.
+buildpath:
+    push r4                          ; write cursor
+    push r5                          ; read cursor
+    mov r5, r1
+    mov r4, pathbuf
+    mov8 r0, [r5]
+    cmp r0, 47                       ; '/' -> an absolute path, take it verbatim
+    je .name
+    mov r5, binprefix
+    .pre:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .predone
+        mov8 [r4], r0
+        add r4, 1
+        add r5, 1
+        jmp .pre
+    .predone:
+    mov r5, r1
+    .name:                           ; append the name, terminator included
+        mov8 r0, [r5]
+        mov8 [r4], r0
+        cmp r0, 0
+        je .done
+        add r4, 1
+        add r5, 1
+        jmp .name
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; itoa(r1 = value, r2 = destination) -> r0 = digits written. Digits come out of
+; the division least-significant-first, so they go on the stack and come back off
+; in order.
+itoa:
+    push r4                          ; value
+    push r5                          ; destination
+    push r6                          ; digit count
+    push r7                          ; copy index
+    mov r4, r1
+    mov r5, r2
+    mov r6, 0
+    cmp r4, 0
+    jne .gen
+    mov8 [r5], 48                    ; "0"
+    mov r0, 1
+    jmp .ret
+    .gen:
+    .gl:
+        cmp r4, 0
+        je .emit
+        mov r0, r4
+        mov r1, 10
+        udiv r0, r1                  ; r0 = quotient, r1 = remainder
+        add r1, 48
+        push r1
+        add r6, 1
+        mov r4, r0
+        jmp .gl
+    .emit:
+    mov r7, 0
+    .ol:
+        cmp r7, r6
+        juge .count
+        pop r1
+        mov r0, r5
+        add r0, r7
+        mov8 [r0], r1
+        add r7, 1
+        jmp .ol
+    .count:
+    mov r0, r6
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+binprefix:
+    dstr "/bin/\0"
+startmsg:
+    dstr "bg: started pid "
+startmsg_end:
+usagemsg:
+    dstr "usage: bg <command> [args...]\n"
+usagemsg_end:
+nsmsg:
+    dstr "bg: cannot start command\n"
+nsmsg_end:
+newline:
+    dstr "\n"
+
+pathbuf:
+    res8 PATHBUF
+numbuf:
+    res8 NUMBUF

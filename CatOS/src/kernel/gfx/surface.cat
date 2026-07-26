@@ -1,0 +1,583 @@
+; ==========================
+;   CatOS surface service
+; ==========================
+; The kernel side of windowing, and deliberately *not* a window manager. It owns
+; the pixel buffers programs draw into and moves bytes in and out of them under
+; access control, and that is the whole job. It has no idea what a window looks
+; like, where one goes, whether they overlap or tile or page, which one you are
+; looking at, or how big any of them ought to be. Every one of those is a decision
+; for the userland window manager, and swapping that program for a different one
+; requires no change here.
+;
+;
+; -- Sizing: the program asks, the manager grants ------------------------------
+;
+; A program asks for a size with wcreate. The kernel grants exactly what was asked
+; for, so a manager with no opinion about sizes need do nothing at all and windows
+; behave as if they were fixed. A manager that does have an opinion calls wresize
+; to grant something else - a tile, a maximised area, whatever its layout says -
+; and the program notices with wconfig and redraws to fit.
+;
+;   app:  wcreate(w, h)          -> sid
+;   app:  wconfig(sid, buf)      -> [granted w, granted h, config counter]
+;   wm:   wresize(sid, w, h)     -> bumps that counter and reshapes the buffer
+;
+; The counter changes only when the geometry does, so a program can poll it in one
+; compare. The requested size is kept in the record and reported through wlist, so
+; a manager can honour a program's preference when it has room to. Nothing in this
+; protocol commits the kernel to a policy, and it is what makes resizable windows
+; a window-manager feature rather than a kernel feature.
+;
+;
+; -- Input: the manager routes, the kernel just relays -------------------------
+;
+; A client cannot read the pointer usefully for itself: SYS_MOUSE is in screen
+; coordinates and a surface has no position, because position is the window
+; manager's business. So the manager - which is the only thing that knows where a
+; window ended up - does the hit-testing and posts the pointer to whichever window
+; is under it, already translated into that window's own coordinates. Everyone else
+; is posted (-1, -1) with no buttons.
+;
+;   wm:   wpost(sid, [x, y, buttons])   after it has laid the screen out
+;   app:  winput(sid, buf)              -> the same three words
+;
+; The kernel stores three words and hands them back. It does not decide who has
+; focus, what a click means, or whether a window can see the pointer at all - a
+; manager that wants click-to-focus, or wants to swallow input entirely, just posts
+; differently.
+;
+;
+; -- Pixels ---------------------------------------------------------------------
+;
+; The CPU has no shared memory, so pixels cross between processes as two bounded
+; copies: the owner COMMITs into the kernel's surface buffer, and the window
+; manager READs it out into its own. Both are bounds-checked, both compute their
+; length from the surface record rather than trusting the caller, and the kernel
+; does no drawing whatsoever.
+;
+; A surface id is a slot index, not a capability - it is trivially guessable - so
+; every call that touches pixels checks who is asking. Writing a surface is the
+; owner's business; reading one, or even listing them, is the screen owner's.
+
+#define MAX_SURF, 8
+
+; ---- surface record layout ----
+#define SURF_INUSE, 0
+#define SURF_PID, 4                  ; owning process id
+#define SURF_W, 8                    ; granted size - what the buffer actually is
+#define SURF_H, 12
+#define SURF_REQW, 16                ; what the program asked for
+#define SURF_REQH, 20
+#define SURF_BUF, 24                 ; kernel physical base of the pixel buffer
+#define SURF_PAGES, 28               ; pages backing it (for freeing / regrowing)
+#define SURF_SEQ, 32                 ; commit counter: new pixels
+#define SURF_CFG, 36                 ; config counter: new geometry
+#define SURF_PX, 40                  ; pointer, in this window's own coordinates
+#define SURF_PY, 44                  ; (-1, -1 when the pointer is elsewhere)
+#define SURF_PBTN, 48                ; buttons held while over this window
+#define SURF_STRUCT, 52
+
+; wlist record handed to the window manager: sid, w, h, reqw, reqh, seq (6 words)
+#define WREC_BYTES, 24
+
+; ---- state ----
+surf_seq:
+    d32 0                            ; monotonic commit counter, never reused, so a
+                                     ; recycled slot can never present a value the
+                                     ; window manager has already seen
+surf_table:
+    res8 MAX_SURF * SURF_STRUCT
+
+
+; Surface record address for slot r1 -> r0.
+surf_slot_addr:
+    mov r0, r1
+    umul r0, SURF_STRUCT
+    add r0, surf_table
+    ret
+
+
+; Does the calling process own the surface whose record is at r1? -> r0 = 1 / 0
+surf_is_owner:
+    vload r0, r1, SURF_PID
+    mov r1, [curproc]
+    vload r1, r1, PCB_PID
+    cmp r0, r1
+    jne .no
+    mov r0, 1
+    ret
+    .no:
+    mov r0, 0
+    ret
+
+
+; Give a surface a size, growing its buffer if the one it has is too small (a
+; shrink keeps the larger allocation - it is already paid for). The pixels do not
+; survive a reshape, so the buffer is zeroed and the config counter bumped to tell
+; the owner to redraw. r1 = record, r2 = width, r3 = height -> r0 = 1 ok / 0 failed
+surf_setsize:
+    push r4                          ; record
+    push r5                          ; width
+    push r6                          ; height
+    push r7                          ; pages needed
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    mov r7, r5                       ; pages = ceil(w*h*4 / PAGE_SIZE)
+    umul r7, r6
+    umul r7, 4
+    add r7, PAGE_SIZE - 1
+    shr r7, PAGE_SHIFT_FAC
+    vload r0, r4, SURF_BUF
+    cmp r0, 0
+    je .grow                         ; nothing allocated yet
+    vload r0, r4, SURF_PAGES
+    cmp r7, r0
+    jule .have                       ; what we have is big enough
+    .grow:
+    vload r1, r4, SURF_BUF           ; release the old buffer first
+    cmp r1, 0
+    je .alloc
+    vload r2, r4, SURF_PAGES
+    call freepages
+    mov r0, 0
+    vstore r4, SURF_BUF, r0, r1
+    vstore r4, SURF_PAGES, r0, r1
+    .alloc:
+    mov r1, r7
+    call allocpages
+    cmp r0, 0
+    je .fail
+    vstore r4, SURF_BUF, r0, r1
+    vstore r4, SURF_PAGES, r7, r1
+    .have:
+    vload r1, r4, SURF_BUF           ; a reshape leaves undefined pixels
+    vload r2, r4, SURF_PAGES
+    shl r2, PAGE_SHIFT_FAC
+    call proc_memzero
+    vstore r4, SURF_W, r5, r0
+    vstore r4, SURF_H, r6, r0
+    vload r0, r4, SURF_CFG           ; tell the owner its geometry moved
+    add r0, 1
+    vstore r4, SURF_CFG, r0, r1
+    mov r0, 1
+    jmp .ret
+    .fail:
+    mov r0, 0
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; SYS_WCREATE (r2 = requested width, r3 = requested height): create a surface owned
+; by the caller. The request is recorded and granted as-is; a window manager that
+; wants a different size says so with wresize. The size is bounded by the display,
+; not by anything the window manager believes. Returns the surface id, or -1 if the
+; size is out of range, there is no display, or resources are exhausted.
+surf_create_h:
+    cmp r2, 1
+    jul .fail
+    cmp r3, 1
+    jul .fail
+    mov r1, GDEV_W
+    call display_field
+    cmp r0, 0
+    je .fail                         ; no display: nothing to put a window on
+    cmp r2, r0
+    jug .fail
+    mov r1, GDEV_H
+    call display_field
+    cmp r3, r0
+    jug .fail
+    mov r4, r2                       ; requested w
+    mov r5, r3                       ; requested h
+    mov r7, 0                        ; slot / sid
+    .find:
+        cmp r7, MAX_SURF
+        juge .fail
+        mov r1, r7
+        call surf_slot_addr
+        mov r6, r0                   ; slot record address
+        vload r0, r6, SURF_INUSE
+        cmp r0, 0
+        je .got
+        add r7, 1
+        jmp .find
+    .got:
+    mov r0, 0                        ; a recycled slot still names a freed buffer
+    vstore r6, SURF_BUF, r0, r1
+    vstore r6, SURF_PAGES, r0, r1
+    vstore r6, SURF_SEQ, r0, r1
+    vstore r6, SURF_CFG, r0, r1
+    vstore r6, SURF_PBTN, r0, r1
+    vstore r6, SURF_REQW, r4, r0
+    vstore r6, SURF_REQH, r5, r0
+    mov r0, -1                       ; the pointer is not over it until told so
+    vstore r6, SURF_PX, r0, r1
+    vstore r6, SURF_PY, r0, r1
+    mov r1, r6                       ; grant the requested size
+    mov r2, r4
+    mov r3, r5
+    call surf_setsize
+    cmp r0, 0
+    je .fail
+    mov r0, [curproc]                ; owner pid
+    vload r0, r0, PCB_PID
+    vstore r6, SURF_PID, r0, r1
+    mov r0, 1
+    vstore r6, SURF_INUSE, r0, r1
+    mov r0, r7                       ; return the surface id
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_WRESIZE (r2 = sid, r3 = size packed as (width << 16) | height): the window
+; manager grants a surface a size. Restricted to whoever holds the screen, since
+; reshaping somebody's window out from under them is a layout decision and there
+; is only one process doing layout. Granting the size a surface already has is a
+; no-op, so a manager can call this unconditionally every frame. Returns 0, or -1
+; on a bad id / not the manager / out of range / out of memory.
+surf_resize_h:
+    call gfx_is_screen_owner
+    cmp r0, 0
+    je .fail
+    cmp r2, MAX_SURF
+    juge .fail
+    mov r4, r3                       ; unpack the requested geometry
+    shr r4, 16
+    mov r5, r3
+    and r5, 0xFFFF
+    cmp r4, 1
+    jul .fail
+    cmp r5, 1
+    jul .fail
+    mov r1, GDEV_W                   ; bounded by the display, as at create
+    call display_field
+    cmp r4, r0
+    jug .fail
+    mov r1, GDEV_H
+    call display_field
+    cmp r5, r0
+    jug .fail
+    mov r1, r2
+    call surf_slot_addr
+    mov r6, r0
+    vload r0, r6, SURF_INUSE
+    cmp r0, 0
+    je .fail
+    vload r0, r6, SURF_W             ; already that size? leave the pixels and the
+    cmp r0, r4                       ; counter alone
+    jne .apply
+    vload r0, r6, SURF_H
+    cmp r0, r5
+    je .same
+    .apply:
+    mov r1, r6
+    mov r2, r4
+    mov r3, r5
+    call surf_setsize
+    cmp r0, 0
+    je .fail
+    .same:
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_WCONFIG (r2 = sid, r3 = dst): the owner reads back what it actually got -
+; [granted width, granted height, config counter]. The counter changes only when
+; the geometry does, so a program notices a resize in one compare. Returns 0, or
+; -1 on a bad id / not the owner / bounds fault.
+surf_config_h:
+    cmp r2, MAX_SURF
+    juge .fail
+    mov r1, r2
+    call surf_slot_addr
+    mov r6, r0
+    vload r0, r6, SURF_INUSE
+    cmp r0, 0
+    je .fail
+    mov r1, r6
+    call surf_is_owner
+    cmp r0, 0
+    je .fail
+    mov r1, r3
+    mov r2, 12
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r1, r0
+    vload r0, r6, SURF_W
+    mov [r1], r0
+    add r1, 4
+    vload r0, r6, SURF_H
+    mov [r1], r0
+    add r1, 4
+    vload r0, r6, SURF_CFG
+    mov [r1], r0
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_WPOST (r2 = sid, r3 = src): the window manager gives a surface the pointer in
+; that window's own coordinates - three words [x, y, buttons], or (-1, -1, 0) for
+; "the pointer is not yours". Restricted to whoever holds the screen, since routing
+; input is a layout decision. Returns 0, or -1 on a bad id / not the manager /
+; bounds fault.
+surf_post_h:
+    call gfx_is_screen_owner
+    cmp r0, 0
+    je .fail
+    cmp r2, MAX_SURF
+    juge .fail
+    mov r1, r2
+    call surf_slot_addr
+    mov r6, r0
+    vload r0, r6, SURF_INUSE
+    cmp r0, 0
+    je .fail
+    mov r1, r3
+    mov r2, 12
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r1, r0
+    mov r0, [r1]                     ; x
+    vstore r6, SURF_PX, r0, r2
+    add r1, 4
+    mov r0, [r1]                     ; y
+    vstore r6, SURF_PY, r0, r2
+    add r1, 4
+    mov r0, [r1]                     ; buttons
+    vstore r6, SURF_PBTN, r0, r2
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_WINPUT (r2 = sid, r3 = dst): the owner reads the pointer as it stands over
+; its own window - [x, y, buttons], with x and y already relative to the window's
+; top-left corner, or -1 when the pointer is somewhere else. Returns 0, or -1 on a
+; bad id / not the owner / bounds fault.
+surf_input_h:
+    cmp r2, MAX_SURF
+    juge .fail
+    mov r1, r2
+    call surf_slot_addr
+    mov r6, r0
+    vload r0, r6, SURF_INUSE
+    cmp r0, 0
+    je .fail
+    mov r1, r6
+    call surf_is_owner
+    cmp r0, 0
+    je .fail
+    mov r1, r3
+    mov r2, 12
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r1, r0
+    vload r0, r6, SURF_PX
+    mov [r1], r0
+    add r1, 4
+    vload r0, r6, SURF_PY
+    mov [r1], r0
+    add r1, 4
+    vload r0, r6, SURF_PBTN
+    mov [r1], r0
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_WCOMMIT (r2 = sid, r3 = src): copy a granted-size image from the caller into
+; the surface's buffer and bump its commit counter. Only the surface's owner may
+; write to it. The length comes from the record, so a program that has not noticed
+; a resize yet simply fails the bounds check rather than corrupting anything.
+; Returns 0, or -1 on a bad id / not the owner / bounds fault.
+surf_commit_h:
+    cmp r2, MAX_SURF
+    juge .fail
+    mov r1, r2
+    call surf_slot_addr
+    mov r6, r0
+    vload r0, r6, SURF_INUSE
+    cmp r0, 0
+    je .fail
+    mov r1, r6                       ; another program's window is not yours to draw in
+    call surf_is_owner
+    cmp r0, 0
+    je .fail
+    vload r4, r6, SURF_W
+    vload r5, r6, SURF_H
+    mov r2, r4                       ; bytes = w*h*4
+    umul r2, r5
+    umul r2, 4
+    mov r1, r3                       ; user source pointer
+    call uaddr                       ; r0 = physical (r1, r2 preserved)
+    cmp r0, 0
+    je .fail
+    mov r1, r0                       ; src physical
+    vload r0, r6, SURF_BUF           ; dst = surface buffer
+    cpy r1, r2
+    mov r0, [surf_seq]               ; stamp the frame with a value never used
+    add r0, 1                        ; before, so the manager can tell "new pixels"
+    mov [surf_seq], r0               ; from "same pixels" in one compare
+    vstore r6, SURF_SEQ, r0, r1
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_WREAD (r2 = sid, r3 = dst): copy a surface's granted-size pixels out into the
+; caller's buffer, so the window manager can composite them itself. Restricted to
+; whoever holds the screen - reading another program's window leaks exactly as much
+; as writing it. Returns 0, or -1 on a bad id / not the manager / bounds fault.
+surf_read_h:
+    call gfx_is_screen_owner
+    cmp r0, 0
+    je .fail
+    cmp r2, MAX_SURF
+    juge .fail
+    mov r1, r2
+    call surf_slot_addr
+    mov r6, r0
+    vload r0, r6, SURF_INUSE
+    cmp r0, 0
+    je .fail
+    vload r4, r6, SURF_W
+    vload r5, r6, SURF_H
+    mov r2, r4                       ; bytes = w*h*4
+    umul r2, r5
+    umul r2, 4
+    mov r1, r3                       ; user destination pointer
+    call uaddr                       ; r0 = physical dst (r2, r6 preserved)
+    cmp r0, 0
+    je .fail
+    vload r1, r6, SURF_BUF           ; src = surface buffer (physical)
+    cpy r1, r2                       ; dst = r0, src = r1, len = r2
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_WLIST (r2 = dst, r3 = capacity in records): write [sid, w, h, reqw, reqh, seq]
+; for each live surface, up to the capacity. That is everything a window manager
+; needs to lay the screen out: what exists, how big it currently is, how big its
+; program would like it to be, and whether its pixels have moved since last frame.
+; Restricted to whoever holds the screen. Returns the number written, or -1 on a
+; bounds fault.
+surf_list_h:
+    call gfx_is_screen_owner
+    cmp r0, 0
+    je .fail
+    mov r1, r2                       ; dst pointer
+    mov r0, r3                       ; total bytes = capacity * WREC_BYTES
+    umul r0, WREC_BYTES
+    mov r2, r0
+    call uaddr                       ; r0 = physical base of the destination
+    cmp r0, 0
+    je .fail
+    mov r7, r0                       ; destination cursor
+    mov r4, 0                        ; records written
+    mov r5, 0                        ; slot index
+    .loop:
+        cmp r5, MAX_SURF
+        juge .done
+        cmp r4, r3                   ; hit capacity?
+        juge .done
+        mov r1, r5
+        call surf_slot_addr
+        mov r6, r0
+        vload r0, r6, SURF_INUSE
+        cmp r0, 0
+        je .next
+        mov [r7], r5                 ; sid
+        add r7, 4
+        vload r0, r6, SURF_W
+        mov [r7], r0
+        add r7, 4
+        vload r0, r6, SURF_H
+        mov [r7], r0
+        add r7, 4
+        vload r0, r6, SURF_REQW
+        mov [r7], r0
+        add r7, 4
+        vload r0, r6, SURF_REQH
+        mov [r7], r0
+        add r7, 4
+        vload r0, r6, SURF_SEQ
+        mov [r7], r0
+        add r7, 4
+        add r4, 1
+        .next:
+        add r5, 1
+        jmp .loop
+    .done:
+    mov r0, r4
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; Release every surface owned by a process, and hand the screen back if it was the
+; one holding it. Called from process teardown, so a window disappears when its
+; program does and a window manager that dies cannot leave the machine staring at
+; a dead framebuffer. r1 = pid.
+gfx_reap:
+    push r4                          ; pid
+    push r5                          ; slot
+    push r6                          ; record
+    mov r4, r1
+    call display_reap                ; screen ownership first (clobbers r1-r3)
+    mov r5, 0
+    .loop:
+        cmp r5, MAX_SURF
+        juge .done
+        mov r1, r5
+        call surf_slot_addr
+        mov r6, r0
+        vload r0, r6, SURF_INUSE
+        cmp r0, 0
+        je .next
+        vload r0, r6, SURF_PID
+        cmp r0, r4
+        jne .next
+        vload r1, r6, SURF_BUF
+        vload r2, r6, SURF_PAGES
+        cmp r1, 0
+        je .clear
+        call freepages
+        .clear:
+        mov r0, 0
+        vstore r6, SURF_BUF, r0, r1
+        vstore r6, SURF_PAGES, r0, r1
+        vstore r6, SURF_INUSE, r0, r1
+        .next:
+        add r5, 1
+        jmp .loop
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret

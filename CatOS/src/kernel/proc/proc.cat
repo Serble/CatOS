@@ -103,6 +103,19 @@ proc_tmp_name:
     d32 0                       ; scratch across proc_create (single-threaded)
 proc_tmp_upages:
     d32 0
+; scratch across sys_sbrk_h (single-threaded: syscalls run non-preemptively)
+sbrk_frame:
+    d32 0
+sbrk_oldbase:
+    d32 0
+sbrk_oldpages:
+    d32 0
+sbrk_oldmlen:
+    d32 0
+sbrk_newbase:
+    d32 0
+sbrk_newpages:
+    d32 0
 proctable:
     res8 MAX_PROCS * PCB_STRUCT
 
@@ -501,6 +514,77 @@ uaddr:
     mov r0, 0
     pop r4
     ret
+
+
+; SYS_SBRK (r2 = bytes): grow the current process's memory segment by at least r2
+; bytes (rounded up to whole pages). A larger segment is allocated, the old one is
+; copied into it and freed, and both the PCB and the live interrupt frame are
+; repointed at the new base/length so the caller resumes transparently (user code
+; sees a 0-based address space, so moving the physical base is invisible to it).
+; Returns r0 = the old segment length - i.e. the base of the freshly added region
+; in the caller's address space - or -1 if the growth could not be allocated.
+;
+; This is how a userland compositor obtains a framebuffer big enough to draw into:
+; a full 512*384*4 buffer will not fit inside a program image (CatFS caps files at
+; ~68 KiB), so it is mapped in at runtime here instead.
+sys_sbrk_h:
+    mov r0, sp                       ; capture the caller's frame base (sp = frame)
+    mov [sbrk_frame], r0
+    mov r4, [curproc]
+    vload r0, r4, PCB_MBASE
+    mov [sbrk_oldbase], r0
+    vload r0, r4, PCB_UPAGES
+    mov [sbrk_oldpages], r0
+    vload r0, r4, PCB_MLEN
+    mov [sbrk_oldmlen], r0
+    mov r3, r2                       ; requested bytes -> delta pages
+    add r3, PAGE_SIZE - 1
+    shr r3, PAGE_SHIFT_FAC
+    cmp r3, 0
+    je .fail                         ; a zero-page request is meaningless
+    mov r0, [sbrk_oldpages]
+    add r0, r3                       ; new total page count
+    mov [sbrk_newpages], r0
+    mov r1, r0
+    call allocpages                  ; r0 = new segment base, or 0
+    cmp r0, 0
+    je .fail
+    mov [sbrk_newbase], r0
+    mov r1, r0                       ; zero the whole new segment
+    mov r2, [sbrk_newpages]
+    shl r2, PAGE_SHIFT_FAC
+    call proc_memzero
+    mov r0, [sbrk_newbase]           ; copy old contents across (dst = r0)
+    mov r1, [sbrk_oldbase]
+    mov r2, [sbrk_oldmlen]
+    cpy r1, r2
+    mov r4, [curproc]                ; repoint the PCB at the new segment
+    mov r0, [sbrk_newbase]
+    vstore r4, PCB_MBASE, r0, r1
+    vstore r4, PCB_USEG, r0, r1
+    mov r0, [sbrk_newpages]
+    vstore r4, PCB_UPAGES, r0, r1
+    mov r0, [sbrk_newpages]
+    shl r0, PAGE_SHIFT_FAC
+    vstore r4, PCB_MLEN, r0, r1
+    mov r3, [sbrk_frame]             ; repoint the live frame that iret will restore
+    mov r0, r3
+    add r0, FRM_MBASE
+    mov r1, [sbrk_newbase]
+    mov [r0], r1
+    mov r0, r3
+    add r0, FRM_MLEN
+    mov r1, [sbrk_newpages]
+    shl r1, PAGE_SHIFT_FAC
+    mov [r0], r1
+    mov r1, [sbrk_oldbase]           ; free the old segment
+    mov r2, [sbrk_oldpages]
+    call freepages
+    mov r0, [sbrk_oldmlen]           ; base of the new region in the caller's space
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
 
 
 ; Copy a null-terminated string from the kernel out to the current process's

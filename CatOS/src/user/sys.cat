@@ -31,6 +31,22 @@
 #define SYS_CHDIR, 16
 #define SYS_GETCWD, 17
 #define SYS_POWEROFF, 18
+#define SYS_GACQUIRE, 19
+#define SYS_GRELEASE, 20
+#define SYS_GPRESENT, 24
+#define SYS_MOUSE, 25
+#define SYS_WCREATE, 26
+#define SYS_WCOMMIT, 27
+#define SYS_WLIST, 28
+#define SYS_SBRK, 29
+#define SYS_WREAD, 30
+#define SYS_GKEY, 31
+#define SYS_CONREAD, 32
+#define SYS_WCONFIG, 33
+#define SYS_WRESIZE, 34
+#define SYS_KEYGRAB, 35
+#define SYS_WPOST, 36
+#define SYS_WINPUT, 37
 
 ; open() modes (bitfield) and seek() whence, matching the kernel VFS
 #define O_READ, 1
@@ -234,5 +250,181 @@
 ; asks the hardware manager to shut down.
 #macro sys_poweroff, 0
     mov r1, SYS_POWEROFF
+    syscall
+#endmacro
+
+; ---- graphical desktop ----
+; The compositor is an ordinary userland program. It asks the kernel for a chunk
+; of extra memory (sbrk), draws its framebuffer there itself, and points the
+; display hardware straight at it (gacquire). The kernel only switches the video
+; mode, flushes, and relays pixels between processes (the CPU has no shared
+; memory, so a client's window pixels reach the compositor through wread).
+;
+; The screen is 512x384, too small for floating windows, so the desktop shows one
+; full-screen page at a time with a tab bar along the bottom: page 0 is the text
+; console (drawn from conread) and every surface a program creates becomes another
+; page. From a client's point of view none of that matters - it creates a surface
+; and commits pixels to it, exactly as it would for a window.
+
+; sbrk(bytes) -> base pointer of the new region, or -1. Grow the caller's memory
+; segment by at least $1 bytes (rounded up to a page). The returned pointer is
+; valid for [base, base + bytes). $1 = byte count.
+#macro sys_sbrk, 1
+    mov r2, $1
+    mov r1, SYS_SBRK
+    syscall
+#endmacro
+
+; gacquire(fb, textgeom) -> (width << 16) | height, or -1. Take over the screen:
+; the display scans out the caller's own buffer $1, which must hold a whole frame.
+; $2 is the console geometry the window manager wants while it owns the screen,
+; packed as (columns << 16) | rows, or 0 to leave the console's geometry alone -
+; a manager that never shows the console passes 0. The screen size comes back in
+; r0; nothing hardcodes it.
+#macro sys_gacquire, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_GACQUIRE
+    syscall
+#endmacro
+
+; keygrab(keycode, on) -> 0/-1. While you hold the screen, claim a keycode so it
+; is delivered to you through gkey instead of to the console line discipline (or
+; give it back with on = 0). This is how a window manager gets its shortcuts; the
+; kernel never interprets a keycode, it only compares. $1 = keycode, $2 = 1/0.
+#macro sys_keygrab, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_KEYGRAB
+    syscall
+#endmacro
+
+; grelease(). Hand the screen back to the text console.
+#macro sys_grelease, 0
+    mov r1, SYS_GRELEASE
+    syscall
+#endmacro
+
+; gpresent() -> 0/-1. Flush the framebuffer to the display. Compositor only.
+#macro sys_gpresent, 0
+    mov r1, SYS_GPRESENT
+    syscall
+#endmacro
+
+; mouse(dst) -> 0/-1. Write [x, y, buttons] (three words) into dst. Button bit 0
+; is the left button. $1 = pointer to a 12-byte buffer.
+#macro sys_mouse, 1
+    mov r2, $1
+    mov r1, SYS_MOUSE
+    syscall
+#endmacro
+
+; wcreate(w, h) -> surface id, or -1. Create a window surface. $1/$2 are the size
+; you would *like*, bounded by the screen; the kernel grants it as-is, but a window
+; manager may hand you something else at any time, so read your real size back with
+; wconfig rather than assuming you got what you asked for.
+#macro sys_wcreate, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WCREATE
+    syscall
+#endmacro
+
+; wcommit(sid, src) -> 0/-1. Upload a w*h*4 pixel image into surface sid, which you
+; must own - a surface id is a slot index, not a capability, so the kernel checks
+; the owning pid on every write. $1 = surface id, $2 = pointer to the pixels.
+#macro sys_wcommit, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WCOMMIT
+    syscall
+#endmacro
+
+; wlist(dst, cap) -> count, or -1. Write [sid, w, h, reqw, reqh, seq] per live
+; surface, up to cap records: what exists, the size it currently has, the size its
+; program asked for, and a commit counter that changes whenever its pixels do (so
+; an unchanged window need not be fetched at all). $1 = buffer, $2 = capacity in
+; records. Window manager only - the kernel rejects callers that do not hold the
+; screen.
+#macro sys_wlist, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WLIST
+    syscall
+#endmacro
+
+; wread(sid, dst) -> 0/-1. Copy surface sid's committed w*h*4 pixels into the
+; caller's buffer $2 so the compositor can composite them itself. $1 = surface id,
+; $2 = destination buffer. Compositor only - the kernel rejects callers that do not
+; hold the screen, so one program cannot read another's window.
+#macro sys_wread, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WREAD
+    syscall
+#endmacro
+
+; wconfig(sid, dst) -> 0/-1. Read back what your surface actually is: three words
+; [granted width, granted height, config counter] into $2. The counter changes only
+; when the geometry does, so poll it and redraw to fit when it moves - that is the
+; whole client side of resizing. $1 = surface id, $2 = a 12-byte buffer.
+#macro sys_wconfig, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WCONFIG
+    syscall
+#endmacro
+
+; wpost(sid, src) -> 0/-1. Hand a surface the pointer in its own coordinates: three
+; words [x, y, buttons] at $2, or (-1, -1, 0) for "not over this window". The window
+; manager is the only thing that knows where a window landed, so it does the
+; hit-testing. $1 = surface id, $2 = a 12-byte buffer. Window manager only.
+#macro sys_wpost, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WPOST
+    syscall
+#endmacro
+
+; winput(sid, dst) -> 0/-1. Read the pointer over your own window: [x, y, buttons]
+; into $2, with x and y relative to your top-left corner, or -1 when the pointer is
+; elsewhere. This is how a GUI program gets clicks - SYS_MOUSE is in screen
+; coordinates and you do not know where you are. $1 = surface id, $2 = 12 bytes.
+#macro sys_winput, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WINPUT
+    syscall
+#endmacro
+
+; wresize(sid, size) -> 0/-1. Grant a surface a size, packed as
+; (width << 16) | height. Granting the size it already has does nothing, so a
+; window manager can call this every frame from its layout. $1 = surface id,
+; $2 = packed size. Window manager only.
+#macro sys_wresize, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WRESIZE
+    syscall
+#endmacro
+
+; gkey() -> the next queued page-switch keycode, or -1 if none. The keyboard ISR
+; routes the desktop's page keys here instead of to the console line discipline,
+; so the compositor sees them and the shell never does. Compositor only.
+#macro sys_gkey, 0
+    mov r1, SYS_GKEY
+    syscall
+#endmacro
+
+; conread(dst, cap) -> bytes written, or -1. Snapshot the text console into dst as
+; a 20-byte header (columns, rows, cursor column, cursor row, change counter)
+; followed by columns*rows characters, row-major. Lets a graphical program draw the
+; console itself - which is how the desktop shows the shell as a page - and the
+; counter lets it skip that work when nothing has been typed or printed.
+; $1 = buffer, $2 = its capacity in bytes.
+#macro sys_conread, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_CONREAD
     syscall
 #endmacro

@@ -6,6 +6,11 @@
 ; for the child before prompting again. The built-in "exit" ends the shell,
 ; "cd" changes the working directory, and "pwd" prints it.
 ;
+; A final token of "&" (space-separated, like everything else here) runs the
+; command in the background: the shell spawns it and prompts again immediately
+; instead of waiting. That is how you start a program that puts up a page on the
+; graphical desktop without tying up the shell - "gdemo &".
+;
 ; Commands are resolved as /bin/<name>. Path arguments may be relative; the
 ; kernel roots them against the process working directory (see "cd"/"pwd").
 #include "sys.cat"
@@ -38,6 +43,9 @@ main:
     call tokenize
     cmp r0, 0
     je .prompt                       ; blank line
+    call parse_bg                    ; strip a trailing "&" off argv
+    cmp r0, 0
+    je .prompt                       ; nothing left to run
 
     mov r1, [argvec]                 ; built-in: exit
     mov r2, exitcmd
@@ -64,8 +72,11 @@ main:
     syscall
     cmp r0, -1
     je .notfound
-    mov r2, r0                       ; wait for the child to finish
-    mov r1, SYS_WAIT
+    mov r2, r0                       ; the child's pid
+    mov r0, [bgflag]
+    cmp r0, 0
+    jne .prompt                      ; "&" - leave it running and prompt again
+    mov r1, SYS_WAIT                 ; otherwise wait for it to finish
     syscall
     jmp .prompt
 
@@ -158,6 +169,37 @@ tokenize:
     ret
 
 
+; A trailing "&" means "do not wait for this command". Drop it from argv and
+; record the fact in bgflag. r0 = argc -> r0 = argc without it. A bare "&" leaves
+; argc at 1 and is reported as a missing command, like any other unknown name.
+parse_bg:
+    push r4                          ; argc
+    push r5                          ; the last argv slot
+    mov r4, r0
+    mov r0, 0
+    mov [bgflag], r0
+    cmp r4, 1
+    jule .done
+    mov r5, r4                       ; &argvec[argc-1]
+    sub r5, 1
+    shl r5, 2
+    add r5, argvec
+    mov r1, [r5]
+    mov r2, ampcmd
+    call streq
+    cmp r0, 1
+    jne .done
+    mov [r5], 0                      ; unlink it from the argv array
+    mov r0, 1
+    mov [bgflag], r0
+    sub r4, 1
+    .done:
+    mov r0, r4
+    pop r5
+    pop r4
+    ret
+
+
 ; Build pathbuf = "/bin/" followed by argv[0] and a null terminator.
 buildpath:
     push r4                          ; write cursor
@@ -229,6 +271,8 @@ cdcmd:
     dstr "cd\0"
 pwdcmd:
     dstr "pwd\0"
+ampcmd:
+    dstr "&\0"
 rootpath:
     dstr "/\0"
 cdmsg:
@@ -237,6 +281,8 @@ cdmsg_end:
 newline:
     dstr "\n"
 
+bgflag:
+    d32 0                            ; 1 if the current command ended in "&"
 argvec:
     res32 MAXARGS + 1
 linebuf:

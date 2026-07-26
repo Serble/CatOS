@@ -59,6 +59,22 @@
 #define SYS_CHDIR, 16         ; change the working directory (fdio.cat)
 #define SYS_GETCWD, 17        ; read the working directory (fdio.cat)
 #define SYS_POWEROFF, 18      ; power the machine off via the hardware manager
+#define SYS_GACQUIRE, 19      ; take over the screen / linear framebuffer (wm.cat)
+#define SYS_GRELEASE, 20      ; hand the screen back to the text console
+#define SYS_GPRESENT, 24      ; flush the framebuffer to the display
+#define SYS_MOUSE, 25         ; read the mouse state
+#define SYS_WCREATE, 26       ; create a window surface (client)
+#define SYS_WCOMMIT, 27       ; upload pixels into a surface (client)
+#define SYS_WLIST, 28         ; list live surfaces (compositor)
+#define SYS_SBRK, 29          ; grow the caller's memory segment (proc.cat)
+#define SYS_WREAD, 30         ; copy a surface's pixels to the caller (compositor)
+#define SYS_GKEY, 31          ; take a queued grabbed key (display.cat)
+#define SYS_CONREAD, 32       ; snapshot the text console grid (console.cat)
+#define SYS_WCONFIG, 33       ; read a surface's granted size (surface.cat)
+#define SYS_WRESIZE, 34       ; grant a surface a size (surface.cat)
+#define SYS_KEYGRAB, 35       ; claim a keycode for the screen owner (display.cat)
+#define SYS_WPOST, 36         ; route the pointer to a surface (surface.cat)
+#define SYS_WINPUT, 37        ; read the pointer over your own surface (surface.cat)
 
 
 ; Register the syscall dispatcher. Call once at boot, after intinit.
@@ -126,6 +142,38 @@ syscall_handler:
     je sys_getcwd_h
     cmp r1, SYS_POWEROFF
     je sys_poweroff_h
+    cmp r1, SYS_GACQUIRE
+    je gfx_acquire_h
+    cmp r1, SYS_GRELEASE
+    je gfx_release_h
+    cmp r1, SYS_GPRESENT
+    je gfx_present_h
+    cmp r1, SYS_MOUSE
+    je gfx_mouse_h
+    cmp r1, SYS_WCREATE
+    je surf_create_h
+    cmp r1, SYS_WCOMMIT
+    je surf_commit_h
+    cmp r1, SYS_WLIST
+    je surf_list_h
+    cmp r1, SYS_WREAD
+    je surf_read_h
+    cmp r1, SYS_WCONFIG
+    je surf_config_h
+    cmp r1, SYS_WRESIZE
+    je surf_resize_h
+    cmp r1, SYS_WPOST
+    je surf_post_h
+    cmp r1, SYS_WINPUT
+    je surf_input_h
+    cmp r1, SYS_GKEY
+    je input_key_h
+    cmp r1, SYS_KEYGRAB
+    je input_grab_h
+    cmp r1, SYS_CONREAD
+    je sys_conread_h
+    cmp r1, SYS_SBRK
+    je sys_sbrk_h
     cmp r1, SYS_PRINT
     je .print
     cmp r1, SYS_TEST

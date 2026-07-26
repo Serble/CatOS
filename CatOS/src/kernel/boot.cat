@@ -28,6 +28,8 @@ jmp main
 #include "proc/exec.cat"
 #include "fs/fdio.cat"
 #include "io/console.cat"
+#include "gfx/display.cat"
+#include "gfx/surface.cat"
 #include "drivers/raylibppu.cat"
 
 ; to start let's work out how much memory we have
@@ -149,6 +151,9 @@ mov r2, rppu_gfx_bind
 call drvregister
 mov r1, KBD_TYPE
 mov r2, rppu_kbd_bind
+call drvregister
+mov r1, MOUSE_TYPE
+mov r2, rppu_mouse_bind
 call drvregister
 call hwscan
 call devscan

@@ -1,0 +1,140 @@
+; gdemo - a demo client for the CatOS window managers.
+;
+; Creates a window and, forever, paints its pixel buffer with a colour that cycles
+; over time and commits it. It never touches the screen directly: it only creates a
+; surface and pushes pixels into it (both plain kernel-mediated copies), which is
+; all a client needs to do to "talk to" whichever window manager is running.
+;
+;
+; -- Being resizable ----------------------------------------------------------
+;
+; wcreate asks for a size; it does not guarantee one. A window manager may grant
+; something else at any time - the tiling manager (tile.cat) resizes every window
+; to fit its share of the screen - so the size we asked for is only a preference.
+;
+; The client half of that protocol is three lines: poll wconfig, notice the config
+; counter move, and use the width and height it reports from then on. Committing
+; with a stale size would just fail the kernel's bounds check, never corrupt
+; anything, but then nothing would appear.
+;
+; The pixel buffer is sbrk'd at the largest size the screen could ever grant, so a
+; resize never needs to reallocate here. It also could not live in the program
+; image: a screen-sized buffer is far past what CatFS will hold in one file.
+#include "sys.cat"
+
+#define WANT_W, 320                  ; the size we would like
+#define WANT_H, 200
+#define MAX_BYTES, 786432            ; 512 * 384 * 4 - any size the screen can grant
+
+main:
+    sys_sbrk MAX_BYTES               ; r0 = the pixel buffer, or -1
+    cmp r0, -1
+    je .fail
+    mov [winbuf], r0
+
+    sys_wcreate WANT_W, WANT_H       ; r0 = surface id, or -1
+    cmp r0, -1
+    je .fail
+    mov r7, r0                       ; sid (survives syscalls)
+    mov r6, 0                        ; animation phase
+
+    .loop:
+        mov r1, r7                   ; adopt whatever size we have been granted
+        call resync
+        mov r1, r6                   ; colour = f(phase)
+        call paint
+        mov r3, [winbuf]             ; commit(sid, winbuf)
+        mov r2, r7
+        mov r1, SYS_WCOMMIT
+        syscall
+        add r6, 1
+        sys_yield
+        jmp .loop
+
+    .fail:
+        sys_exit 1
+
+
+; Pick up the window manager's idea of our size. Only the config counter moving
+; means anything changed, so this is a compare in the common case. r1 = sid
+resync:
+    sys_wconfig r1, cfgbuf
+    cmp r0, -1
+    je .done                         ; surface gone; the next commit will fail too
+    mov r0, cfgbuf
+    add r0, 8
+    mov r0, [r0]                     ; config counter
+    mov r1, [lastcfg]
+    cmp r0, r1
+    je .done
+    mov [lastcfg], r0
+    mov r0, [cfgbuf]                 ; granted width
+    mov [winw], r0
+    mov r0, cfgbuf
+    add r0, 4
+    mov r0, [r0]                     ; granted height
+    mov [winh], r0
+    .done:
+    ret
+
+
+; Fill the window with a solid colour derived from the phase in r1, so it visibly
+; animates. colour = 0x00RRGGBB with red fixed, green/blue driven by the phase. The
+; fill uses the doubling copy trick - seed one pixel, then repeatedly copy the
+; filled span onto itself - so even a screen-sized window costs ~log2(N) `cpy`
+; blocks instead of a quarter of a million stores.
+paint:
+    push r4                          ; span already filled
+    push r5                          ; scratch / colour
+    push r6                          ; total bytes
+    mov r4, r1
+    and r4, 0xFF                     ; 0..255 ramp
+    mov r5, r4
+    shl r5, 8                        ; green channel
+    or r5, 0x00400000                ; a constant red
+    or r5, r4                        ; blue channel
+    mov r6, [winw]                   ; bytes = w * h * 4
+    mov r0, [winh]
+    umul r6, r0
+    umul r6, 4
+    cmp r6, 0
+    je .done
+    mov r0, [winbuf]
+    mov [r0], r5                     ; seed pixel
+    mov r4, 4
+    .fill:
+        cmp r4, r6
+        juge .done
+        mov r5, r6
+        sub r5, r4                   ; remaining
+        cmp r4, r5
+        jule .use
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r5
+        jmp .done
+        .use:
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r4
+        add r4, r4
+        jmp .fill
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+winbuf:
+    d32 0                            ; the sbrk'd pixel buffer
+winw:
+    d32 WANT_W                       ; the size we are currently drawing at
+winh:
+    d32 WANT_H
+lastcfg:
+    d32 0                            ; last config counter we adopted
+cfgbuf:
+    res8 12                          ; wconfig: width, height, config counter

@@ -213,6 +213,8 @@ sys_exit_h:
     mov [r4], r0
     vload r1, r4, PCB_PID        ; waiters block on the child's pid
     call proc_wakeup
+    vload r1, r4, PCB_PID        ; release any windows the process owned
+    call gfx_reap
     call sched_pick
     mov r1, r0
     jmp sched_resume

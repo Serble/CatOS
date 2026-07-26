@@ -1,0 +1,562 @@
+; ==========================
+;   CatOS display service
+; ==========================
+; Who owns the screen, what hardware is behind it, and the input that belongs to
+; whoever is holding it. The surface service (surface.cat) and the userland window
+; manager both sit on top of this, and neither of them names a driver.
+;
+;
+; -- The display device vtable ------------------------------------------------
+;
+; A graphics driver registers one record describing itself and how to drive it.
+; Nothing above this line knows or cares whether the pixels end up in a Raylib
+; window, a real framebuffer, or a file:
+;
+;   GDEV_LINEAR   linear(r1 = physical address)  scan out that buffer directly
+;   GDEV_TEXT     text()                         return to the text console mode
+;   GDEV_PRESENT  present()                      flush whatever mode is current
+;   GDEV_TEXTOPS  the console display vtable for the device's text mode, or 0
+;   GDEV_TCOLS    that text mode's geometry, in character cells
+;   GDEV_TROWS
+;   GDEV_W        the linear framebuffer's dimensions, in pixels
+;   GDEV_H
+;
+; A device with no text mode registers 0 for TEXTOPS and simply never becomes the
+; console's backend. A device that cannot scan out a linear buffer registers 0 for
+; LINEAR, and gacquire then fails cleanly instead of half-configuring the screen.
+; Screen dimensions come from the device, so no size is hardcoded above this file.
+;
+;
+; -- Input that belongs to the screen owner -----------------------------------
+;
+; Two things have to be diverted away from the text console while a window manager
+; is running, and both are published here so that any driver can feed them and any
+; manager can consume them:
+;
+;   * pointer state, which input backends push in through pointer_move /
+;     pointer_button and the manager reads with SYS_MOUSE;
+;   * grabbed keys. A keyboard driver asks input_hotkey about every key-down before
+;     handing it to the console line discipline. If the screen's owner has grabbed
+;     that keycode it is queued for them instead. The kernel never interprets a
+;     keycode - it only compares - so which keys mean what is entirely the window
+;     manager's business, and the same table works for any keyboard.
+
+#define GDEV_LINEAR, 0
+#define GDEV_TEXT, 4
+#define GDEV_PRESENT, 8
+#define GDEV_TEXTOPS, 12
+#define GDEV_TCOLS, 16
+#define GDEV_TROWS, 20
+#define GDEV_W, 24
+#define GDEV_H, 28
+
+#define MAX_GRAB, 8              ; keycodes the screen owner may hold at once
+#define INPUT_KEYS, 16           ; queued grabbed keys
+
+; ---- state ----
+display_dev:
+    d32 0                        ; registered display device record, 0 = none
+gfx_owned:
+    d32 0                        ; 1 while some process holds the screen
+gfx_owner_pid:
+    d32 0                        ; pid of the screen owner (for teardown)
+gfx_ptr_x:
+    d32 0                        ; pointer state, published by an input backend
+gfx_ptr_y:
+    d32 0
+gfx_ptr_btn:
+    d32 0                        ; button bitmask (bit N = button N held)
+input_grabs:
+    res8 MAX_GRAB * 4            ; keycodes the screen owner wants for itself
+input_grabn:
+    d32 0
+input_keyring:
+    res8 INPUT_KEYS * 4          ; grabbed keys, driver -> screen owner
+input_keyhead:
+    d32 0                        ; drained by SYS_GKEY
+input_keytail:
+    d32 0                        ; filled by the keyboard driver
+
+
+; ==========================
+;   Device registration
+; ==========================
+
+; Register the display device and, if it has a text mode, hand that mode to the
+; console. Called from a graphics driver's bind. r1 = device record
+display_register:
+    push r4
+    mov r4, r1
+    mov [display_dev], r4
+    mov r0, r4
+    add r0, GDEV_TEXTOPS
+    mov r0, [r0]
+    cmp r0, 0
+    je .done                     ; no text mode: the console keeps its old backend
+    mov r1, r0
+    mov r2, r4
+    add r2, GDEV_TCOLS
+    mov r2, [r2]
+    mov r3, r4
+    add r3, GDEV_TROWS
+    mov r3, [r3]
+    call console_set_display
+    .done:
+    pop r4
+    ret
+
+
+; Read one field of the registered device. r1 = field offset -> r0 = value, or 0
+; if no device has registered (every caller treats 0 as "cannot do that").
+display_field:
+    mov r0, [display_dev]
+    cmp r0, 0
+    je .none
+    add r0, r1
+    mov r0, [r0]
+    ret
+    .none:
+    mov r0, 0
+    ret
+
+
+; Point the display at a linear framebuffer. r1 = physical address
+display_linear:
+    push r4
+    mov r4, r1
+    mov r1, GDEV_LINEAR
+    call display_field
+    cmp r0, 0
+    je .done
+    mov r1, r4
+    call r0
+    .done:
+    pop r4
+    ret
+
+
+; Return the display to its text mode.
+display_text:
+    mov r1, GDEV_TEXT
+    call display_field
+    cmp r0, 0
+    je .done
+    call r0
+    .done:
+    ret
+
+
+; Flush the current mode to the screen.
+display_present:
+    mov r1, GDEV_PRESENT
+    call display_field
+    cmp r0, 0
+    je .done
+    call r0
+    .done:
+    ret
+
+
+; Bytes in one full-screen linear frame -> r0 (0 if there is no device).
+display_fb_bytes:
+    push r4
+    mov r1, GDEV_W
+    call display_field
+    mov r4, r0
+    mov r1, GDEV_H
+    call display_field
+    umul r4, r0
+    umul r4, 4
+    mov r0, r4
+    pop r4
+    ret
+
+
+; ==========================
+;   Console hand-off
+; ==========================
+
+; Give the console a backend that draws nowhere, at the geometry the incoming
+; screen owner asked for (r1 = columns, r2 = rows; either 0 means "leave the
+; geometry alone"). The console keeps running and the mirror keeps recording, so
+; SYS_CONREAD still works and the session is intact when the screen comes back -
+; it simply has no hardware behind it in the meantime.
+display_console_detach:
+    cmp r1, 0
+    je .keep
+    cmp r2, 0
+    jne .set
+    .keep:
+    mov r1, [console_cols]
+    mov r2, [console_rows]
+    .set:
+    mov r3, r2
+    mov r2, r1
+    mov r1, console_null_ops
+    call console_set_display
+    ret
+
+
+; Put the device back into its text mode and give the console its hardware back.
+display_console_attach:
+    push r4
+    call display_text
+    mov r1, GDEV_TEXTOPS
+    call display_field
+    cmp r0, 0
+    je .done
+    mov r4, r0
+    mov r1, GDEV_TCOLS
+    call display_field
+    mov r2, r0
+    mov r1, GDEV_TROWS
+    call display_field
+    mov r3, r0
+    mov r1, r4
+    call console_set_display
+    .done:
+    pop r4
+    ret
+
+
+; ==========================
+;   Screen ownership
+; ==========================
+
+; Is the calling process the one currently holding the screen? -> r0 = 1 / 0
+gfx_is_screen_owner:
+    mov r0, [gfx_owned]
+    cmp r0, 0
+    je .no
+    mov r0, [curproc]
+    vload r0, r0, PCB_PID
+    mov r1, [gfx_owner_pid]
+    cmp r0, r1
+    jne .no
+    mov r0, 1
+    ret
+    .no:
+    mov r0, 0
+    ret
+
+
+; SYS_GACQUIRE (r2 = framebuffer pointer, r3 = console geometry packed as
+; (columns << 16) | rows, or 0 to leave the console's geometry alone): take over
+; the screen. The caller passes a buffer in its own address space at least one
+; full frame in size; the display is pointed straight at it, so the caller's
+; pixels are scanned out with no kernel copy at all. Returns the screen dimensions
+; packed as (width << 16) | height, or -1 if the screen is already owned, the
+; device cannot scan out a linear buffer, or the buffer is out of bounds.
+gfx_acquire_h:
+    push r4
+    push r5
+    mov r4, r2                       ; caller's framebuffer
+    mov r5, r3                       ; requested console geometry
+    mov r0, [gfx_owned]
+    cmp r0, 0
+    jne .fail                        ; someone already holds the screen
+    mov r1, GDEV_LINEAR
+    call display_field
+    cmp r0, 0
+    je .fail                         ; this display cannot do linear scan-out
+    call display_fb_bytes
+    cmp r0, 0
+    je .fail
+    mov r2, r0                       ; validate the whole frame
+    mov r1, r4
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r1, r0
+    call display_linear
+    mov r0, 1
+    mov [gfx_owned], r0
+    mov r0, [curproc]
+    vload r0, r0, PCB_PID
+    mov [gfx_owner_pid], r0
+    call input_reset                 ; no bindings or keys from a previous owner
+    mov r1, r5                       ; the console geometry the owner asked for
+    shr r1, 16
+    mov r2, r5
+    and r2, 0xFFFF
+    call display_console_detach
+    mov r1, GDEV_W                   ; hand back the screen size
+    call display_field
+    mov r4, r0
+    shl r4, 16
+    mov r1, GDEV_H
+    call display_field
+    or r4, r0
+    mov r0, r4
+    pop r5
+    pop r4
+    jmp sysret
+    .fail:
+    mov r0, -1
+    pop r5
+    pop r4
+    jmp sysret
+
+
+; SYS_GRELEASE: hand the screen back to the text console. The framebuffer belongs
+; to the caller, so there is nothing to free here.
+gfx_release_h:
+    mov r0, [gfx_owned]
+    cmp r0, 0
+    je .done
+    mov r0, 0                        ; clear ownership first: the keyboard driver
+    mov [gfx_owned], r0              ; and the console backend both key off it
+    mov [gfx_owner_pid], r0
+    call input_reset
+    call display_console_attach
+    .done:
+    mov r0, 0
+    jmp sysret
+
+
+; SYS_GPRESENT: flush the framebuffer to the display. Returns 0, or -1 if the
+; screen is not owned.
+gfx_present_h:
+    mov r0, [gfx_owned]
+    cmp r0, 0
+    je .fail
+    call display_present
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; Called from process teardown: if this process was holding the screen, hand the
+; display back to the text console so the machine is not left staring at a stale
+; linear framebuffer. r1 = pid. Clobbers r1-r3; preserves r4-r7.
+display_reap:
+    push r4
+    mov r4, r1
+    mov r0, [gfx_owned]
+    cmp r0, 0
+    je .done
+    mov r0, [gfx_owner_pid]
+    cmp r0, r4
+    jne .done
+    mov r0, 0
+    mov [gfx_owned], r0
+    mov [gfx_owner_pid], r0
+    call input_reset
+    call display_console_attach
+    .done:
+    pop r4
+    ret
+
+
+; ==========================
+;   Pointer
+; ==========================
+; Input backends publish here; nothing above cares which device produced it.
+
+; r1 = x, r2 = y
+pointer_move:
+    mov [gfx_ptr_x], r1
+    mov [gfx_ptr_y], r2
+    ret
+
+
+; r1 = button index, r2 = 1 for down, 0 for up
+pointer_button:
+    mov r0, 1
+    shl r0, r1
+    cmp r2, 0
+    je .up
+    mov r1, [gfx_ptr_btn]
+    or r1, r0
+    mov [gfx_ptr_btn], r1
+    ret
+    .up:
+    not r0
+    mov r1, [gfx_ptr_btn]
+    and r1, r0
+    mov [gfx_ptr_btn], r1
+    ret
+
+
+; SYS_MOUSE (r2 = dst): write the current pointer state as three words
+; [x, y, buttons] into the caller's buffer. Returns 0, or -1 on a bounds fault.
+gfx_mouse_h:
+    mov r1, r2
+    mov r2, 12
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r1, r0
+    mov r0, [gfx_ptr_x]
+    mov [r1], r0
+    add r1, 4
+    mov r0, [gfx_ptr_y]
+    mov [r1], r0
+    add r1, 4
+    mov r0, [gfx_ptr_btn]
+    mov [r1], r0
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; ==========================
+;   Grabbed keys
+; ==========================
+; Single-producer (the keyboard driver) / single-consumer (the screen owner), so
+; the producer only advances the tail and the consumer only the head - no locking.
+
+; Forget every grab and every queued key. Done whenever the screen changes hands,
+; so a new owner never inherits the last one's bindings.
+input_reset:
+    mov r0, 0
+    mov [input_grabn], r0
+    mov [input_keyhead], r0
+    mov [input_keytail], r0
+    ret
+
+
+; Queue a keycode for the screen owner, dropping it if the ring is full. r1 = keycode
+input_key_push:
+    mov r0, [input_keytail]
+    mov r2, r0
+    add r2, 1
+    cmp r2, INPUT_KEYS
+    jul .nowrap
+    mov r2, 0
+    .nowrap:
+    mov r3, [input_keyhead]
+    cmp r2, r3
+    je .full                         ; would collide with the reader -> drop
+    mov r3, r0
+    umul r3, 4
+    add r3, input_keyring
+    mov [r3], r1
+    mov [input_keytail], r2
+    .full:
+    ret
+
+
+; Called by a keyboard driver for every key-down, before the key is handed to the
+; console. If the screen's owner has grabbed this keycode, queue it for them and
+; report the key consumed so the console never sees it.
+; r1 = keycode -> r0 = 1 if consumed
+input_hotkey:
+    push r4                          ; index
+    push r5                          ; grab count
+    mov r0, [gfx_owned]
+    cmp r0, 0
+    je .no                           ; plain text console: an ordinary key
+    mov r4, 0
+    mov r5, [input_grabn]
+    .scan:
+        cmp r4, r5
+        juge .no
+        mov r0, r4
+        umul r0, 4
+        add r0, input_grabs
+        mov r0, [r0]
+        cmp r0, r1
+        je .take
+        add r4, 1
+        jmp .scan
+    .take:
+    call input_key_push
+    mov r0, 1
+    pop r5
+    pop r4
+    ret
+    .no:
+    mov r0, 0
+    pop r5
+    pop r4
+    ret
+
+
+; SYS_GKEY: take the next queued grabbed keycode, or -1 if the ring is empty.
+input_key_h:
+    mov r0, [input_keyhead]
+    mov r1, [input_keytail]
+    cmp r0, r1
+    je .empty
+    mov r1, r0
+    umul r1, 4
+    add r1, input_keyring
+    mov r2, [r1]                     ; the keycode to hand back
+    add r0, 1
+    cmp r0, INPUT_KEYS
+    jul .nowrap
+    mov r0, 0
+    .nowrap:
+    mov [input_keyhead], r0
+    mov r0, r2
+    jmp sysret
+    .empty:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_KEYGRAB (r2 = keycode, r3 = 1 to grab / 0 to release): the screen's owner
+; declares which keys should come to it instead of to the console. This is how a
+; window manager gets its shortcuts without the kernel knowing what any key means.
+; Returns 0, or -1 if the caller does not hold the screen or the table is full.
+input_grab_h:
+    call gfx_is_screen_owner
+    cmp r0, 0
+    je .fail
+    mov r4, 0
+    mov r5, [input_grabn]
+    cmp r3, 0
+    je .release
+    .scan:
+        cmp r4, r5
+        juge .add
+        mov r0, r4
+        umul r0, 4
+        add r0, input_grabs
+        mov r0, [r0]
+        cmp r0, r2
+        je .ok                       ; already grabbed
+        add r4, 1
+        jmp .scan
+    .add:
+    cmp r5, MAX_GRAB
+    juge .fail
+    mov r0, r5
+    umul r0, 4
+    add r0, input_grabs
+    mov [r0], r2
+    add r5, 1
+    mov [input_grabn], r5
+    jmp .ok
+    .release:
+    .rscan:
+        cmp r4, r5
+        juge .ok                     ; not grabbed: releasing it is a no-op
+        mov r0, r4
+        umul r0, 4
+        add r0, input_grabs
+        mov r1, [r0]
+        cmp r1, r2
+        jne .rnext
+        sub r5, 1                    ; fill the hole with the last entry
+        mov r1, r5
+        umul r1, 4
+        add r1, input_grabs
+        mov r1, [r1]
+        mov [r0], r1
+        mov [input_grabn], r5
+        jmp .ok
+        .rnext:
+        add r4, 1
+        jmp .rscan
+    .ok:
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
