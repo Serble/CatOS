@@ -40,6 +40,14 @@
 ;     that keycode it is queued for them instead. The kernel never interprets a
 ;     keycode - it only compares - so which keys mean what is entirely the window
 ;     manager's business, and the same table works for any keyboard.
+;
+;     A grab of keycode -1 means "all of them", which is the only way a full-screen
+;     program that is not a shell - an editor, a game - can read the keyboard at
+;     all: the line discipline hands over whole lines, echoes them, and would need
+;     Enter before delivering anything, none of which a text editor can use. It
+;     still interprets nothing; it is one flag instead of a table scan, and the
+;     owner asked for it. While it is set the console sees no keys, so whatever was
+;     reading the console simply waits until the screen is handed back.
 
 #define GDEV_LINEAR, 0
 #define GDEV_TEXT, 4
@@ -51,7 +59,9 @@
 #define GDEV_H, 28
 
 #define MAX_GRAB, 8              ; keycodes the screen owner may hold at once
-#define INPUT_KEYS, 16           ; queued grabbed keys
+#define INPUT_KEYS, 32           ; queued grabbed keys. A window manager holding the
+                                 ; whole keyboard drains this once per composited
+                                 ; frame, so it has to hold a burst of typing.
 
 ; ---- state ----
 display_dev:
@@ -70,6 +80,8 @@ input_grabs:
     res8 MAX_GRAB * 4            ; keycodes the screen owner wants for itself
 input_grabn:
     d32 0
+input_graball:
+    d32 0                        ; 1 = the owner grabbed every key (keygrab -1)
 input_keyring:
     res8 INPUT_KEYS * 4          ; grabbed keys, driver -> screen owner
 input_keyhead:
@@ -415,6 +427,7 @@ gfx_mouse_h:
 input_reset:
     mov r0, 0
     mov [input_grabn], r0
+    mov [input_graball], r0
     mov [input_keyhead], r0
     mov [input_keytail], r0
     ret
@@ -451,6 +464,9 @@ input_hotkey:
     mov r0, [gfx_owned]
     cmp r0, 0
     je .no                           ; plain text console: an ordinary key
+    mov r0, [input_graball]
+    cmp r0, 0
+    jne .take                        ; the owner wants the whole keyboard
     mov r4, 0
     mov r5, [input_grabn]
     .scan:
@@ -503,11 +519,15 @@ input_key_h:
 ; SYS_KEYGRAB (r2 = keycode, r3 = 1 to grab / 0 to release): the screen's owner
 ; declares which keys should come to it instead of to the console. This is how a
 ; window manager gets its shortcuts without the kernel knowing what any key means.
+; A keycode of -1 is every key at once, for a full-screen program that wants the
+; keyboard rather than a handful of shortcuts.
 ; Returns 0, or -1 if the caller does not hold the screen or the table is full.
 input_grab_h:
     call gfx_is_screen_owner
     cmp r0, 0
     je .fail
+    cmp r2, -1
+    je .all
     mov r4, 0
     mov r5, [input_grabn]
     cmp r3, 0
@@ -554,6 +574,13 @@ input_grab_h:
         .rnext:
         add r4, 1
         jmp .rscan
+    .all:
+    mov r0, 0                        ; grab-all is a flag, not a table entry, so
+    cmp r3, 0                        ; the named grabs are left exactly as they are
+    je .allset
+    mov r0, 1
+    .allset:
+    mov [input_graball], r0
     .ok:
     mov r0, 0
     jmp sysret

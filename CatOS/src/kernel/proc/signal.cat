@@ -461,6 +461,11 @@ sys_kill_h:
         add r5, 1
         jmp .scan
     .found:
+    mov r0, [idleproc]            ; the idle process is the scheduler's only
+    cmp r0, r4                    ; guarantee that something is always runnable, so
+    je .fail                      ; it is not anybody's to kill - and now that
+                                  ; pkill makes killing by name a one-liner, that
+                                  ; has to be enforced rather than assumed
     vload r0, r4, PCB_SIGPEND     ; set the pending bit
     mov r1, 1
     shl r1, r3

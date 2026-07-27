@@ -24,6 +24,10 @@
 spawn_pathbuf:
     res8 VFS_PATH_MAX
 
+; the name the process being built will carry (see spawn_takename)
+spawn_namebuf:
+    res8 PROC_NAME_MAX
+
 ; argv staging: filled from the parent's address space, then written into the
 ; child's segment. Single-threaded kernel, so plain globals are fine.
 spawn_argc:
@@ -41,6 +45,33 @@ spawn_curstr:
     d32 0
 
 
+; Record the name a process about to be built will carry: the last component of
+; its path ("/bin/gdemo" -> "gdemo"), copied into our own buffer. The name has to
+; be taken here and copied, because the path a caller passes is usually scratch
+; (abspath's buffer, or a user path staged in spawn_pathbuf) that gets reused
+; before the PCB exists.
+; r1 - path (kernel address)
+spawn_takename:
+    push r4                      ; start of the component being scanned
+    mov r4, r1
+    .scan:
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .done
+        add r1, 1
+        cmp r0, 47               ; '/' - the name starts again after it
+        jne .scan
+        mov r4, r1
+        jmp .scan
+    .done:
+    mov r1, r4
+    mov r2, spawn_namebuf
+    mov r3, PROC_NAME_MAX
+    call proc_copyname
+    pop r4
+    ret
+
+
 ; Load a flat binary from a path and create a runnable process from it.
 ; r1 - path (kernel address)
 ; returns r0 = PCB pointer, or 0 on failure
@@ -49,6 +80,9 @@ proc_spawn:
     push r5                      ; file size
     push r6                      ; scratch buffer
     push r7                      ; bytes read so far
+    push r1                      ; name it after its program, while the path is
+    call spawn_takename          ; still the caller's and still intact
+    pop r1
     mov r2, O_READ
     call vfsopen
     cmp r0, -1
@@ -94,9 +128,9 @@ proc_spawn:
     cmp r7, r5
     jne .failbuf                 ; short read -> refuse to run a partial image
 
-    mov r1, r6                   ; build the process (spawned procs are unnamed)
+    mov r1, r6                   ; build the process under the name taken above
     mov r2, r5
-    mov r3, 0
+    mov r3, spawn_namebuf
     call proc_create
 
     push r0                      ; free the scratch buffer, keep the result

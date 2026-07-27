@@ -46,6 +46,22 @@
 ; manager that wants click-to-focus, or wants to swallow input entirely, just posts
 ; differently.
 ;
+; The keyboard works the same way, and has to: a key does not carry coordinates, so
+; there is nothing for the kernel to route it *by*. Which window is typing into is
+; the definition of focus, and focus is a window manager's decision, so the manager
+; takes the keys (keygrab -1 gets it the whole keyboard) and hands each one to the
+; window it decides is focused. Each surface has a small ring of them, drained by
+; its owner:
+;
+;   wm:   wkeypost(sid, keycode)        for whichever window it calls focused
+;   app:  wkey(sid)                     -> the next keycode, or -1
+;
+; A keycode is exactly what the keyboard reported (Raylib codes: letters uppercase,
+; 256+ for the non-printing keys), because a manager relaying keys should not have
+; to understand them and the kernel maps nothing on this path. Keys posted to a
+; window nobody is draining are dropped once the ring fills, which is the right
+; failure: a stalled program cannot make the manager block.
+;
 ;
 ; -- Pixels ---------------------------------------------------------------------
 ;
@@ -75,10 +91,21 @@
 #define SURF_PX, 40                  ; pointer, in this window's own coordinates
 #define SURF_PY, 44                  ; (-1, -1 when the pointer is elsewhere)
 #define SURF_PBTN, 48                ; buttons held while over this window
-#define SURF_STRUCT, 52
+#define SURF_KHEAD, 52               ; key ring: drained by the owner (wkey)
+#define SURF_KTAIL, 56               ; filled by the window manager (wkeypost)
+#define SURF_KRING, 60
+#define SURF_KEYS, 16                ; keys one window can have waiting: enough to
+                                     ; cover a burst of typing across a slow frame,
+                                     ; since a client only drains once per redraw
+#define SURF_STRUCT, 124             ; SURF_KRING + SURF_KEYS * 4
 
-; wlist record handed to the window manager: sid, w, h, reqw, reqh, seq (6 words)
-#define WREC_BYTES, 24
+; wlist record handed to the window manager: sid, w, h, reqw, reqh, seq, pid
+; (7 words). The owner's pid is in there because closing a window is a window
+; manager decision and there is no kernel call for it: a manager that puts a close
+; button on a window acts on it by signalling the program that owns it, exactly as
+; pkill would. That leaks nothing - pslist already hands out every pid, and a pid
+; is not a capability here.
+#define WREC_BYTES, 28
 
 ; ---- state ----
 surf_seq:
@@ -213,6 +240,8 @@ surf_create_h:
     vstore r6, SURF_SEQ, r0, r1
     vstore r6, SURF_CFG, r0, r1
     vstore r6, SURF_PBTN, r0, r1
+    vstore r6, SURF_KHEAD, r0, r1    ; ... and any keys the last owner never took
+    vstore r6, SURF_KTAIL, r0, r1
     vstore r6, SURF_REQW, r4, r0
     vstore r6, SURF_REQH, r5, r0
     mov r0, -1                       ; the pointer is not over it until told so
@@ -405,6 +434,89 @@ surf_input_h:
     jmp sysret
 
 
+; SYS_WKEYPOST (r2 = sid, r3 = keycode): the window manager gives a surface a key.
+; Restricted to whoever holds the screen, because deciding which window a keystroke
+; belongs to *is* focus, and there is only one process doing that. Single-producer
+; (the manager) / single-consumer (the owner), so the producer only moves the tail
+; and the consumer only the head and neither needs a lock. A full ring drops the
+; key: a program that has stopped draining must not be able to stall the manager.
+; Returns 0, or -1 on a bad id / not the manager.
+surf_keypost_h:
+    call gfx_is_screen_owner
+    cmp r0, 0
+    je .fail
+    cmp r2, MAX_SURF
+    juge .fail
+    mov r1, r2
+    call surf_slot_addr
+    mov r6, r0
+    vload r0, r6, SURF_INUSE
+    cmp r0, 0
+    je .fail
+    vload r4, r6, SURF_KTAIL
+    mov r5, r4                       ; where the tail would land next
+    add r5, 1
+    cmp r5, SURF_KEYS
+    jul .nowrap
+    mov r5, 0
+    .nowrap:
+    vload r0, r6, SURF_KHEAD
+    cmp r5, r0
+    je .ok                           ; would collide with the reader -> drop it
+    mov r0, r4                       ; ring[tail] = keycode
+    umul r0, 4
+    add r0, SURF_KRING
+    add r0, r6
+    mov [r0], r3
+    vstore r6, SURF_KTAIL, r5, r0
+    .ok:
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_WKEY (r2 = sid): the owner takes the next key posted to its window, or -1 if
+; there is none. Polling this is how a windowed program reads the keyboard - it
+; cannot read the console, which is line-buffered, echoed and owned by the shell.
+; Returns the keycode, or -1 on an empty ring / bad id / not the owner (a program
+; that is not the owner simply never sees keys, which is the same as none).
+surf_key_h:
+    cmp r2, MAX_SURF
+    juge .none
+    mov r1, r2
+    call surf_slot_addr
+    mov r6, r0
+    vload r0, r6, SURF_INUSE
+    cmp r0, 0
+    je .none
+    mov r1, r6
+    call surf_is_owner
+    cmp r0, 0
+    je .none
+    vload r4, r6, SURF_KHEAD
+    vload r0, r6, SURF_KTAIL
+    cmp r4, r0
+    je .none                         ; empty
+    mov r0, r4
+    umul r0, 4
+    add r0, SURF_KRING
+    add r0, r6
+    mov r5, [r0]                     ; the keycode to hand back
+    add r4, 1
+    cmp r4, SURF_KEYS
+    jul .nowrap
+    mov r4, 0
+    .nowrap:
+    vstore r6, SURF_KHEAD, r4, r0
+    mov r0, r5
+    jmp sysret
+    .none:
+    mov r0, -1
+    jmp sysret
+
+
 ; SYS_WCOMMIT (r2 = sid, r3 = src): copy a granted-size image from the caller into
 ; the surface's buffer and bump its commit counter. Only the surface's owner may
 ; write to it. The length comes from the record, so a program that has not noticed
@@ -480,10 +592,11 @@ surf_read_h:
     jmp sysret
 
 
-; SYS_WLIST (r2 = dst, r3 = capacity in records): write [sid, w, h, reqw, reqh, seq]
-; for each live surface, up to the capacity. That is everything a window manager
-; needs to lay the screen out: what exists, how big it currently is, how big its
-; program would like it to be, and whether its pixels have moved since last frame.
+; SYS_WLIST (r2 = dst, r3 = capacity in records): write
+; [sid, w, h, reqw, reqh, seq, pid] for each live surface, up to the capacity. That
+; is everything a window manager needs to lay the screen out: what exists, how big
+; it currently is, how big its program would like it to be, whether its pixels have
+; moved since last frame, and who to signal to make it go away.
 ; Restricted to whoever holds the screen. Returns the number written, or -1 on a
 ; bounds fault.
 surf_list_h:
@@ -526,6 +639,9 @@ surf_list_h:
         mov [r7], r0
         add r7, 4
         vload r0, r6, SURF_SEQ
+        mov [r7], r0
+        add r7, 4
+        vload r0, r6, SURF_PID
         mov [r7], r0
         add r7, 4
         add r4, 1

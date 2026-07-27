@@ -1,0 +1,195 @@
+; ps - list the processes on the machine.
+;
+; The kernel hands out the process table through one syscall, pslist, as an array
+; of fixed-size records (pid, parent pid, state, name); everything below is just
+; formatting. Rows are assembled in a line buffer and written whole, so a row is
+; one write() rather than one per column - the console is a real device and a
+; half-written row is something another process could interleave with.
+;
+;   $ ps
+;     PID  PPID STATE   NAME
+;       1     0 ready   idle
+;       2     0 ready   init
+;       3     2 blocked sh
+;       7     3 run     ps
+;
+; A process shows as "run" only if it is the one asking - anything else was
+; descheduled to let ps run. "zombie" means it has exited but nothing has waited
+; on it yet, so it still holds a slot (see the reaping note in the kernel).
+#include "sys.cat"
+
+#define LINEMAX, 64                  ; comfortably wider than the widest row
+#define PIDCOL, 5                    ; column widths, right-aligned
+#define PPIDCOL, 6
+#define STATECOL, 8                  ; bytes per entry in statenames, name included
+#define DECBUF, 13                   ; 10 digits, spare, and the terminator
+
+main:
+    sys_pslist psbuf, PS_MAX
+    cmp r0, -1
+    je .fail
+    mov r5, r0                       ; live process count (r5-r7 survive syscalls)
+    mov r6, psbuf                    ; record cursor
+    mov r7, 0                        ; record index
+
+    mov r1, header
+    call emit_str
+    call flush
+
+    .row:
+        cmp r7, r5
+        juge .done
+        mov r1, [r6]                 ; PSREC_PID
+        mov r2, PIDCOL
+        call emit_dec
+        mov r1, r6
+        add r1, PSREC_PPID
+        mov r1, [r1]
+        mov r2, PPIDCOL
+        call emit_dec
+        mov r1, 32                   ; ' '
+        call emit_char
+        mov r1, r6                   ; state name: a fixed-width table entry, so
+        add r1, PSREC_STATE          ; the column lines up without padding here
+        mov r1, [r1]
+        cmp r1, PS_EMBRYO
+        jule .known
+        mov r1, 0                    ; anything else -> the "?" entry
+        .known:
+        umul r1, STATECOL
+        add r1, statenames
+        call emit_str
+        mov r1, 32
+        call emit_char
+        mov r1, r6                   ; the name, which the kernel terminated for us
+        add r1, PSREC_NAME
+        mov8 r0, [r1]
+        cmp r0, 0
+        jne .named
+        mov r1, noname               ; a process the kernel started without one
+        .named:
+        call emit_str
+        mov r1, 10                   ; '\n'
+        call emit_char
+        call flush
+        add r6, PSREC_BYTES
+        add r7, 1
+        jmp .row
+    .done:
+    sys_exit 0
+
+.fail:
+    sys_write 1, errmsg, errmsg_end - errmsg
+    sys_exit 1
+
+
+; ---- line assembly ----------------------------------------------------------
+; A row is built up in linebuf through the cursor in cur, then flushed. All three
+; clobber r0-r3 only, so a caller can keep its loop state in r4-r7 - except that
+; SYS_WRITE takes its length in r4, so flush saves it.
+
+; emit_char(r1) - append one byte.
+emit_char:
+    mov r0, [cur]
+    mov8 [r0], r1
+    add r0, 1
+    mov [cur], r0
+    ret
+
+
+; emit_str(r1) - append a null-terminated string, terminator excluded.
+emit_str:
+    push r4                          ; write cursor
+    mov r4, [cur]
+    .loop:
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .done
+        mov8 [r4], r0
+        add r4, 1
+        add r1, 1
+        jmp .loop
+    .done:
+    mov [cur], r4
+    pop r4
+    ret
+
+
+; emit_dec(r1 = value, r2 = width) - append the value as decimal, right-aligned in
+; a space-padded field of r2 columns (a value too wide for the field just runs
+; over, which keeps the number readable at the cost of the alignment). Digits come
+; out least-significant-first, so they are generated backwards into decbuf, whose
+; last byte is left as the terminator that emit_str stops on.
+emit_dec:
+    push r4                          ; digit cursor
+    push r5                          ; digits produced
+    push r6                          ; field width
+    mov r6, r2
+    mov r4, decbuf
+    add r4, DECBUF - 1               ; one past the last digit slot
+    mov r5, 0
+    .digits:
+        mov r2, 10
+        udiv r1, r2                  ; r1 = quotient, r2 = remainder
+        add r2, 48                   ; '0'
+        sub r4, 1
+        mov8 [r4], r2
+        add r5, 1
+        cmp r1, 0
+        jne .digits
+    .pad:
+        cmp r5, r6
+        juge .write
+        mov r1, 32                   ; ' '
+        call emit_char
+        add r5, 1
+        jmp .pad
+    .write:
+    mov r1, r4
+    call emit_str
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; flush() - write the assembled row to stdout and start a new one.
+flush:
+    push r4                          ; length (also SYS_WRITE's third argument)
+    mov r4, [cur]
+    sub r4, linebuf
+    sys_write 1, linebuf, r4
+    mov r0, linebuf
+    mov [cur], r0
+    pop r4
+    ret
+
+
+header:
+    dstr "  PID  PPID STATE   NAME\n\0"
+noname:
+    dstr "?\0"
+errmsg:
+    dstr "ps: cannot read the process table\n"
+errmsg_end:
+
+; State names, one fixed-width STATECOL entry per PS_* value so the column can be
+; indexed by state and needs no padding of its own. Slot 0 is the "unknown" entry:
+; a free slot is never listed, so a state of 0 could only mean the kernel and this
+; program disagree about the numbering.
+statenames:
+    dstr "?      \0"
+    dstr "ready  \0"
+    dstr "run    \0"
+    dstr "blocked\0"
+    dstr "zombie \0"
+    dstr "embryo \0"
+
+cur:
+    d32 linebuf
+decbuf:
+    res8 DECBUF
+linebuf:
+    res8 LINEMAX
+psbuf:
+    res8 PS_MAX * PSREC_BYTES

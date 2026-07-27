@@ -1,0 +1,1801 @@
+; editor - a graphical text editor. An ordinary userland program with a window.
+;
+;   +--------------------------------------------------+
+;   | editor  /home/notes.txt  *mod*    F2 save ESC quit|
+;   | the quick brown fox                               |
+;   | jumped over the lazy dog|                         |
+;   |                                                   |
+;   | ln 2, col 25   saved                              |
+;   +--------------------------------------------------+
+;
+; It creates one surface and draws into it, and knows nothing about which window
+; manager is running: under desktop.cat it is a page, under tile.cat it is a tile
+; that gets resized to fit. It asks the kernel only the three questions a client
+; can ask about itself:
+;
+;   wconfig  how big am I right now?      -> re-lay the text area out
+;   winput   where is the pointer on me?  -> in MY coordinates, so a click is
+;                                            arithmetic, not screen geometry
+;   wkey     what has been typed at me?   -> only while the manager says I am
+;                                            the focused window
+;
+; The keyboard half of that is the part a client could not do before: a key carries
+; no coordinates, so unlike the pointer there is nothing for the kernel to route it
+; by, and the console line discipline - echoed, line-buffered, and already being
+; read by the shell - is no use to a program that needs to see Backspace and the
+; arrows as they happen. So the window manager takes the whole keyboard and hands
+; each key to whichever window it calls focused, and we drain ours with wkey. Which
+; window that is remains entirely the manager's business: tile.cat gives the keys
+; to the last window clicked, desktop.cat to the page you are looking at.
+;
+; Keycodes arrive exactly as the keyboard reported them (Raylib codes) rather than
+; as the ASCII the console would have mapped them to, so the folding of letters to
+; lower case happens here. There is no shift state anywhere in this machine - the
+; driver only ever sees key-down - so text is lower case, the same as the shell.
+;
+;
+; -- The buffer ---------------------------------------------------------------
+;
+; One flat array of bytes with lines separated by '\n', a byte offset for the
+; cursor, and another for the selection anchor. Inserting shifts the tail up a byte
+; and deleting shifts it down, which is O(n) per keystroke and completely fine at
+; this size - a 32 KB buffer moves in well under a frame. Nothing else is cached:
+; the line and column under the cursor, and the number of lines, are recomputed by
+; one scan of the buffer per redrawn frame, and a frame is only drawn - and only
+; committed - when something has actually changed, so an idle editor costs the
+; window manager nothing to show.
+;
+; The file is read in whole and written out whole. TEXT_MAX is under the 69632-byte
+; ceiling CatFS puts on a single file, so a file that loads can always be saved.
+;
+;
+; -- Keys ---------------------------------------------------------------------
+;
+;   printable      insert (replacing the selection, if there is one)
+;   Enter / Tab    newline / four spaces
+;   Backspace      delete the selection, or the character before the cursor
+;   Delete         delete the selection, or the character under the cursor
+;   arrows         move; up/down keep the column you were aiming for
+;   Home / End     start / end of line
+;   PgUp / PgDn    a screenful
+;   F2             save
+;   ESC            quit (twice, if there are unsaved changes)
+;
+; The pointer places the caret, and dragging selects. Typing over a selection
+; replaces it.
+;
+;   $ bg editor /home/notes.txt
+;   $ bg tile
+#include "sys.cat"
+
+#define WANT_W, 400                  ; the size we would like
+#define WANT_H, 300
+#define TEXT_MAX, 32768              ; the largest file we will open
+#define MAX_WIN_BYTES, 786432        ; 512 * 384 * 4 - any size we could be granted
+#define ARENA_BYTES, 819200          ; MAX_WIN_BYTES + TEXT_MAX, in one sbrk
+
+#define GW, 8                        ; the console font is 8x16, 1bpp
+#define GH, 16
+#define FONT_GLYPHS, 129
+#define TABSTOP, 4                   ; Tab inserts this many spaces
+
+; Raylib keycodes. Everything from 32..96 is already ASCII; these are the rest.
+#define KEY_ESCAPE, 256
+#define KEY_ENTER, 257
+#define KEY_TAB, 258
+#define KEY_BACKSPACE, 259
+#define KEY_DELETE, 261
+#define KEY_RIGHT, 262
+#define KEY_LEFT, 263
+#define KEY_DOWN, 264
+#define KEY_UP, 265
+#define KEY_PAGEUP, 266
+#define KEY_PAGEDOWN, 267
+#define KEY_HOME, 268
+#define KEY_END, 269
+#define KEY_F2, 291
+#define KEY_KPENTER, 335
+
+#define BG_COLOUR, 0x001E2A38        ; the page
+#define TEXT_COLOUR, 0x00E8F0F5
+#define BAR_BG, 0x000E141B           ; title and status bars
+#define TITLE_TEXT, 0x00FFFFFF
+#define HINT_TEXT, 0x008FA6BC
+#define STATUS_TEXT, 0x00C8D8E4
+#define DIRTY_TEXT, 0x00E8B45A       ; the unsaved-changes marker
+#define SEL_BG, 0x003A6EA5
+#define CARET_COLOUR, 0x00FFD479
+
+
+main:
+    mov [g_argc], r1
+    mov [g_argv], r2
+    cmp r1, 2
+    jul usage_exit                   ; we edit a named file, so we need the name
+    mov r1, 1
+    call getarg
+    mov [path], r0
+
+    sys_sbrk ARENA_BYTES             ; pixels first, the text buffer behind them.
+    cmp r0, -1                       ; the window buffer is allocated at the biggest
+    je mem_exit                      ; size we could be granted, so a resize never
+    mov [winbuf], r0                 ; has to reallocate
+    add r0, MAX_WIN_BYTES
+    mov [textptr], r0
+
+    call load_file                   ; before the window exists, so a failure can
+    cmp r0, 0                        ; still be reported on the console
+    jne big_exit
+
+    sys_wcreate WANT_W, WANT_H
+    cmp r0, -1
+    je win_exit
+    mov [sid], r0
+    call measure                     ; nlines/curline for the first frame
+
+    .loop:
+        call resync                  ; adopt whatever size we have been granted
+        call handle_keys
+        cmp r0, 1
+        je .quit
+        call handle_mouse
+        mov r0, [dirty]
+        cmp r0, 0
+        je .idle
+        call measure                 ; where the cursor is, and how many lines
+        call clamp_scroll            ; scroll to keep it on screen
+        call redraw
+        mov r0, 0
+        mov [dirty], r0
+        mov r3, [winbuf]             ; commit(sid, winbuf)
+        mov r2, [sid]
+        mov r1, SYS_WCOMMIT
+        syscall
+        .idle:
+        sys_yield
+        jmp .loop
+
+    .quit:
+        sys_exit 0
+
+
+; Pick up the size the window manager has granted us. Only the config counter
+; moving means anything changed, so this is a compare in the common case.
+resync:
+    sys_wconfig [sid], cfgbuf
+    cmp r0, -1
+    je .done                         ; surface gone; the next commit will fail too
+    mov r0, cfgbuf
+    add r0, 8
+    mov r0, [r0]                     ; config counter
+    mov r1, [lastcfg]
+    cmp r0, r1
+    je .done
+    mov [lastcfg], r0
+    mov r0, [cfgbuf]                 ; granted width
+    mov [winw], r0
+    mov r0, cfgbuf
+    add r0, 4
+    mov r0, [r0]                     ; granted height
+    mov [winh], r0
+    call layout
+    mov r0, 1                        ; redraw at the new size
+    mov [dirty], r0
+    .done:
+    ret
+
+
+; How many characters fit in the window. Two rows go to the title and status bars,
+; and everything else is derived from the size we were granted - nothing here
+; assumes any particular window size.
+layout:
+    mov r0, [winw]
+    mov r1, GW
+    udiv r0, r1
+    cmp r0, 1
+    juge .colsok
+    mov r0, 1
+    .colsok:
+    mov [cols], r0
+    mov r0, [winh]
+    mov r1, GH
+    udiv r0, r1
+    mov [rows], r0
+    sub r0, 2
+    cmp r0, 1
+    jige .ok
+    mov r0, 1                        ; a window too short for a text area
+    .ok:
+    mov [textrows], r0
+    ret
+
+
+; ==========================
+;   The file
+; ==========================
+
+; Load the whole file into the buffer. A file that does not exist is not an error -
+; that is how you start a new one. -> r0 = 0, or -1 if it will not fit.
+load_file:
+    push r5                          ; fd
+    push r6                          ; size on disk
+    push r7                          ; bytes read so far
+    mov r0, 0
+    mov [tlen], r0
+    sys_open [path], O_READ
+    cmp r0, -1
+    je .new
+    mov r5, r0
+    sys_seek r5, 0, SEEK_END
+    mov r6, r0
+    cmp r6, TEXT_MAX
+    jug .toobig                      ; refuse it rather than load a truncated file
+    sys_seek r5, 0, SEEK_SET
+    mov r7, 0
+    .rl:
+        cmp r7, r6
+        juge .rdone
+        mov r4, r6                   ; read(fd, textptr + total, size - total)
+        sub r4, r7
+        mov r3, [textptr]
+        add r3, r7
+        mov r2, r5
+        mov r1, SYS_READ
+        syscall
+        cmp r0, 0
+        jile .rdone
+        add r7, r0
+        jmp .rl
+    .rdone:
+    mov [tlen], r7
+    sys_close r5
+    mov r0, msg_opened
+    mov [statusmsg], r0
+    mov r0, 0
+    jmp .ret
+    .new:
+    mov r0, msg_new
+    mov [statusmsg], r0
+    mov r0, 0
+    jmp .ret
+    .toobig:
+    sys_close r5
+    mov r0, -1
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    ret
+
+
+; Write the buffer back over the file. Sets the status line either way; the editor
+; carries on running whatever happened.
+save_file:
+    push r5                          ; fd
+    push r6                          ; bytes to write
+    push r7                          ; bytes written so far
+    sys_open [path], O_WRITE + O_CREATE + O_TRUNC
+    cmp r0, -1
+    je .fail
+    mov r5, r0
+    mov r6, [tlen]
+    mov r7, 0
+    .wl:
+        cmp r7, r6
+        juge .wdone
+        mov r4, r6
+        sub r4, r7
+        mov r3, [textptr]
+        add r3, r7
+        mov r2, r5
+        mov r1, SYS_WRITE
+        syscall
+        cmp r0, 0
+        jile .werr
+        add r7, r0
+        jmp .wl
+    .wdone:
+    sys_close r5
+    mov r0, 0
+    mov [modified], r0
+    mov r0, msg_saved
+    mov [statusmsg], r0
+    jmp .ret
+    .werr:
+    sys_close r5
+    .fail:
+    mov r0, msg_wfail
+    mov [statusmsg], r0
+    .ret:
+    mov r0, 1
+    mov [dirty], r0
+    pop r7
+    pop r6
+    pop r5
+    ret
+
+
+; ==========================
+;   The buffer
+; ==========================
+
+; The offset of the first character of the line containing offset r1 -> r0.
+line_start:
+    push r4                          ; scan position
+    push r5                          ; buffer base
+    mov r4, r1
+    mov r5, [textptr]
+    .back:
+        cmp r4, 0
+        je .done
+        mov r0, r5
+        add r0, r4
+        sub r0, 1
+        mov8 r0, [r0]
+        cmp r0, 10
+        je .done
+        sub r4, 1
+        jmp .back
+    .done:
+    mov r0, r4
+    pop r5
+    pop r4
+    ret
+
+
+; The offset of the newline ending the line containing offset r1 (or the end of the
+; buffer, for a last line with no newline) -> r0.
+line_end:
+    push r4                          ; scan position
+    push r5                          ; buffer base
+    push r6                          ; length
+    mov r4, r1
+    mov r5, [textptr]
+    mov r6, [tlen]
+    .fwd:
+        cmp r4, r6
+        juge .done
+        mov r0, r5
+        add r0, r4
+        mov8 r0, [r0]
+        cmp r0, 10
+        je .done
+        add r4, 1
+        jmp .fwd
+    .done:
+    mov r0, r4
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; The offset where line r1 begins (clamped to the end of the buffer) -> r0.
+offset_of_line:
+    push r4                          ; lines still to skip
+    push r5                          ; scan position
+    push r6                          ; length
+    push r7                          ; buffer base
+    mov r4, r1
+    mov r5, 0
+    mov r6, [tlen]
+    mov r7, [textptr]
+    .scan:
+        cmp r4, 0
+        je .done
+        cmp r5, r6
+        juge .done
+        mov r0, r7
+        add r0, r5
+        mov8 r0, [r0]
+        add r5, 1
+        cmp r0, 10
+        jne .scan
+        sub r4, 1
+        jmp .scan
+    .done:
+    mov r0, r5
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; One pass over the buffer for the two things a frame needs that cannot be worked
+; out locally: which line the cursor is on, and how many lines there are. Called
+; once per redrawn frame, so an idle editor does not walk the buffer at all.
+measure:
+    push r4                          ; scan position
+    push r5                          ; newlines seen
+    push r6                          ; length
+    push r7                          ; buffer base
+    mov r4, 0
+    mov r5, 0
+    mov r6, [tlen]
+    mov r7, [textptr]
+    .scan:
+        cmp r4, r6
+        juge .tail
+        mov r0, [cur]
+        cmp r4, r0
+        jne .notcur
+        mov [curline], r5
+        .notcur:
+        mov r0, r7
+        add r0, r4
+        mov8 r0, [r0]
+        cmp r0, 10
+        jne .next
+        add r5, 1
+        .next:
+        add r4, 1
+        jmp .scan
+    .tail:
+    mov r0, [cur]                    ; a cursor sitting at the very end never met
+    cmp r0, r6                       ; the test in the loop
+    jul .lines
+    mov [curline], r5
+    .lines:
+    add r5, 1                        ; n newlines means n+1 lines
+    mov [nlines], r5
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; The cursor's column within its own line -> curcol.
+curcol_calc:
+    mov r1, [cur]
+    call line_start
+    mov r1, [cur]
+    sub r1, r0
+    mov [curcol], r1
+    ret
+
+
+; The column up/down aim for. Any horizontal movement or edit resets it, so walking
+; down past a short line and back out again keeps the column you started from.
+set_goal:
+    call curcol_calc
+    mov r0, [curcol]
+    mov [goalcol], r0
+    ret
+
+
+; The selection as a half-open range -> r0 = start, r1 = end, r2 = 1 if there is
+; one. An anchor equal to the cursor is a plain click, not a selection.
+sel_range:
+    push r4                          ; anchor
+    mov r4, [anchor]
+    cmp r4, 0
+    jil .none
+    mov r0, [cur]
+    cmp r4, r0
+    je .none
+    jul .anchorfirst
+    mov r1, r4                       ; cursor .. anchor
+    mov r2, 1
+    pop r4
+    ret
+    .anchorfirst:
+    mov r1, r0                       ; anchor .. cursor
+    mov r0, r4
+    mov r2, 1
+    pop r4
+    ret
+    .none:
+    mov r0, 0
+    mov r1, 0
+    mov r2, 0
+    pop r4
+    ret
+
+
+; What every edit has in common: the file differs from the disk, the frame differs
+; from the window, the selection is gone and the goal column follows the cursor.
+touch:
+    mov r0, 1
+    mov [modified], r0
+    mov [dirty], r0
+    mov r0, -1
+    mov [anchor], r0
+    call set_goal
+    ret
+
+
+; Remove [r1, r2) and leave the cursor where the text was.
+delete_range:
+    push r4                          ; start
+    push r5                          ; end
+    push r6                          ; buffer base
+    push r7                          ; scan position
+    mov r4, r1
+    mov r5, r2
+    cmp r4, r5
+    juge .done
+    mov r6, [textptr]
+    mov r7, r5
+    .shift:
+        mov r0, [tlen]               ; pull the tail down over the hole
+        cmp r7, r0
+        juge .trim
+        mov r0, r6
+        add r0, r7
+        mov8 r0, [r0]
+        mov r1, r6
+        add r1, r7
+        sub r1, r5
+        add r1, r4
+        mov8 [r1], r0
+        add r7, 1
+        jmp .shift
+    .trim:
+    mov r0, [tlen]
+    sub r0, r5
+    add r0, r4
+    mov [tlen], r0
+    mov [cur], r4
+    call touch
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Delete the selection if there is one -> r0 = 1 if anything went.
+delete_sel:
+    push r4                          ; start
+    push r5                          ; end
+    call sel_range
+    cmp r2, 0
+    je .none
+    mov r4, r0
+    mov r5, r1
+    mov r1, r4
+    mov r2, r5
+    call delete_range
+    mov r0, 1
+    pop r5
+    pop r4
+    ret
+    .none:
+    mov r0, 0
+    pop r5
+    pop r4
+    ret
+
+
+; Insert character r1 at the cursor, replacing the selection if there is one.
+insert_char:
+    push r4                          ; the character
+    push r5                          ; scan position
+    push r6                          ; buffer base
+    mov r4, r1
+    call delete_sel
+    mov r0, [tlen]
+    cmp r0, TEXT_MAX
+    juge .full
+    mov r6, [textptr]
+    mov r5, [tlen]
+    .shift:                          ; push the tail up a byte, from the top down
+        mov r0, [cur]
+        cmp r5, r0
+        jule .place
+        mov r0, r6
+        add r0, r5
+        sub r0, 1
+        mov8 r0, [r0]
+        mov r1, r6
+        add r1, r5
+        mov8 [r1], r0
+        sub r5, 1
+        jmp .shift
+    .place:
+    mov r0, [cur]
+    add r0, r6
+    mov8 [r0], r4
+    mov r0, [tlen]
+    add r0, 1
+    mov [tlen], r0
+    mov r0, [cur]
+    add r0, 1
+    mov [cur], r0
+    call touch
+    jmp .done
+    .full:
+    mov r0, msg_full
+    mov [statusmsg], r0
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Backspace: the selection, or the character behind the cursor.
+delete_back:
+    call delete_sel
+    cmp r0, 1
+    je .done
+    mov r0, [cur]
+    cmp r0, 0
+    je .done
+    mov r1, r0
+    sub r1, 1
+    mov r2, r0
+    call delete_range
+    .done:
+    ret
+
+
+; Delete: the selection, or the character under the cursor.
+delete_fwd:
+    call delete_sel
+    cmp r0, 1
+    je .done
+    mov r0, [cur]
+    mov r1, [tlen]
+    cmp r0, r1
+    juge .done
+    mov r1, r0
+    mov r2, r0
+    add r2, 1
+    call delete_range
+    .done:
+    ret
+
+
+; ==========================
+;   Moving about
+; ==========================
+; Moving drops the selection (there is no shift state to extend one with) and, for
+; the horizontal moves, re-aims the goal column.
+
+after_move:
+    mov r0, 1
+    mov [dirty], r0
+    mov r0, -1
+    mov [anchor], r0
+    call set_goal
+    ret
+
+
+after_vmove:
+    mov r0, 1
+    mov [dirty], r0
+    mov r0, -1
+    mov [anchor], r0
+    ret
+
+
+move_left:
+    mov r0, [cur]
+    cmp r0, 0
+    je .done
+    sub r0, 1
+    mov [cur], r0
+    .done:
+    call after_move
+    ret
+
+
+move_right:
+    mov r0, [cur]
+    mov r1, [tlen]
+    cmp r0, r1
+    juge .done
+    add r0, 1
+    mov [cur], r0
+    .done:
+    call after_move
+    ret
+
+
+move_home:
+    mov r1, [cur]
+    call line_start
+    mov [cur], r0
+    call after_move
+    ret
+
+
+move_end:
+    mov r1, [cur]
+    call line_end
+    mov [cur], r0
+    call after_move
+    ret
+
+
+move_up:
+    push r4                          ; start of this line
+    push r5                          ; start of the line above
+    mov r1, [cur]
+    call line_start
+    mov r4, r0
+    cmp r4, 0
+    je .top
+    mov r1, r4
+    sub r1, 1                        ; the newline that ended the line above
+    call line_start
+    mov r5, r0
+    mov r0, r4                       ; its length, newline excluded
+    sub r0, r5
+    sub r0, 1
+    mov r1, [goalcol]
+    cmp r1, r0
+    jule .colok
+    mov r1, r0                       ; shorter than the goal: land at its end
+    .colok:
+    add r1, r5
+    mov [cur], r1
+    jmp .done
+    .top:
+    mov r0, 0                        ; already on line 1: go to the very start
+    mov [cur], r0
+    .done:
+    call after_vmove
+    pop r5
+    pop r4
+    ret
+
+
+move_down:
+    push r4                          ; end of this line
+    push r5                          ; start of the line below
+    push r6                          ; end of the line below
+    mov r1, [cur]
+    call line_end
+    mov r4, r0
+    mov r0, [tlen]
+    cmp r4, r0
+    juge .bottom
+    mov r5, r4
+    add r5, 1                        ; past the newline
+    mov r1, r5
+    call line_end
+    mov r6, r0
+    mov r0, r6
+    sub r0, r5
+    mov r1, [goalcol]
+    cmp r1, r0
+    jule .colok
+    mov r1, r0
+    .colok:
+    add r1, r5
+    mov [cur], r1
+    jmp .done
+    .bottom:
+    mov [cur], r4                    ; already on the last line: go to its end
+    .done:
+    call after_vmove
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+page_up:
+    push r4
+    mov r4, [textrows]
+    .l:
+        cmp r4, 0
+        je .done
+        call move_up
+        sub r4, 1
+        jmp .l
+    .done:
+    pop r4
+    ret
+
+
+page_down:
+    push r4
+    mov r4, [textrows]
+    .l:
+        cmp r4, 0
+        je .done
+        call move_down
+        sub r4, 1
+        jmp .l
+    .done:
+    pop r4
+    ret
+
+
+; Scroll the view so the cursor is inside it, in both directions.
+clamp_scroll:
+    mov r0, [curline]
+    mov r1, [topline]
+    cmp r0, r1
+    juge .below
+    mov [topline], r0                ; above the view: it becomes the top line
+    jmp .horiz
+    .below:
+    mov r1, [topline]
+    mov r2, [textrows]
+    add r1, r2
+    cmp r0, r1
+    jul .horiz
+    sub r0, r2                       ; below it: it becomes the bottom line
+    add r0, 1
+    mov [topline], r0
+    .horiz:
+    call curcol_calc
+    mov r0, [curcol]
+    mov r1, [leftcol]
+    cmp r0, r1
+    juge .right
+    mov [leftcol], r0
+    jmp .done
+    .right:
+    mov r1, [leftcol]
+    mov r2, [cols]
+    add r1, r2
+    cmp r0, r1
+    jul .done
+    sub r0, r2
+    add r0, 1
+    mov [leftcol], r0
+    .done:
+    ret
+
+
+; ==========================
+;   Input
+; ==========================
+
+; Drain the keys the window manager has given us. We only ever see them while it
+; considers us focused, and anything not recognised below is simply dropped.
+; -> r0 = 1 if the editor should quit.
+handle_keys:
+    push r4                          ; keycode
+    push r5                          ; quit requested
+    mov r5, 0
+    .drain:
+        sys_wkey [sid]
+        cmp r0, -1
+        je .done                     ; nothing waiting for us
+        mov r4, r0
+        cmp r4, KEY_ESCAPE
+        je .escape
+        mov r0, 0                    ; any other key answers "no" to the quit
+        mov [quitasked], r0          ; confirmation
+        cmp r4, KEY_F2
+        je .save
+        cmp r4, KEY_ENTER
+        je .newline
+        cmp r4, KEY_KPENTER
+        je .newline
+        cmp r4, KEY_TAB
+        je .tab
+        cmp r4, KEY_BACKSPACE
+        je .back
+        cmp r4, KEY_DELETE
+        je .del
+        cmp r4, KEY_LEFT
+        je .left
+        cmp r4, KEY_RIGHT
+        je .right
+        cmp r4, KEY_UP
+        je .up
+        cmp r4, KEY_DOWN
+        je .down
+        cmp r4, KEY_HOME
+        je .home
+        cmp r4, KEY_END
+        je .end
+        cmp r4, KEY_PAGEUP
+        je .pgup
+        cmp r4, KEY_PAGEDOWN
+        je .pgdn
+        cmp r4, 32                   ; the printable range is already ASCII
+        jul .drain
+        cmp r4, 96
+        jug .drain
+        mov r1, r4
+        cmp r1, 65
+        jul .insert
+        cmp r1, 90
+        jug .insert
+        add r1, 32                   ; no shift state exists: fold to lower case
+        .insert:
+        call insert_char
+        jmp .drain
+
+        .escape:
+        mov r0, [modified]
+        cmp r0, 0
+        je .wantquit                 ; nothing to lose
+        mov r0, [quitasked]
+        cmp r0, 0
+        jne .wantquit                ; asked twice: they mean it
+        mov r0, 1
+        mov [quitasked], r0
+        mov [dirty], r0
+        mov r0, msg_confirm
+        mov [statusmsg], r0
+        jmp .drain
+        .wantquit:
+        mov r5, 1
+        jmp .drain
+
+        .save:
+        call save_file
+        jmp .drain
+        .newline:
+        mov r1, 10
+        call insert_char
+        jmp .drain
+        .tab:
+        mov r0, TABSTOP              ; spaces, so the width is not a question the
+        mov [tabn], r0               ; renderer has to answer
+        .tabloop:
+            mov r0, [tabn]
+            cmp r0, 0
+            je .drain
+            sub r0, 1
+            mov [tabn], r0
+            mov r1, 32
+            call insert_char
+            jmp .tabloop
+        .back:
+        call delete_back
+        jmp .drain
+        .del:
+        call delete_fwd
+        jmp .drain
+        .left:
+        call move_left
+        jmp .drain
+        .right:
+        call move_right
+        jmp .drain
+        .up:
+        call move_up
+        jmp .drain
+        .down:
+        call move_down
+        jmp .drain
+        .home:
+        call move_home
+        jmp .drain
+        .end:
+        call move_end
+        jmp .drain
+        .pgup:
+        call page_up
+        jmp .drain
+        .pgdn:
+        call page_down
+        jmp .drain
+    .done:
+    mov r0, r5
+    pop r5
+    pop r4
+    ret
+
+
+; The pointer places the caret; holding the button and moving selects. winput gives
+; it to us in our own coordinates - the window manager did the hit-testing, because
+; it is the only thing that knows where we were put - so this is arithmetic.
+handle_mouse:
+    push r4                          ; buttons this frame
+    push r5                          ; x
+    push r6                          ; y
+    sys_winput [sid], inbuf
+    cmp r0, -1
+    je .done
+    mov r5, [inbuf]
+    mov r0, inbuf
+    add r0, 4
+    mov r6, [r0]
+    mov r0, inbuf
+    add r0, 8
+    mov r4, [r0]
+    mov r0, r4                       ; bit 0 = left button
+    and r0, 1
+    cmp r0, 0
+    je .store
+    mov r1, r5
+    mov r2, r6
+    call hit_offset
+    cmp r0, -1
+    je .store                        ; not over the text
+    mov r1, [prevbtn]
+    and r1, 1
+    cmp r1, 0
+    jne .drag
+    mov [cur], r0                    ; press: caret here, and anchor a selection
+    mov [anchor], r0
+    jmp .placed
+    .drag:
+    mov r1, [cur]                    ; held: drag the far end of the selection
+    cmp r0, r1
+    je .store
+    mov [cur], r0
+    .placed:
+    call set_goal
+    mov r0, 1
+    mov [dirty], r0
+    .store:
+    mov [prevbtn], r4
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; The buffer offset under pixel (r1, r2) -> r0, or -1 if that is not the text area
+; (which covers the pointer being somewhere else entirely, reported as -1, -1).
+; Clicking past the end of a line lands at its end, and past the last line at the
+; end of the buffer, which is what every other editor does.
+hit_offset:
+    push r4                          ; row, then line
+    push r5                          ; x, then column
+    push r6                          ; that line's offset
+    mov r4, r2
+    mov r5, r1
+    cmp r4, 0
+    jil .miss
+    cmp r5, 0
+    jil .miss
+    mov r0, r4
+    mov r1, GH
+    udiv r0, r1
+    cmp r0, 1
+    jul .miss                        ; the title bar
+    sub r0, 1
+    mov r1, [textrows]
+    cmp r0, r1
+    juge .miss                       ; the status bar, or below the last row
+    mov r1, [topline]
+    add r0, r1
+    mov r4, r0
+    mov r0, r5
+    mov r1, GW
+    udiv r0, r1
+    mov r1, [leftcol]
+    add r0, r1
+    mov r5, r0
+    mov r0, [nlines]
+    cmp r4, r0
+    jul .haveline
+    mov r0, [tlen]                   ; past the last line
+    jmp .ret
+    .haveline:
+    mov r1, r4
+    call offset_of_line
+    mov r6, r0
+    mov r1, r6
+    call line_end
+    mov r1, r0
+    mov r0, r6
+    add r0, r5
+    cmp r0, r1
+    jule .ret
+    mov r0, r1                       ; past the end of that line
+    .ret:
+    pop r6
+    pop r5
+    pop r4
+    ret
+    .miss:
+    mov r0, -1
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Drawing
+; ==========================
+
+redraw:
+    call clear_win
+    call draw_title
+    call draw_body
+    call draw_status
+    ret
+
+
+; The title bar: what we are editing, whether it has been changed, and the two
+; keys that are not guessable.
+draw_title:
+    push r4                          ; pen x, after the title
+    push r5                          ; where the hint would go
+    mov [fx], 0
+    mov [fy], 0
+    mov r0, [winw]
+    mov [fw], r0
+    mov [fh], GH
+    mov [fc], BAR_BG
+    call fill_rect
+    mov [gy], 0
+    mov [gc], TITLE_TEXT
+    mov r1, msg_title
+    mov r2, GW
+    call draw_text
+    mov r4, r0
+    mov r1, [path]
+    mov r2, r4
+    call draw_text
+    mov r4, r0
+    mov r0, [modified]
+    cmp r0, 0
+    je .hint
+    mov [gc], DIRTY_TEXT
+    mov r1, msg_mod
+    mov r2, r4
+    call draw_text
+    mov r4, r0
+    .hint:
+    mov r1, msg_keys                 ; right-aligned against the far edge
+    call strlen
+    umul r0, GW
+    mov r5, [winw]
+    sub r5, r0
+    sub r5, GW
+    cmp r5, 0
+    jil .done                        ; the window is not wide enough for it
+    mov r0, r4                       ; a cell of clearance from the title; a window
+    add r0, GW                       ; too narrow for both just loses the reminder
+    cmp r5, r0
+    jil .done
+    mov [gc], HINT_TEXT
+    mov r1, msg_keys
+    mov r2, r5
+    call draw_text
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; The status bar: where the cursor is, and whatever last happened.
+draw_status:
+    push r4                          ; pen x
+    mov r0, [rows]
+    sub r0, 1
+    umul r0, GH
+    mov [fy], r0
+    mov [gy], r0
+    mov [fx], 0
+    mov r0, [winw]
+    mov [fw], r0
+    mov [fh], GH
+    mov [fc], BAR_BG
+    call fill_rect
+    mov [gc], HINT_TEXT
+    mov r1, msg_ln
+    mov r2, GW
+    call draw_text
+    mov r4, r0
+    mov r1, [curline]                ; lines and columns are 1-based to a human
+    add r1, 1
+    mov r2, r4
+    call draw_num
+    mov r4, r0
+    mov r1, msg_col
+    mov r2, r4
+    call draw_text
+    mov r4, r0
+    mov r1, [curcol]
+    add r1, 1
+    mov r2, r4
+    call draw_num
+    mov r4, r0
+    add r4, GW * 3
+    mov [gc], STATUS_TEXT
+    mov r1, [statusmsg]
+    mov r2, r4
+    call draw_text
+    pop r4
+    ret
+
+
+; The visible slice of the buffer, then the caret on top of it.
+draw_body:
+    push r4                          ; screen row
+    push r5                          ; offset of the line being drawn
+    call sel_range                   ; one range for the whole pass
+    cmp r2, 0
+    jne .havesel
+    mov r0, -1                       ; no selection: a range nothing falls inside
+    mov r1, -1
+    .havesel:
+    mov [selstart], r0
+    mov [selend], r1
+    mov r1, [topline]
+    call offset_of_line
+    mov r5, r0
+    mov r4, 0
+    .rows:
+        mov r0, [textrows]
+        cmp r4, r0
+        juge .caret
+        mov r0, [topline]
+        add r0, r4
+        mov r1, [nlines]
+        cmp r0, r1
+        juge .caret                  ; past the last line: leave the page bare
+        mov r1, r4
+        mov r2, r5
+        call draw_line
+        mov r5, r0
+        add r4, 1
+        jmp .rows
+    .caret:
+    mov r0, [curline]                ; a two-pixel bar between characters
+    mov r1, [topline]
+    cmp r0, r1
+    jul .done
+    sub r0, r1
+    mov r1, [textrows]
+    cmp r0, r1
+    juge .done
+    add r0, 1                        ; the title bar is row 0
+    umul r0, GH
+    mov [fy], r0
+    mov r0, [curcol]
+    mov r1, [leftcol]
+    cmp r0, r1
+    jul .done
+    sub r0, r1
+    mov r1, [cols]
+    cmp r0, r1
+    juge .done
+    umul r0, GW
+    mov [fx], r0
+    mov [fw], 2
+    mov [fh], GH
+    mov [fc], CARET_COLOUR
+    call fill_rect
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; One line of text. r1 = screen row, r2 = the line's offset in the buffer.
+; -> r0 = the offset of the line after it.
+draw_line:
+    push r4                          ; pixel y
+    push r5                          ; offset of the character being drawn
+    push r6                          ; screen column
+    push r7                          ; offset of the line's end
+    mov r0, r1
+    add r0, 1
+    umul r0, GH
+    mov r4, r0
+    mov [gy], r4
+    mov r5, r2
+    mov r1, r5
+    call line_end
+    mov r7, r0
+    mov r0, r5                       ; skip the columns scrolled off the left
+    mov r1, [leftcol]
+    add r0, r1
+    cmp r0, r7
+    jule .fromleft
+    mov r0, r7                       ; the line is shorter than the scroll
+    .fromleft:
+    mov r5, r0
+    mov r6, 0
+    .each:
+        mov r0, [cols]
+        cmp r6, r0
+        juge .eol
+        cmp r5, r7
+        juge .eol
+        mov r0, [selstart]           ; selected characters sit on a filled cell
+        cmp r5, r0
+        jul .nosel
+        mov r0, [selend]
+        cmp r5, r0
+        juge .nosel
+        mov r0, r6
+        umul r0, GW
+        mov [fx], r0
+        mov [fy], r4
+        mov [fw], GW
+        mov [fh], GH
+        mov [fc], SEL_BG
+        call fill_rect
+        .nosel:
+        mov r0, [textptr]
+        add r0, r5
+        mov8 r0, [r0]
+        cmp r0, 32
+        jule .skip                   ; blank, or a control byte we will not draw
+        mov [gch], r0
+        mov r0, r6
+        umul r0, GW
+        mov [gx], r0
+        mov [gc], TEXT_COLOUR
+        call draw_glyph
+        .skip:
+        add r5, 1
+        add r6, 1
+        jmp .each
+    .eol:
+    cmp r5, r7                       ; a selection that runs on to the next line
+    jne .next                        ; shows the newline as a half-width block
+    mov r0, [cols]
+    cmp r6, r0
+    juge .next
+    mov r0, [selstart]
+    cmp r7, r0
+    jul .next
+    mov r0, [selend]
+    cmp r7, r0
+    juge .next
+    mov r0, r6
+    umul r0, GW
+    mov [fx], r0
+    mov [fy], r4
+    mov [fw], GW / 2
+    mov [fh], GH
+    mov [fc], SEL_BG
+    call fill_rect
+    .next:
+    mov r0, r7
+    mov r1, [tlen]
+    cmp r0, r1
+    juge .done
+    add r0, 1                        ; step over the newline
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Primitives
+; ==========================
+
+; Draw a null-terminated string. r1 = string, r2 = pen x. Uses gy and gc, and
+; hands back the pen where the next string would start.
+draw_text:
+    push r4                          ; read cursor
+    push r5                          ; pen x
+    mov r4, r1
+    mov r5, r2
+    .each:
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .done
+        cmp r0, 32
+        jule .skip
+        mov [gch], r0
+        mov [gx], r5
+        call draw_glyph
+        .skip:
+        add r5, GW
+        add r4, 1
+        jmp .each
+    .done:
+    mov r0, r5
+    pop r5
+    pop r4
+    ret
+
+
+; Draw an unsigned number. r1 = value, r2 = pen x -> r0 = the pen after it.
+draw_num:
+    push r4                          ; pen x
+    mov r4, r2
+    mov r2, numbuf
+    call itoa
+    mov r1, numbuf
+    mov r2, r4
+    call draw_text
+    pop r4
+    ret
+
+
+; One 8x16 glyph from the embedded console font. Inputs (globals): gx, gy (its
+; top-left pixel), gch (the character), gc (the colour). Rows whose font byte is
+; zero are skipped, which is most of them.
+draw_glyph:
+    push r4                          ; glyph row
+    push r5                          ; that row's font byte
+    push r6                          ; where the row lands in the buffer
+    push r7                          ; bit index within the row
+    mov r0, [gch]
+    cmp r0, FONT_GLYPHS
+    juge .done                       ; unmapped code -> draw nothing
+    umul r0, GH
+    add r0, font
+    mov [gsrc], r0
+    mov r4, 0
+    .rows:
+        cmp r4, GH
+        juge .done
+        mov r0, [gy]
+        add r0, r4                   ; py
+        mov r1, [winh]
+        cmp r0, r1
+        juge .done                   ; off the bottom
+        mov r5, [gsrc]
+        add r5, r4
+        mov8 r5, [r5]                ; 1bpp row, MSB = leftmost pixel
+        cmp r5, 0
+        je .nextrow
+        mov r1, [winw]               ; dst = winbuf + (py*winw + gx)*4
+        umul r0, r1
+        mov r1, [gx]
+        add r0, r1
+        umul r0, 4
+        mov r6, [winbuf]
+        add r6, r0
+        mov r7, 0
+        .bits:
+            cmp r7, GW
+            juge .nextrow
+            mov r0, 7
+            sub r0, r7
+            mov r1, r5
+            shr r1, r0
+            and r1, 1
+            cmp r1, 0
+            je .nextbit
+            mov r0, [gx]
+            add r0, r7
+            mov r1, [winw]
+            cmp r0, r1
+            juge .nextrow            ; ran off the right edge
+            mov r0, r7
+            umul r0, 4
+            add r0, r6
+            mov r1, [gc]
+            mov [r0], r1
+            .nextbit:
+            add r7, 1
+            jmp .bits
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; A solid rectangle, clipped to the window. Inputs (globals): fx, fy, fw, fh, fc.
+fill_rect:
+    push r4                          ; row
+    push r5                          ; py
+    push r6                          ; clipped width
+    push r7                          ; column counter
+    mov r4, 0
+    .rows:
+        mov r0, [fh]
+        cmp r4, r0
+        juge .done
+        mov r5, [fy]
+        add r5, r4
+        cmp r5, 0
+        jil .next
+        mov r0, [winh]
+        cmp r5, r0
+        juge .done
+        mov r6, [fw]
+        mov r0, [fx]
+        add r0, r6
+        mov r1, [winw]
+        cmp r0, r1
+        jule .wok
+        mov r6, [winw]
+        mov r0, [fx]
+        sub r6, r0
+        .wok:
+        cmp r6, 0
+        jile .next
+        mov r0, r5                   ; dst = winbuf + (py*winw + x)*4
+        mov r1, [winw]
+        umul r0, r1
+        mov r1, [fx]
+        add r0, r1
+        umul r0, 4
+        mov r2, [winbuf]
+        add r0, r2
+        mov r1, [fc]
+        mov r7, r6
+        .cols:
+            mov [r0], r1
+            add r0, 4
+            sub r7, 1
+            cmp r7, 0
+            jne .cols
+        .next:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Fill the window with the background, by the doubling copy trick: seed one pixel,
+; then repeatedly copy the filled span onto itself.
+clear_win:
+    push r4                          ; span already filled
+    push r5                          ; remaining
+    push r6                          ; total bytes
+    mov r6, [winw]
+    mov r0, [winh]
+    umul r6, r0
+    umul r6, 4
+    cmp r6, 0
+    je .done
+    mov r0, [winbuf]
+    mov [r0], BG_COLOUR
+    mov r4, 4
+    .fill:
+        cmp r4, r6
+        juge .done
+        mov r5, r6
+        sub r5, r4
+        cmp r4, r5
+        jule .use
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r5
+        jmp .done
+        .use:
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r4
+        add r4, r4
+        jmp .fill
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Small utilities
+; ==========================
+
+; getarg(r1 = index) -> r0 = argv[index].
+getarg:
+    shl r1, 2
+    mov r0, [g_argv]
+    add r1, r0
+    mov r0, [r1]
+    ret
+
+
+; strlen(r1) -> r0, the terminator excluded.
+strlen:
+    push r4
+    mov r4, r1
+    mov r0, 0
+    .l:
+        mov8 r1, [r4]
+        cmp r1, 0
+        je .done
+        add r0, 1
+        add r4, 1
+        jmp .l
+    .done:
+    pop r4
+    ret
+
+
+; itoa(r1 = value, r2 = buffer): unsigned decimal, null-terminated.
+itoa:
+    push r4                          ; value
+    push r5                          ; buffer
+    push r6                          ; digit count
+    push r7                          ; write index
+    mov r4, r1
+    mov r5, r2
+    mov r6, 0
+    cmp r4, 0
+    jne .gen
+    mov8 [r5], 48                    ; "0"
+    mov r6, 1
+    jmp .term
+    .gen:
+    .gl:                             ; least significant digit first, onto the stack
+        cmp r4, 0
+        je .emit
+        mov r0, r4
+        mov r1, 10
+        udiv r0, r1                  ; r0 = quotient, r1 = remainder
+        add r1, 48
+        push r1
+        add r6, 1
+        mov r4, r0
+        jmp .gl
+    .emit:
+        mov r7, 0
+    .ol:                             ; and back off it in order
+        cmp r7, r6
+        juge .term
+        pop r1
+        mov r0, r5
+        add r0, r7
+        mov8 [r0], r1
+        add r7, 1
+        jmp .ol
+    .term:
+    mov r0, r5
+    add r0, r6
+    mov8 [r0], 0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Error exits
+; ==========================
+; All before the window exists, so the console is still where a message belongs.
+usage_exit:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+mem_exit:
+    sys_write 1, memmsg, memmsg_end - memmsg
+    sys_exit 1
+big_exit:
+    sys_write 1, bigmsg, bigmsg_end - bigmsg
+    sys_exit 1
+win_exit:
+    sys_write 1, winmsg, winmsg_end - winmsg
+    sys_exit 1
+
+
+; ==========================
+;   Data
+; ==========================
+usage:
+    dstr "usage: editor <file>\n"
+usage_end:
+memmsg:
+    dstr "editor: out of memory\n"
+memmsg_end:
+bigmsg:
+    dstr "editor: file too large to edit\n"
+bigmsg_end:
+winmsg:
+    dstr "editor: cannot create a window\n"
+winmsg_end:
+
+msg_title:
+    dstr "editor  \0"
+msg_mod:
+    dstr "  *modified*\0"
+msg_keys:
+    dstr "F2 save  ESC quit \0"
+msg_ln:
+    dstr "ln \0"
+msg_col:
+    dstr ", col \0"
+msg_new:
+    dstr "new file\0"
+msg_opened:
+    dstr "opened\0"
+msg_saved:
+    dstr "saved\0"
+msg_wfail:
+    dstr "write failed\0"
+msg_full:
+    dstr "buffer full\0"
+msg_confirm:
+    dstr "unsaved changes - ESC again to quit\0"
+
+font:
+    dfile "../../build/font.bin"     ; the same 8x16 blob the console uses
+
+
+; ---- state ------------------------------------------------------------------
+g_argc:
+    d32 0
+g_argv:
+    d32 0
+path:
+    d32 0                            ; argv[1], the file we are editing
+sid:
+    d32 0                            ; our surface
+winbuf:
+    d32 0                            ; the pixels we commit into it
+textptr:
+    d32 0                            ; the text buffer, behind the pixels
+tlen:
+    d32 0                            ; bytes of text
+cur:
+    d32 0                            ; the cursor, as a byte offset
+anchor:
+    d32 -1                           ; the other end of the selection, -1 = none
+goalcol:
+    d32 0                            ; the column up/down are aiming for
+curline:
+    d32 0                            ; where the cursor is, from measure
+curcol:
+    d32 0
+nlines:
+    d32 1
+topline:
+    d32 0                            ; the view
+leftcol:
+    d32 0
+winw:
+    d32 WANT_W                       ; the size we are currently drawing at
+winh:
+    d32 WANT_H
+lastcfg:
+    d32 0                            ; last config counter we adopted
+cols:
+    d32 50                           ; character cells that fit in the window
+rows:
+    d32 18                           ; (WANT_W / GW, WANT_H / GH)
+textrows:
+    d32 16
+modified:
+    d32 0                            ; the buffer differs from the file
+dirty:
+    d32 1                            ; the buffer differs from what we committed
+quitasked:
+    d32 0                            ; ESC pressed once with changes outstanding
+statusmsg:
+    d32 msg_new
+tabn:
+    d32 0                            ; spaces left to insert for a Tab
+selstart:
+    d32 -1                           ; the selection, resolved once per frame
+selend:
+    d32 -1
+prevbtn:
+    d32 0                            ; last frame's buttons, for press-edge detection
+cfgbuf:
+    res8 12                          ; wconfig: width, height, config counter
+inbuf:
+    res8 12                          ; winput: x, y, buttons
+numbuf:
+    res8 16
+; fill_rect inputs
+fx:
+    d32 0
+fy:
+    d32 0
+fw:
+    d32 0
+fh:
+    d32 0
+fc:
+    d32 0
+; draw_glyph inputs
+gx:
+    d32 0
+gy:
+    d32 0
+gch:
+    d32 0
+gc:
+    d32 0
+gsrc:
+    d32 0

@@ -30,12 +30,32 @@
 ;
 ; Left/Right arrow change page. Those two keycodes never reach the console: the
 ; keyboard ISR diverts them to the window manager while the screen is owned, and
-; we drain them with gkey. Every other key goes to the console line discipline as
-; usual, which is exactly what makes page 0 a working shell.
+; we drain them with gkey.
 ;
-; Clicking a tab also switches to it. F1 quits and hands the screen back to the
-; text console; the pointer deliberately cannot, so a misplaced click never throws
-; you out of the desktop.
+; Where every *other* key goes depends on which page you are looking at, and that
+; is the one input decision this program makes:
+;
+;   page 0        nothing is grabbed, so keys fall through to the console line
+;                 discipline exactly as they always did - which is what makes
+;                 page 0 a working shell.
+;   pages 1..n    the whole keyboard is grabbed (keygrab -1) and each key is handed
+;                 to that page's window with wkeypost, so a program with a window
+;                 can be typed into. editor.cat is the one that needs this.
+;
+; The grab is turned on and off as the page changes, which is the entire focus
+; policy: the window you are looking at is the window you are typing into.
+;
+; Clicking a tab also switches to it, and every window tab carries a small "x" at
+; its right-hand end that closes that window. There is no kernel call for closing
+; one - a surface belongs to the program that made it and goes away when that
+; program does - so the button does the only thing it can: it sends SIGTERM to the
+; owning pid, which wlist reports, exactly as pkill would. A program that installs
+; a SIGTERM handler therefore decides for itself what closing means, and one that
+; does not simply dies and takes its window with it (proc teardown calls gfx_reap).
+;
+; F1 quits and hands the screen back to the text console; the pointer deliberately
+; cannot, so a misplaced click never throws you out of the desktop - the worst a
+; stray click can do is close one window.
 #include "sys.cat"
 
 #define FBW, 512
@@ -47,10 +67,11 @@
 #define ARENA_BYTES, 1540096         ; FB_BYTES + CONTENT_BYTES
 
 #define MAXREC, 8                    ; must match the kernel's MAX_SURF
-#define WREC_BYTES, 24               ; sid, w, h, reqw, reqh, seq
+#define WREC_BYTES, 28               ; sid, w, h, reqw, reqh, seq, pid
 #define WREC_W, 4                    ; offsets within one record
 #define WREC_H, 8
 #define WREC_SEQ, 20
+#define WREC_PID, 24                 ; who to signal when its close button is hit
 
 ; ---- the console page ----
 #define GW, 8                        ; glyph width
@@ -68,6 +89,14 @@
 #define CON_GEOM, 4194327            ; (CON_COLS << 16) | CON_ROWS, for gacquire
 
 #define TAB_W, 56                    ; one tab button, including its 2px gutter
+#define CLOSE_W, 14                  ; the close button's hit area, at the tab's
+                                     ; right-hand end and inside its gutter
+#define CLOSE_LEFT, 41               ; TAB_W - 1 - CLOSE_W: where that area starts
+#define CLOSE_RIGHT, 55              ; TAB_W - 1: and where the gutter takes over
+#define LABEL_X, 13                  ; the two-glyph label, centred in the 40px the
+                                     ; close button leaves: 1 + (40 - 2*GW) / 2
+#define CLOSE_X, 44                  ; the "x" glyph, centred in the button area:
+                                     ; CLOSE_LEFT + (CLOSE_W - GW) / 2
 
 #define BG_COLOUR, 0x001E2A38        ; dark slate page background
 #define BAR_BG, 0x000E141B           ; behind the tabs
@@ -100,6 +129,7 @@ main:
         je .quit
         call handle_mouse
         call clamp_page
+        call sync_grab               ; the keyboard follows the page
         call post_input              ; clicks must reach clients on skipped frames
         call need_redraw             ; r0 = 0 when last frame is still correct
         cmp r0, 0
@@ -139,7 +169,8 @@ read_pages:
 
 
 ; Drain the keys the ISR diverted to us. Left/Right step one page and stop at the
-; ends rather than wrapping; F1 asks to quit. -> r0 = 1 if F1 was pressed.
+; ends rather than wrapping; F1 asks to quit. Anything else belongs to the window
+; on the current page, if there is one. -> r0 = 1 if F1 was pressed.
 handle_keys:
     push r4                          ; keycode
     push r5                          ; quit requested
@@ -155,6 +186,10 @@ handle_keys:
         je .left
         cmp r4, KEY_RIGHT
         je .right
+        call page_sid                ; not ours: it belongs to the window on show
+        cmp r0, -1
+        je .drain                    ; page 0, or nothing there - drop it
+        sys_wkeypost r0, r4
         jmp .drain
         .wantquit:
         mov r5, 1
@@ -205,7 +240,10 @@ handle_mouse:
     ret
 
 
-; If the pointer is over the tab bar, switch to whichever tab it is on.
+; If the pointer is over the tab bar, act on whichever tab it is on: the "x" at the
+; right-hand end of a window tab closes that window, anywhere else on the tab
+; switches to it. The console tab has no close button - there is no program behind
+; page 0 to signal, and the shell is the one thing you cannot get rid of.
 tab_hit:
     mov r0, mousebuf
     add r0, 4
@@ -215,12 +253,44 @@ tab_hit:
     mov r0, mousebuf
     mov r0, [r0]                     ; x
     mov r1, TAB_W
-    udiv r0, r1                      ; r0 = tab index (r1 takes the remainder)
-    mov r1, [pagecount]
-    cmp r0, r1
+    udiv r0, r1                      ; r0 = tab index, r1 = x within that tab
+    mov r2, [pagecount]
+    cmp r0, r2
     juge .done                       ; past the last tab
+    cmp r0, 0
+    je .select                       ; the console tab is all label
+    cmp r1, CLOSE_LEFT
+    jul .select                      ; left of the button
+    cmp r1, CLOSE_RIGHT
+    juge .select                     ; in the gutter, past the button
+    call close_page
+    ret
+    .select:
     mov [page], r0
     .done:
+    ret
+
+
+; Close the window on page r0 by asking its program to exit. SIGTERM rather than
+; SIGKILL: closing a window is a request, and a program that wants to save first,
+; or refuse, is entitled to. The window itself disappears when the process does,
+; so nothing here touches the page list - the next read_pages simply finds one
+; fewer surface and clamp_page moves off it.
+close_page:
+    push r4                          ; the record for that page
+    mov r4, r0
+    sub r4, 1                        ; page 1 is record 0
+    mov r0, [pagecount]
+    sub r0, 1                        ; surfaces = pages - the console page
+    cmp r4, r0
+    juge .done                       ; the page list moved under us
+    umul r4, WREC_BYTES
+    add r4, wlistbuf
+    add r4, WREC_PID
+    mov r0, [r4]
+    sys_kill r0, SIGTERM
+    .done:
+    pop r4
     ret
 
 
@@ -464,6 +534,48 @@ surface_rect:
     ret
 
 
+; The surface shown on the current page -> r0 = its sid, or -1 on page 0 (the
+; console) or if the page list has moved under us.
+page_sid:
+    mov r0, [page]
+    cmp r0, 0
+    je .none
+    sub r0, 1                        ; page 1 is record 0
+    mov r1, [pagecount]
+    sub r1, 1
+    cmp r0, r1
+    juge .none
+    umul r0, WREC_BYTES
+    add r0, wlistbuf
+    mov r0, [r0]
+    ret
+    .none:
+    mov r0, -1
+    ret
+
+
+; Hold the keyboard only while a window is on screen. On page 0 the grab is dropped
+; so the console gets its keys back and the shell works exactly as it does without
+; a window manager running; on any other page we take the lot and relay it to that
+; window. Left/Right/F1 are grabbed by name throughout, so paging always works.
+sync_grab:
+    push r4                          ; the grab we want
+    mov r4, 0
+    mov r0, [page]
+    cmp r0, 0
+    je .want
+    mov r4, 1
+    .want:
+    mov r0, [lastgrab]
+    cmp r0, r4
+    je .done                         ; already in that state
+    mov [lastgrab], r4
+    sys_keygrab -1, r4
+    .done:
+    pop r4
+    ret
+
+
 ; Keep the selection inside the live page list - the page we were on disappears
 ; when the program owning it exits.
 clamp_page:
@@ -603,7 +715,8 @@ draw_surface:
 
 
 ; The tab bar: one button per page, the current one highlighted, labelled "sh"
-; for the console and "w<n>" for surface page n.
+; for the console and "w<n>" for surface page n, with an "x" on every window tab
+; to close it.
 draw_bar:
     push r4                          ; page index
     push r5                          ; tab left edge
@@ -639,8 +752,7 @@ draw_bar:
         mov [fc], TAB_ON
         .paint:
         call fill_rect
-        mov r1, r5                   ; centre a two-glyph label in the button
-        add r1, 20
+        mov r1, r5                   ; then its label and close button
         mov r2, r4
         call draw_tab_label
         add r4, 1
@@ -651,9 +763,11 @@ draw_bar:
     ret
 
 
-; Draw one tab's label. r1 = left pixel, r2 = page index.
+; Draw what is inside one tab: a two-glyph label - "w<n>" for a window, "sh" for
+; the console - and, on a window tab only, the "x" that closes it. r1 = the tab's
+; left edge, r2 = page index.
 draw_tab_label:
-    push r4                          ; pen x
+    push r4                          ; the tab's left edge
     push r5                          ; page index
     mov r4, r1
     mov r5, r2
@@ -666,26 +780,32 @@ draw_tab_label:
     .on:
     mov [gc], TEXT_ON
     .draw:
+    mov r0, r4
+    add r0, LABEL_X
+    mov [gx], r0
     cmp r5, 0
     je .console
     mov [gch], 119                   ; 'w'
-    mov [gx], r4
     call draw_glyph
     mov r0, r5                       ; the page number, single digit
     add r0, 48
     mov [gch], r0
     mov r0, r4
-    add r0, GW
+    add r0, LABEL_X + GW
+    mov [gx], r0
+    call draw_glyph
+    mov [gch], 120                   ; 'x': tab_hit closes the window on a click
+    mov r0, r4                       ; here. The console tab does not get one.
+    add r0, CLOSE_X
     mov [gx], r0
     call draw_glyph
     jmp .done
     .console:
     mov [gch], 115                   ; 's'
-    mov [gx], r4
     call draw_glyph
     mov [gch], 104                   ; 'h'
     mov r0, r4
-    add r0, GW
+    add r0, LABEL_X + GW
     mov [gx], r0
     call draw_glyph
     .done:
@@ -940,6 +1060,8 @@ page:
     d32 0                            ; the page on screen (0 = console)
 pagecount:
     d32 1                            ; console + live surfaces
+lastgrab:
+    d32 0                            ; 1 while we are holding the whole keyboard
 prevbtn:
     d32 0                            ; last frame's buttons, for press-edge detection
 conrows:

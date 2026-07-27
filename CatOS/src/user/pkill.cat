@@ -1,0 +1,287 @@
+; pkill - signal every process with a given name.
+;
+;   pkill <name>            send SIGTERM (15) to each process called <name>
+;   pkill -<signal> <name>  send that signal number instead, e.g. "pkill -9 spin"
+;
+; A name is the last component of the program's path, exactly as ps prints it, and
+; the match is exact - there is no pattern matching here, which makes it obvious
+; what a given command will hit. Everything it needs is already userland-visible:
+; pslist for the table, getpid to leave itself alone, kill to do the work. The
+; kernel has no idea that killing by name is a thing.
+;
+; It reports each process it signals, because a signal is asynchronous - the
+; target dies at some point after this exits, so without a line here you cannot
+; tell "no such process" from "killed it, and it is still finishing up".
+;
+; Signalling is a request, not a guarantee: SIGTERM's default action terminates,
+; but a process that installed a handler decides for itself, and the kernel
+; refuses the signal outright for the idle process it needs to stay runnable.
+#include "sys.cat"
+
+#define DECBUF, 13                   ; 10 digits, spare, and the terminator
+
+main:
+    mov r5, r1                       ; argc (r5-r7 survive syscalls)
+    mov r6, r2                       ; argv
+    mov r0, SIGTERM                  ; the default, unless argv[1] overrides it
+    mov [signum], r0
+    cmp r5, 2
+    jil .usage
+
+    mov r1, r6                       ; argv[1]
+    add r1, 4
+    mov r1, [r1]
+    mov8 r0, [r1]
+    cmp r0, 45                       ; '-' -> a signal number, name follows it
+    jne .havename
+    add r1, 1
+    call parsedec
+    cmp r0, -1
+    je .usage
+    cmp r0, 1                        ; the kernel's valid range, so a typo is
+    jil .badsig                      ; refused here rather than silently ignored
+    cmp r0, NSIG_MAX
+    jig .badsig
+    mov [signum], r0
+    cmp r5, 3
+    jil .usage
+    mov r1, r6                       ; argv[2] is then the name
+    add r1, 8
+    mov r1, [r1]
+.havename:
+    mov [target], r1
+
+    sys_getpid                       ; pkill is not its own target
+    mov [selfpid], r0
+
+    sys_pslist psbuf, PS_MAX
+    cmp r0, -1
+    je .listfail
+    mov r5, r0                       ; live process count
+    mov r6, psbuf                    ; record cursor
+    mov r7, 0                        ; record index
+    mov r0, 0
+    mov [nmatched], r0               ; processes with the name, and of those the
+    mov [nkilled], r0                ; ones the kernel actually took the signal for
+
+    .scan:
+        cmp r7, r5
+        juge .report
+        mov r0, [r6]                 ; PSREC_PID
+        mov r1, [selfpid]
+        cmp r0, r1
+        je .next
+        mov r1, r6
+        add r1, PSREC_STATE
+        mov r1, [r1]
+        cmp r1, PS_ZOMBIE
+        je .next                     ; already dead, just unreaped
+        mov r1, r6
+        add r1, PSREC_NAME
+        mov r2, [target]
+        call streq
+        cmp r0, 1
+        jne .next
+
+        mov r1, [r6]                 ; matched: signal it and say so
+        mov [victim], r1
+        mov r0, [nmatched]
+        add r0, 1
+        mov [nmatched], r0
+        sys_kill r1, [signum]
+        cmp r0, -1
+        je .refused
+        mov r0, [nkilled]
+        add r0, 1
+        mov [nkilled], r0
+        sys_write 1, msg_sent, msg_sent_end - msg_sent
+        jmp .said
+        .refused:
+        sys_write 1, msg_refused, msg_refused_end - msg_refused
+        .said:
+        mov r1, [victim]
+        call putdec
+        sys_write 1, newline, 1
+        .next:
+        add r6, PSREC_BYTES
+        add r7, 1
+        jmp .scan
+
+    .report:                         ; "nothing was named that" and "it was named
+    mov r0, [nmatched]               ; that but the kernel said no" are different
+    cmp r0, 0                        ; answers, and the second has already had its
+    je .nomatch                      ; say per process
+    mov r0, [nkilled]
+    cmp r0, 0
+    je .refusedall
+    sys_exit 0
+
+.refusedall:
+    sys_exit 1
+
+.nomatch:
+    sys_write 1, msg_none, msg_none_end - msg_none
+    mov r1, [target]
+    call putstr
+    sys_write 1, newline, 1
+    sys_exit 1
+
+.badsig:
+    sys_write 1, msg_badsig, msg_badsig_end - msg_badsig
+    sys_exit 1
+
+.listfail:
+    sys_write 1, msg_listfail, msg_listfail_end - msg_listfail
+    sys_exit 1
+
+.usage:
+    sys_write 1, msg_usage, msg_usage_end - msg_usage
+    sys_exit 1
+
+
+; parsedec(r1) - the null-terminated decimal string at r1 as a value in r0, or -1
+; if it is empty or holds anything but digits. Bounded by the signal range the
+; caller checks, so overflow is not a concern.
+parsedec:
+    push r4                          ; accumulator
+    push r5                          ; digits seen
+    mov r4, 0
+    mov r5, 0
+    .loop:
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .end
+        cmp r0, 48                   ; '0'
+        jul .bad
+        cmp r0, 57                   ; '9'
+        jug .bad
+        sub r0, 48
+        umul r4, 10
+        add r4, r0
+        add r5, 1
+        add r1, 1
+        jmp .loop
+    .end:
+    cmp r5, 0
+    je .bad
+    mov r0, r4
+    jmp .done
+    .bad:
+    mov r0, -1
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; streq(r1, r2) -> r0 = 1 if the null-terminated strings match, else 0.
+streq:
+    push r4
+    push r5
+    mov r4, r1
+    mov r5, r2
+    .cmp:
+        mov8 r0, [r4]
+        mov8 r1, [r5]
+        cmp r0, r1
+        jne .no
+        cmp r0, 0
+        je .yes
+        add r4, 1
+        add r5, 1
+        jmp .cmp
+    .yes:
+    mov r0, 1
+    jmp .done
+    .no:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; putstr(r1) - write a null-terminated string to stdout.
+putstr:
+    push r4                          ; length
+    push r5                          ; string
+    mov r5, r1
+    mov r4, 0
+    .len:
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .write
+        add r4, 1
+        add r1, 1
+        jmp .len
+    .write:
+    sys_write 1, r5, r4
+    pop r5
+    pop r4
+    ret
+
+
+; putdec(r1) - write a value to stdout as decimal. Digits fall out
+; least-significant-first, so they are generated backwards into numbuf.
+putdec:
+    push r4                          ; digit cursor
+    push r5                          ; digit count
+    mov r4, numbuf
+    add r4, DECBUF
+    mov r5, 0
+    .digits:
+        mov r2, 10
+        udiv r1, r2                  ; r1 = quotient, r2 = remainder
+        add r2, 48                   ; '0'
+        sub r4, 1
+        mov8 [r4], r2
+        add r5, 1
+        cmp r1, 0
+        jne .digits
+    mov r3, r4                       ; write(1, digits, count)
+    mov r4, r5
+    mov r2, 1
+    mov r1, SYS_WRITE
+    syscall
+    pop r5
+    pop r4
+    ret
+
+
+msg_usage:
+    dstr "usage: pkill [-signal] <name>\n"
+msg_usage_end:
+msg_badsig:
+    dstr "pkill: signal out of range\n"
+msg_badsig_end:
+msg_listfail:
+    dstr "pkill: cannot read the process table\n"
+msg_listfail_end:
+msg_sent:
+    dstr "pkill: signalled pid "
+msg_sent_end:
+msg_refused:
+    dstr "pkill: refused for pid "
+msg_refused_end:
+msg_none:
+    dstr "pkill: no process named "
+msg_none_end:
+newline:
+    dstr "\n"
+
+signum:
+    res32 1
+target:
+    res32 1
+selfpid:
+    res32 1
+victim:
+    res32 1
+nmatched:
+    res32 1
+nkilled:
+    res32 1
+numbuf:
+    res8 DECBUF
+psbuf:
+    res8 PS_MAX * PSREC_BYTES

@@ -127,10 +127,11 @@ for headless/terminal use.
 | `MBASE`,`MLEN` | user segment window |
 | `USEG_BASE`,`USEG_PAGES` | user segment (for freeing) |
 | `PARENT` | parent PCB |
+| `PPID` | parent's pid, taken at creation — the pointer above can outlive the slot it names, so anything reporting a parent (`ps`) uses this |
 | `EXITCODE` | set on exit, read by `wait` |
 | `WAITCHAN` | what this proc is blocked on (0 = not blocked) |
 | `FDTABLE[N]` | per-process map of small fd → VFS handle index (−1 free) |
-| `NAME` | for `ps`/debugging |
+| `NAME` | program name (its path's last component), stored inline rather than as a pointer so it survives the caller's scratch buffers; `ps` reads it through `SYS_PSLIST` |
 | `NEXT` | ready-queue / list link |
 
 **Per-process resources:** a user segment via `allocpages` (image + data +

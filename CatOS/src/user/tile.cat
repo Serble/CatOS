@@ -4,8 +4,8 @@
 ; nothing in the kernel is specific to one:
 ;
 ;   * desktop.cat pages - one window on screen at a time, a tab bar, arrow keys.
-;     tile.cat shows every window at once in a grid, has no tab bar, and grabs a
-;     different (much smaller) set of keys - just F1.
+;     tile.cat shows every window at once in a grid, has no tab bar, and takes the
+;     keyboard outright.
 ;   * desktop.cat wants a 64x23 console to draw the shell on page 0. tile.cat never
 ;     shows the console, so it passes 0 for the console geometry at gacquire and
 ;     leaves it exactly as it was.
@@ -23,6 +23,21 @@
 ; belong to them, so they carry on running and reappear the next time a window
 ; manager starts.
 ;
+;
+; -- Focus --------------------------------------------------------------------
+;
+; It grabs the whole keyboard (keygrab -1) and gives every key to one window: the
+; last one clicked, drawn with a brighter frame than the rest. That is the entire
+; definition of focus here, and it lives in this program - the kernel only relays
+; what wkeypost tells it to. A manager with a different idea (focus follows the
+; pointer, focus never moves, keys broadcast to everyone) writes those few lines
+; instead and needs nothing else to change.
+;
+; Taking the keyboard also takes it away from the console, but the console is not
+; on screen while this is running, so there was nothing to type at anyway. With no
+; windows at all the grab is dropped, so the invisible shell still hears you and
+; you can start something to tile; and keys go back to it for good on F1.
+;
 ;   $ bg gdemo
 ;   $ bg gdemo
 ;   $ bg tile
@@ -32,7 +47,7 @@
 #define ARENA_BYTES, 1572864         ; framebuffer + a scratch of the same size
 
 #define MAXREC, 8                    ; must match the kernel's MAX_SURF
-#define WREC_BYTES, 24               ; sid, w, h, reqw, reqh, seq
+#define WREC_BYTES, 28               ; sid, w, h, reqw, reqh, seq, pid
 #define WREC_W, 4
 #define WREC_H, 8
 #define WREC_SEQ, 20
@@ -44,7 +59,8 @@
 #define FONT_GLYPHS, 129
 
 #define BG_COLOUR, 0x00161C22        ; behind the tiles
-#define FRAME_ON, 0x003A6EA5         ; 1px frame around each tile
+#define FRAME_ON, 0x005A8FD0         ; 1px frame around the focused tile
+#define FRAME_OFF, 0x00243544        ; ... and around the rest
 #define TEXT_COLOUR, 0x008FA6BC
 #define CURSOR_COLOUR, 0x00FFFFFF
 
@@ -66,12 +82,11 @@ main:
     and r1, 0xFFFF
     mov [scrh], r1
 
-    sys_keygrab KEY_F1, 1            ; the one key we want; the shell keeps the rest
+    sys_keygrab KEY_F1, 1            ; ours whatever else is going on; the rest of
+                                     ; the keyboard is taken only when there is a
+                                     ; window to type into (sync_grab)
 
     .loop:
-        call poll_keys               ; r0 = 1 to quit
-        cmp r0, 1
-        je .quit
         call read_mouse
         sys_wlist wlistbuf, MAXREC
         cmp r0, 0
@@ -80,7 +95,12 @@ main:
         .havecount:
         mov [nwin], r0
         call layout                  ; grant every window its cell
-        call post_input              ; and route the pointer into it
+        call track_focus             ; a click picks the window that types
+        call sync_grab               ; take the keyboard only if one of them can use it
+        call poll_keys               ; r0 = 1 to quit; the rest go to that window
+        cmp r0, 1
+        je .quit
+        call post_input              ; and route the pointer into its tile
         call clear_fb
         call draw_tiles
         call draw_cursor
@@ -96,30 +116,190 @@ main:
         sys_exit 1
 
 
-; Drain the keys we grabbed. F1 is the way out, and it is the only key we take -
-; everything else still reaches the shell reading the (invisible) console.
-; -> r0 = 1 to quit
+; Drain the keyboard. F1 is ours; every other key goes to the focused window. That
+; one branch is the whole of this manager's input policy - the kernel neither knows
+; nor asks what any of these keycodes mean. -> r0 = 1 to quit
 poll_keys:
-    push r4
+    push r4                          ; quit requested
+    push r5                          ; keycode
     mov r4, 0
     .drain:
         sys_gkey
         cmp r0, -1
-        je .done
-        cmp r0, KEY_F1
-        jne .drain
+        je .done                     ; ring empty
+        mov r5, r0
+        cmp r5, KEY_F1
+        jne .send
         mov r4, 1
+        jmp .drain
+        .send:
+        mov r0, [focus]
+        cmp r0, 0
+        jil .drain                   ; no window to type into: drop it
+        sys_wkeypost r0, r5
         jmp .drain
     .done:
     mov r0, r4
+    pop r5
     pop r4
     ret
 
 
-; Refresh the pointer position so the cursor can be drawn. Clicks do nothing here:
-; this window manager has no controls to click, and quitting is F1's job alone.
+; Refresh the pointer position, for the cursor and for click-to-focus.
 read_mouse:
     sys_mouse mousebuf
+    ret
+
+
+; Move focus to the window that was clicked, on the press edge only, and keep it
+; pointing at something real. Focus is held as a sid rather than a list position,
+; because the list shifts as programs come and go.
+track_focus:
+    push r4                          ; buttons this frame
+    mov r0, mousebuf
+    add r0, 8
+    mov r4, [r0]
+    call focus_valid
+    mov r0, r4                       ; bit 0 = left button
+    and r0, 1
+    cmp r0, 0
+    je .store
+    mov r0, [prevbtn]
+    and r0, 1
+    cmp r0, 0
+    jne .store                       ; still held from last frame: not an edge
+    call tile_hit
+    cmp r0, -1
+    je .store                        ; clicked the gap between tiles
+    umul r0, WREC_BYTES
+    add r0, wlistbuf
+    mov r0, [r0]                     ; that tile's sid
+    mov [focus], r0
+    .store:
+    mov [prevbtn], r4
+    pop r4
+    ret
+
+
+; Hold the keyboard only while there is a window to give it to. With nothing to
+; tile, the keys fall through to the console line discipline exactly as they did
+; before this manager started - the shell is invisible but it is still running, and
+; typing "bg gdemo" blind at it is how you get something to tile in the first place.
+sync_grab:
+    push r4                          ; the grab we want
+    mov r4, 0
+    mov r0, [focus]
+    cmp r0, 0
+    jil .want
+    mov r4, 1
+    .want:
+    mov r0, [lastgrab]
+    cmp r0, r4
+    je .done                         ; already in that state
+    mov [lastgrab], r4
+    sys_keygrab -1, r4
+    .done:
+    pop r4
+    ret
+
+
+; If the focused window has gone (its program exited), fall back to the first one,
+; so there is always somewhere for keys to land.
+focus_valid:
+    push r4                          ; index
+    push r5                          ; the sid we think is focused
+    mov r5, [focus]
+    mov r0, [nwin]
+    cmp r0, 0
+    jne .scan
+    mov r0, -1                       ; nothing on screen at all
+    mov [focus], r0
+    jmp .done
+    .scan:
+    mov r4, 0
+    .each:
+        mov r0, [nwin]
+        cmp r4, r0
+        juge .first
+        mov r0, r4
+        umul r0, WREC_BYTES
+        add r0, wlistbuf
+        mov r0, [r0]
+        cmp r0, r5
+        je .done                     ; still there
+        add r4, 1
+        jmp .each
+    .first:
+    mov r0, [wlistbuf]               ; the first window's sid
+    mov [focus], r0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Which tile is the pointer over? -> r0 = its index, or -1. Same cell arithmetic as
+; the layout, because we are the only thing that knows where anything went.
+tile_hit:
+    push r4                          ; index
+    push r5                          ; record
+    push r6                          ; tile origin x
+    push r7                          ; tile origin y
+    mov r4, 0
+    .each:
+        mov r0, [nwin]
+        cmp r4, r0
+        juge .miss
+        mov r5, r4
+        umul r5, WREC_BYTES
+        add r5, wlistbuf
+        mov r0, r4
+        mov r1, [gcols]
+        udiv r0, r1                  ; r0 = row, r1 = column
+        mov r6, r1
+        mov r7, r0
+        mov r0, r6
+        mov r1, [cellw]
+        umul r0, r1
+        add r0, GAP
+        mov r6, r0
+        mov r0, r7
+        mov r1, [cellh]
+        umul r0, r1
+        add r0, GAP
+        mov r7, r0
+        mov r0, [mousebuf]           ; x, local to this tile
+        sub r0, r6
+        cmp r0, 0
+        jil .next
+        mov r1, r5
+        add r1, WREC_W
+        mov r1, [r1]
+        cmp r0, r1
+        juge .next
+        mov r0, mousebuf             ; y, local to this tile
+        add r0, 4
+        mov r0, [r0]
+        sub r0, r7
+        cmp r0, 0
+        jil .next
+        mov r1, r5
+        add r1, WREC_H
+        mov r1, [r1]
+        cmp r0, r1
+        juge .next
+        mov r0, r4
+        jmp .ret
+        .next:
+        add r4, 1
+        jmp .each
+    .miss:
+    mov r0, -1
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
     ret
 
 
@@ -350,6 +530,15 @@ draw_tiles:
         mov r0, [r0]
         mov [bh], r0
 
+        mov r0, [r5]                 ; the focused window wears a brighter frame
+        mov r1, [focus]
+        cmp r0, r1
+        je .focused
+        mov [framec], FRAME_OFF
+        jmp .frame
+        .focused:
+        mov [framec], FRAME_ON
+        .frame:
         call draw_frame              ; frame first, the window covers its inside
 
         mov r0, [r5]                 ; sid
@@ -377,7 +566,7 @@ draw_tiles:
     ret
 
 
-; A one-pixel frame just outside the window rectangle (bx, by, bw, bh).
+; A one-pixel frame just outside the window rectangle (bx, by, bw, bh), in framec.
 draw_frame:
     mov r0, [bx]
     sub r0, 1
@@ -391,7 +580,8 @@ draw_frame:
     mov r0, [bh]
     add r0, 2
     mov [fh], r0
-    mov [fc], FRAME_ON
+    mov r0, [framec]
+    mov [fc], r0
     call fill_rect
     ret
 
@@ -696,6 +886,14 @@ scrh:
     d32 0
 nwin:
     d32 0
+focus:
+    d32 -1                           ; sid of the window that gets the keyboard
+lastgrab:
+    d32 0                            ; 1 while we are holding the whole keyboard
+prevbtn:
+    d32 0                            ; last frame's buttons, for press-edge detection
+framec:
+    d32 0                            ; the colour draw_frame is about to use
 gcols:
     d32 1                            ; the grid
 grows:

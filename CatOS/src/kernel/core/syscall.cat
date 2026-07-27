@@ -75,6 +75,9 @@
 #define SYS_KEYGRAB, 35       ; claim a keycode for the screen owner (display.cat)
 #define SYS_WPOST, 36         ; route the pointer to a surface (surface.cat)
 #define SYS_WINPUT, 37        ; read the pointer over your own surface (surface.cat)
+#define SYS_PSLIST, 38        ; list the live processes (proc.cat)
+#define SYS_WKEYPOST, 39      ; route a key to a surface (surface.cat)
+#define SYS_WKEY, 40          ; take a key posted to your own surface (surface.cat)
 
 
 ; Register the syscall dispatcher. Call once at boot, after intinit.
@@ -166,6 +169,10 @@ syscall_handler:
     je surf_post_h
     cmp r1, SYS_WINPUT
     je surf_input_h
+    cmp r1, SYS_WKEYPOST
+    je surf_keypost_h
+    cmp r1, SYS_WKEY
+    je surf_key_h
     cmp r1, SYS_GKEY
     je input_key_h
     cmp r1, SYS_KEYGRAB
@@ -174,6 +181,8 @@ syscall_handler:
     je sys_conread_h
     cmp r1, SYS_SBRK
     je sys_sbrk_h
+    cmp r1, SYS_PSLIST
+    je sys_pslist_h
     cmp r1, SYS_PRINT
     je .print
     cmp r1, SYS_TEST

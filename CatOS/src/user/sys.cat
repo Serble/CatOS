@@ -47,6 +47,9 @@
 #define SYS_KEYGRAB, 35
 #define SYS_WPOST, 36
 #define SYS_WINPUT, 37
+#define SYS_PSLIST, 38
+#define SYS_WKEYPOST, 39
+#define SYS_WKEY, 40
 
 ; open() modes (bitfield) and seek() whence, matching the kernel VFS
 #define O_READ, 1
@@ -79,6 +82,12 @@
 #macro sys_print, 1
     mov r2, $1
     mov r1, SYS_PRINT
+    syscall
+#endmacro
+
+; getpid() -> the caller's own pid in r0.
+#macro sys_getpid, 0
+    mov r1, SYS_GETPID
     syscall
 #endmacro
 
@@ -206,6 +215,7 @@
 #define SIGSEGV, 11
 #define SIGUSR2, 12
 #define SIGTERM, 15
+#define NSIG_MAX, 15           ; highest signal the kernel accepts (its NSIG - 1)
 
 ; signal(signum, handler) -> previous disposition (or -1). $1 = signal number,
 ; $2 = a handler address, or SIG_DFL / SIG_IGN. A handler is a plain proc that
@@ -223,6 +233,43 @@
     mov r3, $2
     mov r2, $1
     mov r1, SYS_KILL
+    syscall
+#endmacro
+
+; ---- the process table ----
+; Everything a program can know about the other processes on the machine, which is
+; deliberately not much and deliberately not privileged: a pid is not a capability
+; here (kill takes any pid), so listing them grants nothing that guessing would
+; not. It is what makes ps and pkill ordinary programs.
+;
+; One record per live process, in slot order:
+;
+;   +0  pid
+;   +4  parent pid (0 for the processes the kernel starts at boot)
+;   +8  state, one of PS_*
+;   +12 program name, null-terminated within PS_NAME_MAX bytes
+;
+#define PS_NAME_MAX, 16          ; name field size, terminator included
+#define PSREC_BYTES, 28          ; one record (must match the kernel's PSREC_BYTES)
+#define PSREC_PID, 0
+#define PSREC_PPID, 4
+#define PSREC_STATE, 8
+#define PSREC_NAME, 12
+#define PS_MAX, 16               ; records the kernel can ever return (MAX_PROCS)
+; process states, as reported in PSREC_STATE
+#define PS_READY, 1              ; runnable, waiting for the CPU
+#define PS_RUNNING, 2            ; on the CPU (the caller, when it is looking)
+#define PS_BLOCKED, 3            ; waiting on something - console input, wait()
+#define PS_ZOMBIE, 4             ; exited, still holding its slot until reaped
+#define PS_EMBRYO, 5             ; being constructed
+
+; pslist(dst, cap) -> the number of records written, or -1. $1 = buffer,
+; $2 = its capacity in records. A capacity above PS_MAX is clamped, so
+; PS_MAX * PSREC_BYTES is always enough room for everything.
+#macro sys_pslist, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_PSLIST
     syscall
 #endmacro
 
@@ -292,6 +339,12 @@
 ; is delivered to you through gkey instead of to the console line discipline (or
 ; give it back with on = 0). This is how a window manager gets its shortcuts; the
 ; kernel never interprets a keycode, it only compares. $1 = keycode, $2 = 1/0.
+; A keycode of -1 grabs *every* key, which is what a full-screen program that
+; wants the keyboard itself - editor.cat - asks for: the line discipline echoes,
+; buffers whole lines and needs Enter before it hands anything over, so a program
+; that wants raw keys has to take them all. Keycodes then arrive exactly as the
+; keyboard reports them (Raylib codes: letters are uppercase, 256+ are the
+; non-printing keys), not as the ASCII the console would have mapped them to.
 #macro sys_keygrab, 2
     mov r3, $2
     mov r2, $1
@@ -340,12 +393,14 @@
     syscall
 #endmacro
 
-; wlist(dst, cap) -> count, or -1. Write [sid, w, h, reqw, reqh, seq] per live
+; wlist(dst, cap) -> count, or -1. Write [sid, w, h, reqw, reqh, seq, pid] per live
 ; surface, up to cap records: what exists, the size it currently has, the size its
-; program asked for, and a commit counter that changes whenever its pixels do (so
-; an unchanged window need not be fetched at all). $1 = buffer, $2 = capacity in
-; records. Window manager only - the kernel rejects callers that do not hold the
-; screen.
+; program asked for, a commit counter that changes whenever its pixels do (so an
+; unchanged window need not be fetched at all), and the pid of the program that owns
+; it. The pid is what a close button is built out of - there is no "close a window"
+; syscall, so a manager closes one by signalling its program, the same way pkill
+; does. $1 = buffer, $2 = capacity in records. Window manager only - the kernel
+; rejects callers that do not hold the screen.
 #macro sys_wlist, 2
     mov r3, $2
     mov r2, $1
@@ -394,6 +449,30 @@
     mov r3, $2
     mov r2, $1
     mov r1, SYS_WINPUT
+    syscall
+#endmacro
+
+; wkeypost(sid, keycode) -> 0/-1. Hand a surface a key. A keystroke carries no
+; coordinates, so unlike the pointer there is nothing to route it by except focus,
+; and focus is the window manager's decision - it takes the keyboard with
+; keygrab(-1) and posts each key to whichever window it considers focused. The
+; keycode is passed through exactly as the keyboard reported it. $1 = surface id,
+; $2 = keycode. Window manager only.
+#macro sys_wkeypost, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_WKEYPOST
+    syscall
+#endmacro
+
+; wkey(sid) -> the next keycode posted to your window, or -1 if there is none.
+; This is how a windowed program reads the keyboard: reading the console instead
+; would get you echoed, line-buffered text that the shell is already waiting for.
+; Keys arrive as Raylib keycodes (letters uppercase, 256+ for the non-printing
+; keys), not as ASCII - map them yourself. $1 = surface id.
+#macro sys_wkey, 1
+    mov r2, $1
+    mov r1, SYS_WKEY
     syscall
 #endmacro
 

@@ -50,7 +50,10 @@
 #define PCB_PARENT, 40          ; parent PCB, 0 if none
 #define PCB_EXIT, 44            ; exit code (valid once ZOMBIE)
 #define PCB_CHAN, 48            ; blocking channel, 0 if not blocked
-#define PCB_NAME, 52            ; name string pointer
+#define PCB_PPID, 52            ; parent's pid, taken at creation. PCB_PARENT is a
+                                ; pointer and its slot can be recycled under us
+                                ; (nothing reparents orphans), so anything that
+                                ; *reports* a parent - ps - reads this instead
 #define PCB_FDS, 56             ; per-process fd table: MAX_FDS slots, each a
                                 ; VFS handle index or -1 for a free slot
 ; ---- signal state (see signal.cat) ----
@@ -62,7 +65,15 @@
 #define PCB_SIGINFR, 212        ; nonzero while a signal handler is running
 #define PCB_CWD, 216            ; canonical working-directory string, VFS_PATH_MAX
                                 ; bytes (always absolute, no trailing slash but "/")
-#define PCB_STRUCT, 472         ; total PCB size (PCB_CWD + VFS_PATH_MAX == 216 + 256)
+#define PCB_NAME, 472           ; program name, PROC_NAME_MAX bytes stored inline
+                                ; and always terminated. It is a *copy* because a
+                                ; caller's path buffer is scratch that gets reused;
+                                ; a pointer would dangle by the time ps read it
+#define PCB_STRUCT, 488         ; total PCB size (PCB_NAME + PROC_NAME_MAX)
+
+; ---- SYS_PSLIST record: pid, parent pid, state, then the inline name ----
+#define PSREC_BYTES, 28         ; 3 words + PROC_NAME_MAX (keep in sync with
+                                ; user/sys.cat, which declares the same record)
 
 ; ---- interrupt-frame field offsets (from the frame base) ----
 #define FRM_MARKER, 0           ; 1 byte
@@ -85,6 +96,7 @@
 ; ---- configuration ----
 #define MAX_PROCS, 16           ; process table capacity
 #define MAX_FDS, 8              ; open file descriptors per process
+#define PROC_NAME_MAX, 16       ; program name a PCB records, terminator included
 #define PROC_KSTACK_PAGES, 4    ; kernel stack per process (2 KiB; spawn does
                                 ; deep in-kernel work - VFS + CatFS - on it)
 #define USER_STACK_BYTES, 4096  ; user stack reserved above the image
@@ -137,6 +149,45 @@ proc_memzero:
         sub r4, 1
         jmp .loop
     .done:
+    pop r4
+    ret
+
+
+; Copy a null-terminated kernel string into a fixed-size field, truncating to fit,
+; always terminating, and zero-filling whatever is left - so the field is a valid
+; string whatever the caller hands us, and its unused tail never carries the
+; previous occupant of a recycled slot out to a program that copies it wholesale.
+; A null source gives an empty string. Capacity must be at least 1.
+; r1 - source string (kernel address, 0 for none)
+; r2 - destination field
+; r3 - destination capacity in bytes
+proc_copyname:
+    push r4                      ; destination cursor
+    push r5                      ; bytes left in the field
+    mov r4, r2
+    mov r5, r3
+    cmp r1, 0
+    je .pad
+    .loop:
+        cmp r5, 1
+        jule .pad                ; the last byte belongs to the terminator
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .pad
+        mov8 [r4], r0
+        add r1, 1
+        add r4, 1
+        sub r5, 1
+        jmp .loop
+    .pad:
+        cmp r5, 0
+        je .done
+        mov8 [r4], 0
+        add r4, 1
+        sub r5, 1
+        jmp .pad
+    .done:
+    pop r5
     pop r4
     ret
 
@@ -283,10 +334,19 @@ proc_create:
         jne .zregs
 
     ; ---- finalise the PCB ----
-    mov r1, [proc_tmp_name]
-    vstore r4, PCB_NAME, r1, r2
+    mov r1, [proc_tmp_name]      ; take our own copy of the name (a recycled slot
+    mov r2, r4                   ; still holds the previous occupant's, so this
+    add r2, PCB_NAME             ; runs even when there is no name to record)
+    mov r3, PROC_NAME_MAX
+    call proc_copyname
     mov r1, [curproc]
     vstore r4, PCB_PARENT, r1, r2
+    mov r0, 0                    ; the parent's pid, or 0 for the processes the
+    cmp r1, 0                    ; kernel itself starts at boot
+    je .noparent
+    vload r0, r1, PCB_PID
+    .noparent:
+    vstore r4, PCB_PPID, r0, r1
     mov r1, 0
     vstore r4, PCB_EXIT, r1, r2
     vstore r4, PCB_CHAN, r1, r2
@@ -629,6 +689,67 @@ copyoutstr:
     pop r5
     pop r4
     ret
+
+
+; SYS_PSLIST (r2 = dst, r3 = capacity in records): describe the process table to
+; userland - one record of [pid, parent pid, state, name] per slot in use, written
+; in slot order, returning how many were written. That is the whole of what a
+; program can learn about another process, and it is deliberately unprivileged: a
+; pid is not a capability in this kernel (SYS_KILL already takes any pid and scans
+; for it), so being able to see one grants nothing that guessing would not. It is
+; what lets `ps` and `pkill` be ordinary programs instead of kernel features.
+;
+; The name is copied out of the PCB's own inline field, so it is valid regardless
+; of what has happened to the buffer the program was spawned from, and the whole
+; fixed-size field is copied - userland stops at the terminator.
+; Returns the number of records written, or -1 on a bounds fault.
+sys_pslist_h:
+    cmp r3, MAX_PROCS
+    jule .capok                  ; clamp before multiplying: a wild capacity would
+    mov r3, MAX_PROCS            ; overflow the byte count and slip past uaddr
+    .capok:
+    mov r1, r2                   ; user destination
+    mov r2, r3
+    umul r2, PSREC_BYTES
+    call uaddr                   ; r0 = physical base, checked over the whole range
+    cmp r0, 0
+    je .fail
+    mov r7, r0                   ; destination cursor
+    mov r4, 0                    ; records written
+    mov r5, proctable            ; PCB cursor
+    mov r6, 0                    ; slot index
+    .loop:
+        cmp r6, MAX_PROCS
+        juge .done
+        cmp r4, r3               ; hit the caller's capacity?
+        juge .done
+        mov r0, [r5]             ; PCB_STATE
+        cmp r0, PROC_FREE
+        je .next                 ; an unused slot is not a process
+        vload r1, r5, PCB_PID
+        mov [r7], r1
+        add r7, 4
+        vload r1, r5, PCB_PPID
+        mov [r7], r1
+        add r7, 4
+        mov [r7], r0             ; state, as one of PROC_*
+        add r7, 4
+        mov r0, r7               ; name (cpy takes its destination from r0)
+        mov r1, r5
+        add r1, PCB_NAME
+        cpy r1, PROC_NAME_MAX
+        add r7, PROC_NAME_MAX
+        add r4, 1
+        .next:
+        add r5, PCB_STRUCT
+        add r6, 1
+        jmp .loop
+    .done:
+    mov r0, r4
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
 
 
 ; Wake every process blocked on a channel (mark them READY, clear the channel).
