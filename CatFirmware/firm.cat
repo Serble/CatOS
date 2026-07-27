@@ -190,8 +190,10 @@ jumprel jmp, fail
 ; this is the addr that needs to be loaded into disk_handler_it_callback
 disk_ready_callback:
     debug 171
+    push r0
     loadaddr disk_ready
     mov8 [r0], 1  ; set disk ready flag so we can communicate with the main loop
+    pop r0
     iret
 
 part_table:
