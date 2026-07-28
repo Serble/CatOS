@@ -11,7 +11,7 @@
 ;   * display_register(rppu_gfx_ops) - the display device vtable: mode switching,
 ;     present, screen size, and the console vtable for its text mode;
 ;   * console_input_char - keyboard characters into the line discipline, via
-;     input_hotkey first so the screen's owner gets the keys it grabbed;
+;     input_offer_key first so the screen's owner gets the keys it grabbed;
 ;   * pointer_move / pointer_button - pointer state into the display service.
 ;
 ; So a serial terminal, a plain framebuffer or a different PPU can replace any one
@@ -42,16 +42,43 @@
 ;
 ; -- Input: the keyboard ------------------------------------------------------
 ;
-; The keyboard device raises interrupt 0x70 and exposes (eventType, keycode)
-; pairs read with `in`. The ISR drains them, offers each key-down to input_hotkey
-; first, and otherwise maps Raylib keycodes to ASCII and feeds them to the console
-; line discipline.
+; The keyboard device raises interrupt 0x70 and exposes (eventType, keycode) pairs
+; read with `in`, where the type is 1 for a press and 0 for a release. The ISR
+; drains them, turns each into the key event word display.cat describes, offers it
+; to input_offer_key first, and otherwise feeds the character it carries to the
+; console line discipline.
 ;
-; The hotkey check has to happen here, in the ISR, because the line discipline is
-; downstream and would swallow anything the screen's owner wanted. What it does
-; NOT do is decide which keys are special - it just asks. The keycodes in the grab
-; table are ones a window manager passed down, and they are Raylib keycodes only
-; because this is the driver that produced them.
+; The offer has to happen here, in the ISR, because the line discipline is
+; downstream and would swallow anything the screen's owner wanted. What it does NOT
+; do is decide which keys are special - it just asks. The keycodes in the grab table
+; are ones a window manager passed down, and they are Raylib keycodes only because
+; this is the driver that produced them.
+;
+;
+; -- Modifiers, and why they live in the driver -------------------------------
+;
+; A keycode on its own is not a character: SHIFT+2 is '@' on this keyboard and
+; something else on another one, and only a keyboard driver can say which. So this
+; file is the one place that holds two related pieces of knowledge - which keycodes
+; are the modifier keys, and what character each key produces with them held - and
+; it publishes the answer in every event it builds, rather than leaving each program
+; to carry a copy of the layout.
+;
+; Tracking held modifiers needs releases, which is why the ISR now handles both
+; directions rather than only presses. Presses and releases are counted per physical
+; key in rppu_modkeys (the machine has two of each modifier and letting go of one
+; while the other is held must not clear it) and folded to the four KMOD_* bits only
+; when an event is built.
+;
+; What this file does *not* do is decide the shape of a key event. It reports four
+; facts to input_key_pack - keycode, character, modifiers held, press or release -
+; and the kernel assembles the word. So nothing here mentions where a field lives,
+; and a keyboard on entirely different hardware reimplements only this section.
+;
+; A control or alt chord deliberately produces no character at all. Ctrl+C is a
+; command, not text, and this driver has no idea which - so the raw keycode and the
+; modifier bits go to whoever grabbed the key and the line discipline is told
+; nothing, rather than being handed a stray 'c'.
 
 #define GFX_TYPE, 0xFF64BEF9     ; PPU graphics device type
 #define KBD_TYPE, 0x2EB3AD76     ; PPU keyboard device type
@@ -73,6 +100,17 @@
 #define FB_MAPBYTES, 884         ; 34 * 26
 #define FB_PAGES, 69             ; ceil(34868 / 512)
 
+; Raylib keycodes this driver has to recognise by name. The modifier keys run
+; left-hand set then right-hand set, in the same order as the KMOD_* bits, which is
+; what lets rppu_kbd_event turn a keycode into a bit with one shift.
+#define RKEY_ENTER, 257
+#define RKEY_TAB, 258
+#define RKEY_BACKSPACE, 259
+#define RKEY_KPENTER, 335
+#define RKEY_MOD_FIRST, 340      ; left shift, control, alt, super ...
+#define RKEY_MOD_LAST, 347       ; ... then right shift, control, alt, super
+#define RKEY_MOD_SIDE, 4         ; modifier bits per side, for folding the two sets
+
 #define MAP_STRIDE, 34           ; tile-map row stride
 #define TILE_COLS, 32            ; visible columns
 #define TILE_ROWS, 24            ; visible rows
@@ -91,6 +129,9 @@ rppu_mouseport:
     d32 0
 rppu_fb:
     d32 0                        ; framebuffer base (guest physical address)
+rppu_modkeys:
+    d32 0                        ; one bit per physical modifier key currently held,
+                                 ; in RKEY_MOD_FIRST..RKEY_MOD_LAST order
 
 
 
@@ -365,47 +406,146 @@ rppu_kbd_bind:
     ret
 
 
-; Map a Raylib key-down keycode to an ASCII byte, or 0 to ignore it. Raylib's
-; printable keycodes already equal ASCII (uppercase for letters); we fold
-; letters to lower case and translate the few control keys we care about.
-; r1 = keycode -> r0 = ascii (0 = ignore)
+; The character each key produces with SHIFT held, indexed by the key's unshifted
+; character minus 32 - which is what a Raylib printable keycode already is. This
+; table IS the keyboard layout (a US one), and it is the only place in the machine
+; that knows '/' and SHIFT make '?'.
+; Several entries are unreachable - Raylib only ever reports the code of a character
+; some key produces *unshifted*, so nothing arrives as '!' or '@' - and exist only to
+; keep the table dense enough to index with one subtraction. The two entries spelt
+; numerically are quote marks, which the assembler will not take in a string literal.
+rppu_shift_map:
+    dstr " !"                    ;  32..33
+    d8 34, 35, 36, 37, 38        ;  34..38
+    d8 34                        ;  39      apostrophe -> quote
+    dstr "()*+"                  ;  40..43
+    dstr "<_>?"                  ;  44..47   comma -> <   - -> _   . -> >   / -> ?
+    dstr ")!@#$%^&*("            ;  48..57   the digit row
+    dstr "::<+>?@"               ;  58..64   semicolon -> colon   = -> +
+    dstr "ABCDEFGHIJKLMNOPQRSTUVWXYZ"   ;  65..90   letters: shifted is upper case
+    dstr "{|}^_~"                ;  91..96   [ -> {   backslash -> |   ] -> }   ` -> ~
+
+
+; The character a keycode produces with these modifiers held, or 0 for a key that
+; types nothing (the arrows, the function keys, the modifiers themselves, and any
+; chord this driver refuses to call text).
+; r1 = keycode, r2 = KMOD_* mask -> r0 = ascii (0 = types nothing)
 rppu_keymap:
-    cmp r1, 65                   ; 'A'
-    jil .notalpha
-    cmp r1, 90                   ; 'Z'
-    jig .notalpha
-    mov r0, r1                   ; letter -> lower case
+    push r4                      ; keycode
+    push r5                      ; modifiers
+    mov r4, r1
+    mov r5, r2
+    mov r0, r5                   ; a control or alt chord is a command, not text:
+    and r0, KMOD_CTRL + KMOD_ALT ; report no character and leave what it means to
+    cmp r0, 0                    ; whoever grabbed the key
+    jne .none
+    cmp r4, 32                   ; Raylib's printable codes are the unshifted
+    jul .control                 ; characters of the US layout, upper case for
+    cmp r4, 96                   ; letters, so they span ' ' .. '`'
+    jug .control
+    mov r0, r5
+    and r0, KMOD_SHIFT
+    cmp r0, 0
+    jne .shifted
+    cmp r4, 65                   ; 'A': unshifted letters are lower case
+    jul .plain
+    cmp r4, 90
+    jug .plain
+    mov r0, r4
     add r0, 32
-    ret
-    .notalpha:
-    cmp r1, 32                   ; space .. '`' are already ASCII
-    jil .control
-    cmp r1, 96
-    jig .control
-    mov r0, r1
-    ret
+    jmp .ret
+    .plain:
+    mov r0, r4
+    jmp .ret
+    .shifted:
+    mov r0, r4                   ; what the layout says this key makes with SHIFT
+    sub r0, 32
+    add r0, rppu_shift_map
+    mov8 r0, [r0]
+    jmp .ret
     .control:
-    cmp r1, 257                  ; Enter
+    cmp r4, RKEY_ENTER
     je .enter
-    cmp r1, 259                  ; Backspace
+    cmp r4, RKEY_KPENTER
+    je .enter
+    cmp r4, RKEY_BACKSPACE
     je .backspace
-    cmp r1, 258                  ; Tab
+    cmp r4, RKEY_TAB
     je .tab
+    .none:
     mov r0, 0
-    ret
+    jmp .ret
     .enter:
     mov r0, 10
-    ret
+    jmp .ret
     .backspace:
     mov r0, 8
-    ret
+    jmp .ret
     .tab:
     mov r0, 9
+    .ret:
+    pop r5
+    pop r4
     ret
 
 
-; Interrupt 0x70 handler: drain (type, keycode) pairs, feed key-downs to the
-; console. Preempts kernel code, so it saves/restores everything.
+; Fold one key event into the modifier state and describe it the way
+; input_key_pack wants it: the KMOD_* bits now held, plus KEYF_RELEASE and
+; KEYF_MODKEY where they apply. A modifier key updates the held set *before* the
+; state is read back, so its own event reports what it just brought about - pressing
+; SHIFT arrives with KMOD_SHIFT already set, which is what a program watching raw key
+; state expects.
+; r1 = keycode, r2 = 1 for a press / 0 for a release -> r0 = KMOD_* | KEYF_*
+rppu_key_state:
+    push r4                      ; keycode
+    push r5                      ; press / release
+    push r6                      ; the flags being assembled
+    mov r4, r1
+    mov r5, r2
+    mov r6, 0
+    cmp r5, 0
+    jne .ismod
+    mov r6, KEYF_RELEASE
+    .ismod:
+    cmp r4, RKEY_MOD_FIRST       ; is this one of the modifier keys itself?
+    jul .fold
+    cmp r4, RKEY_MOD_LAST
+    jug .fold
+    or r6, KEYF_MODKEY           ; so nothing above has to know these keycodes
+    mov r0, r4                   ; its bit in the held set - the Raylib codes run
+    sub r0, RKEY_MOD_FIRST       ; left-hand set then right-hand set, in KMOD_* order
+    mov r1, 1
+    shl r1, r0
+    mov r0, [rppu_modkeys]
+    cmp r5, 0
+    je .release
+    or r0, r1
+    jmp .storekeys
+    .release:
+    not r1
+    and r0, r1
+    .storekeys:
+    mov [rppu_modkeys], r0
+    .fold:
+    mov r0, [rppu_modkeys]       ; either of a pair counts as that modifier held, so
+    mov r1, r0                   ; letting go of one shift with the other still down
+    shr r1, RKEY_MOD_SIDE        ; leaves KMOD_SHIFT set
+    or r0, r1
+    and r0, KMOD_ALL
+    or r0, r6
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Interrupt 0x70 handler: drain (type, keycode) pairs and turn each into a key
+; event. Preempts kernel code, so it saves/restores everything.
+;
+; Releases are handled as well as presses, because the modifier state depends on
+; them and because a program reading raw keys - a game - needs them. They go only to
+; whoever grabbed the key: the line discipline deals in characters, and a release is
+; not one.
 rppu_kbd_isr:
     int_prologue
     mov r4, [rppu_kbdport]
@@ -415,17 +555,34 @@ rppu_kbd_isr:
         je .done
         mov r5, r0
         in r6, r4                ; keycode (consume it either way)
-        cmp r5, 1                ; only act on key-down
-        jne .drain
-        mov r1, r6               ; a key the screen's owner grabbed goes to it and
-        call input_hotkey        ; never reaches the console
-        cmp r0, 0
-        jne .drain
-        mov r1, r6
+        cmp r5, 1
+        je .event
+        cmp r5, 0
+        jne .drain               ; an event type this driver does not know
+        .event:
+        mov r1, r6               ; what is held, and which way this key went
+        mov r2, r5
+        call rppu_key_state
+        mov r7, r0
+        mov r1, r6               ; what our layout makes of the two together
+        mov r2, r7
+        and r2, KMOD_ALL
         call rppu_keymap
-        cmp r0, 0
-        je .drain
+        push r0                  ; the console wants that character in a moment
+        mov r2, r0
+        mov r1, r6
+        mov r3, r7
+        call input_key_pack      ; the kernel owns the event layout, not us
         mov r1, r0
+        call input_offer_key     ; a key the screen's owner grabbed goes to it and
+        pop r2                   ; never reaches the console
+        cmp r0, 0
+        jne .drain
+        cmp r5, 0
+        je .drain                ; a release is not a character
+        cmp r2, 0
+        je .drain                ; nor is a key that types nothing
+        mov r1, r2
         call console_input_char
         jmp .drain
     .done:

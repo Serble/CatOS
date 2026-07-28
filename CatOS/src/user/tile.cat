@@ -26,12 +26,17 @@
 ;
 ; -- Focus --------------------------------------------------------------------
 ;
-; It grabs the whole keyboard (keygrab -1) and gives every key to one window: the
-; last one clicked, drawn with a brighter frame than the rest. That is the entire
+; It grabs the whole keyboard (keygrab -1) and gives every key event to one window:
+; the last one clicked, drawn with a brighter frame than the rest. That is the entire
 ; definition of focus here, and it lives in this program - the kernel only relays
 ; what wkeypost tells it to. A manager with a different idea (focus follows the
 ; pointer, focus never moves, keys broadcast to everyone) writes those few lines
 ; instead and needs nothing else to change.
+;
+; Events go over whole - keycode, the character it types, the modifiers held, and
+; whether it was pressed or released - so this program never has to know whether a
+; key was text, a chord or a control being held down. Only F1 is read at all, and
+; only as an unmodified press, so SHIFT+F1 reaches the window like anything else.
 ;
 ; Taking the keyboard also takes it away from the console, but the console is not
 ; on screen while this is running, so there was nothing to type at anyway. With no
@@ -116,19 +121,30 @@ main:
         sys_exit 1
 
 
-; Drain the keyboard. F1 is ours; every other key goes to the focused window. That
-; one branch is the whole of this manager's input policy - the kernel neither knows
-; nor asks what any of these keycodes mean. -> r0 = 1 to quit
+; Drain the keyboard. A plain press of F1 is ours; every other event goes to the
+; focused window untouched. That one branch is the whole of this manager's input
+; policy - the kernel neither knows nor asks what any of it means. -> r0 = 1 to quit
 poll_keys:
     push r4                          ; quit requested
-    push r5                          ; keycode
+    push r5                          ; the whole event
+    push r6                          ; its keycode
     mov r4, 0
     .drain:
         sys_gkey
         cmp r0, -1
         je .done                     ; ring empty
         mov r5, r0
-        cmp r5, KEY_F1
+        mov r6, r5
+        kev_code r6
+        cmp r6, KEY_F1
+        jne .send
+        mov r0, r5                   ; ours only as an unmodified press; the release
+        and r0, KEV_UP               ; and SHIFT+F1 are the window's
+        cmp r0, 0
+        jne .send
+        mov r0, r5
+        kev_mods r0
+        cmp r0, 0
         jne .send
         mov r4, 1
         jmp .drain
@@ -140,6 +156,7 @@ poll_keys:
         jmp .drain
     .done:
     mov r0, r4
+    pop r6
     pop r5
     pop r4
     ret

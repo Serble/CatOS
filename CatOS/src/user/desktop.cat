@@ -32,15 +32,20 @@
 ; keyboard ISR diverts them to the window manager while the screen is owned, and
 ; we drain them with gkey.
 ;
+; Only an *unmodified* press of one is ours, which is the whole reason the kernel
+; hands over modifier bits rather than deciding for us: SHIFT+Left is not paging, it
+; is a selection, so it goes to the window like any other key and the editor on that
+; page extends its selection with it.
+;
 ; Where every *other* key goes depends on which page you are looking at, and that
 ; is the one input decision this program makes:
 ;
 ;   page 0        nothing is grabbed, so keys fall through to the console line
 ;                 discipline exactly as they always did - which is what makes
 ;                 page 0 a working shell.
-;   pages 1..n    the whole keyboard is grabbed (keygrab -1) and each key is handed
-;                 to that page's window with wkeypost, so a program with a window
-;                 can be typed into. editor.cat is the one that needs this.
+;   pages 1..n    the whole keyboard is grabbed (keygrab -1) and each event is handed
+;                 to that page's window with wkeypost, whole and uninterpreted, so a
+;                 program with a window can be typed into. editor.cat needs this.
 ;
 ; The grab is turned on and off as the page changes, which is the entire focus
 ; policy: the window you are looking at is the window you are typing into.
@@ -168,31 +173,45 @@ read_pages:
     ret
 
 
-; Drain the keys the ISR diverted to us. Left/Right step one page and stop at the
-; ends rather than wrapping; F1 asks to quit. Anything else belongs to the window
-; on the current page, if there is one. -> r0 = 1 if F1 was pressed.
+; Drain the key events the ISR diverted to us. An unmodified press of Left/Right
+; steps one page and stops at the ends rather than wrapping; F1 asks to quit.
+; Everything else - modified presses, and every release - belongs to the window on
+; the current page, if there is one, and goes over untouched.
+; -> r0 = 1 if F1 was pressed.
 handle_keys:
-    push r4                          ; keycode
-    push r5                          ; quit requested
-    mov r5, 0
+    push r4                          ; the whole event, which is what a window wants
+    push r5                          ; its keycode, which is what we match on
+    push r6                          ; quit requested
+    mov r6, 0
     .drain:
         sys_gkey
         cmp r0, -1
         je .done                     ; ring empty
         mov r4, r0
-        cmp r4, KEY_F1
+        mov r5, r4
+        kev_code r5
+        mov r0, r4                   ; a release is nobody's shortcut
+        and r0, KEV_UP
+        cmp r0, 0
+        jne .toclient
+        mov r0, r4                   ; nor is a modified press: SHIFT+Left belongs to
+        kev_mods r0                  ; the window, so an editor can select with it
+        cmp r0, 0
+        jne .toclient
+        cmp r5, KEY_F1
         je .wantquit
-        cmp r4, KEY_LEFT
+        cmp r5, KEY_LEFT
         je .left
-        cmp r4, KEY_RIGHT
+        cmp r5, KEY_RIGHT
         je .right
+        .toclient:
         call page_sid                ; not ours: it belongs to the window on show
         cmp r0, -1
         je .drain                    ; page 0, or nothing there - drop it
         sys_wkeypost r0, r4
         jmp .drain
         .wantquit:
-        mov r5, 1
+        mov r6, 1
         jmp .drain
         .left:
         mov r0, [page]
@@ -210,7 +229,8 @@ handle_keys:
         mov [page], r0
         jmp .drain
     .done:
-    mov r0, r5
+    mov r0, r6
+    pop r6
     pop r5
     pop r4
     ret

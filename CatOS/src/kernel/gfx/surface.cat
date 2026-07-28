@@ -53,14 +53,16 @@
 ; window it decides is focused. Each surface has a small ring of them, drained by
 ; its owner:
 ;
-;   wm:   wkeypost(sid, keycode)        for whichever window it calls focused
-;   app:  wkey(sid)                     -> the next keycode, or -1
+;   wm:   wkeypost(sid, event)          for whichever window it calls focused
+;   app:  wkey(sid)                     -> the next event, or -1
 ;
-; A keycode is exactly what the keyboard reported (Raylib codes: letters uppercase,
-; 256+ for the non-printing keys), because a manager relaying keys should not have
-; to understand them and the kernel maps nothing on this path. Keys posted to a
-; window nobody is draining are dropped once the ring fills, which is the right
-; failure: a stalled program cannot make the manager block.
+; An event is the word display.cat builds: the raw keycode, the character it makes
+; under the modifiers that were held, those modifiers, and whether this was a press
+; or a release. All of it is passed straight through, because a manager relaying keys
+; should not have to understand them - it hands over what the keyboard did and lets
+; the window decide whether it is text, a shortcut or a control being held down.
+; Events posted to a window nobody is draining are dropped once the ring fills, which
+; is the right failure: a stalled program cannot make the manager block.
 ;
 ;
 ; -- Pixels ---------------------------------------------------------------------
@@ -94,10 +96,12 @@
 #define SURF_KHEAD, 52               ; key ring: drained by the owner (wkey)
 #define SURF_KTAIL, 56               ; filled by the window manager (wkeypost)
 #define SURF_KRING, 60
-#define SURF_KEYS, 16                ; keys one window can have waiting: enough to
-                                     ; cover a burst of typing across a slow frame,
-                                     ; since a client only drains once per redraw
-#define SURF_STRUCT, 124             ; SURF_KRING + SURF_KEYS * 4
+#define SURF_KEYS, 32                ; key events one window can have waiting: enough
+                                     ; to cover a burst of typing across a slow frame,
+                                     ; since a client only drains once per redraw -
+                                     ; and one typed capital is four events, because
+                                     ; presses and releases both come through here
+#define SURF_STRUCT, 188             ; SURF_KRING + SURF_KEYS * 4
 
 ; wlist record handed to the window manager: sid, w, h, reqw, reqh, seq, pid
 ; (7 words). The owner's pid is in there because closing a window is a window
@@ -434,7 +438,7 @@ surf_input_h:
     jmp sysret
 
 
-; SYS_WKEYPOST (r2 = sid, r3 = keycode): the window manager gives a surface a key.
+; SYS_WKEYPOST (r2 = sid, r3 = key event): the window manager gives a surface a key.
 ; Restricted to whoever holds the screen, because deciding which window a keystroke
 ; belongs to *is* focus, and there is only one process doing that. Single-producer
 ; (the manager) / single-consumer (the owner), so the producer only moves the tail
@@ -463,7 +467,7 @@ surf_keypost_h:
     vload r0, r6, SURF_KHEAD
     cmp r5, r0
     je .ok                           ; would collide with the reader -> drop it
-    mov r0, r4                       ; ring[tail] = keycode
+    mov r0, r4                       ; ring[tail] = the event
     umul r0, 4
     add r0, SURF_KRING
     add r0, r6
@@ -477,11 +481,11 @@ surf_keypost_h:
     jmp sysret
 
 
-; SYS_WKEY (r2 = sid): the owner takes the next key posted to its window, or -1 if
-; there is none. Polling this is how a windowed program reads the keyboard - it
+; SYS_WKEY (r2 = sid): the owner takes the next key event posted to its window, or -1
+; if there is none. Polling this is how a windowed program reads the keyboard - it
 ; cannot read the console, which is line-buffered, echoed and owned by the shell.
-; Returns the keycode, or -1 on an empty ring / bad id / not the owner (a program
-; that is not the owner simply never sees keys, which is the same as none).
+; Returns the event, or -1 on an empty ring / bad id / not the owner (a program that
+; is not the owner simply never sees keys, which is the same as none).
 surf_key_h:
     cmp r2, MAX_SURF
     juge .none
@@ -503,7 +507,7 @@ surf_key_h:
     umul r0, 4
     add r0, SURF_KRING
     add r0, r6
-    mov r5, [r0]                     ; the keycode to hand back
+    mov r5, [r0]                     ; the event to hand back
     add r4, 1
     cmp r4, SURF_KEYS
     jul .nowrap

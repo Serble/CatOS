@@ -1,13 +1,19 @@
-; pkill - signal every process with a given name.
+; pkill - signal processes chosen by name or by pid.
 ;
-;   pkill <name>            send SIGTERM (15) to each process called <name>
-;   pkill -<signal> <name>  send that signal number instead, e.g. "pkill -9 spin"
+;   pkill <name>              send SIGTERM (15) to each process called <name>
+;   pkill <pid>               send SIGTERM to just that one process
+;   pkill -<signal> <target>  send that signal number instead, e.g. "pkill -9 spin"
 ;
-; A name is the last component of the program's path, exactly as ps prints it, and
-; the match is exact - there is no pattern matching here, which makes it obvious
-; what a given command will hit. Everything it needs is already userland-visible:
-; pslist for the table, getpid to leave itself alone, kill to do the work. The
-; kernel has no idea that killing by name is a thing.
+; The target is a pid if it is all digits and a name otherwise, which is why a
+; name is the last component of the program's path exactly as ps prints it and
+; never a path - no argument can be read both ways. The name match is exact,
+; there is no pattern matching here, so it is obvious what a given command will
+; hit; a pid match is exact by construction and hits at most one process.
+;
+; Everything it needs is already userland-visible: pslist for the table, getpid
+; to leave itself alone, kill to do the work. The kernel has no idea that killing
+; by name is a thing, and killing by pid is only spelled differently here than in
+; kill because it takes the same "did anything happen" reporting path.
 ;
 ; It reports each process it signals, because a signal is asynchronous - the
 ; target dies at some point after this exits, so without a line here you cannot
@@ -32,8 +38,8 @@ main:
     add r1, 4
     mov r1, [r1]
     mov8 r0, [r1]
-    cmp r0, 45                       ; '-' -> a signal number, name follows it
-    jne .havename
+    cmp r0, 45                       ; '-' -> a signal number, target follows it
+    jne .havetarget
     add r1, 1
     call parsedec
     cmp r0, -1
@@ -45,11 +51,14 @@ main:
     mov [signum], r0
     cmp r5, 3
     jil .usage
-    mov r1, r6                       ; argv[2] is then the name
+    mov r1, r6                       ; argv[2] is then the target
     add r1, 8
     mov r1, [r1]
-.havename:
-    mov [target], r1
+.havetarget:
+    mov [target], r1                 ; kept whichever way it reads, since the
+    call parsedec                    ; "not found" line echoes it back verbatim
+    mov [targetpid], r0              ; -1 for anything that is not all digits,
+                                     ; which is the flag for "match on the name"
 
     sys_getpid                       ; pkill is not its own target
     mov [selfpid], r0
@@ -61,8 +70,8 @@ main:
     mov r6, psbuf                    ; record cursor
     mov r7, 0                        ; record index
     mov r0, 0
-    mov [nmatched], r0               ; processes with the name, and of those the
-    mov [nkilled], r0                ; ones the kernel actually took the signal for
+    mov [nmatched], r0               ; processes hit by the target, and of those
+    mov [nkilled], r0                ; the ones the kernel took the signal for
 
     .scan:
         cmp r7, r5
@@ -76,6 +85,14 @@ main:
         mov r1, [r1]
         cmp r1, PS_ZOMBIE
         je .next                     ; already dead, just unreaped
+        mov r1, [targetpid]
+        cmp r1, -1
+        je .byname
+        mov r0, [r6]                 ; by pid: at most one record can match, but
+        cmp r0, r1                   ; the scan runs on regardless - the table is
+        jne .next                    ; 16 records, so an early exit buys nothing
+        jmp .matched
+        .byname:
         mov r1, r6
         add r1, PSREC_NAME
         mov r2, [target]
@@ -83,7 +100,8 @@ main:
         cmp r0, 1
         jne .next
 
-        mov r1, [r6]                 ; matched: signal it and say so
+        .matched:
+        mov r1, [r6]                 ; signal it and say so
         mov [victim], r1
         mov r0, [nmatched]
         add r0, 1
@@ -107,10 +125,10 @@ main:
         add r7, 1
         jmp .scan
 
-    .report:                         ; "nothing was named that" and "it was named
-    mov r0, [nmatched]               ; that but the kernel said no" are different
-    cmp r0, 0                        ; answers, and the second has already had its
-    je .nomatch                      ; say per process
+    .report:                         ; "nothing matched" and "something did but the
+    mov r0, [nmatched]               ; kernel said no" are different answers, and
+    cmp r0, 0                        ; the second has already had its say per
+    je .nomatch                      ; process
     mov r0, [nkilled]
     cmp r0, 0
     je .refusedall
@@ -140,8 +158,10 @@ main:
 
 
 ; parsedec(r1) - the null-terminated decimal string at r1 as a value in r0, or -1
-; if it is empty or holds anything but digits. Bounded by the signal range the
-; caller checks, so overflow is not a concern.
+; if it is empty or holds anything but digits. Doubles as the "is this a pid or a
+; name" test, so the -1 has to mean "not a number" and not "0" - it does, since a
+; digit string never produces one. An absurdly long digit string wraps rather than
+; erroring, which then simply matches no pid.
 parsedec:
     push r4                          ; accumulator
     push r5                          ; digits seen
@@ -249,7 +269,7 @@ putdec:
 
 
 msg_usage:
-    dstr "usage: pkill [-signal] <name>\n"
+    dstr "usage: pkill [-signal] <name|pid>\n"
 msg_usage_end:
 msg_badsig:
     dstr "pkill: signal out of range\n"
@@ -264,7 +284,7 @@ msg_refused:
     dstr "pkill: refused for pid "
 msg_refused_end:
 msg_none:
-    dstr "pkill: no process named "
+    dstr "pkill: no process matching "
 msg_none_end:
 newline:
     dstr "\n"
@@ -272,6 +292,8 @@ newline:
 signum:
     res32 1
 target:
+    res32 1
+targetpid:
     res32 1
 selfpid:
     res32 1

@@ -35,11 +35,12 @@
 ;
 ;   * pointer state, which input backends push in through pointer_move /
 ;     pointer_button and the manager reads with SYS_MOUSE;
-;   * grabbed keys. A keyboard driver asks input_hotkey about every key-down before
-;     handing it to the console line discipline. If the screen's owner has grabbed
-;     that keycode it is queued for them instead. The kernel never interprets a
-;     keycode - it only compares - so which keys mean what is entirely the window
-;     manager's business, and the same table works for any keyboard.
+;   * grabbed keys. A keyboard driver offers every key event - press and release -
+;     to input_offer_key before handing it to the console line discipline. If the
+;     screen's owner has grabbed that keycode it is queued for them instead. The
+;     kernel never interprets a keycode - it only compares - so which keys mean
+;     what is entirely the window manager's business, and the same table works for
+;     any keyboard.
 ;
 ;     A grab of keycode -1 means "all of them", which is the only way a full-screen
 ;     program that is not a shell - an editor, a game - can read the keyboard at
@@ -48,6 +49,69 @@
 ;     still interprets nothing; it is one flag instead of a table scan, and the
 ;     owner asked for it. While it is set the console sees no keys, so whatever was
 ;     reading the console simply waits until the screen is handed back.
+;
+;
+; -- What a key event is ------------------------------------------------------
+;
+; One word, built by the keyboard driver, describing one thing the keyboard did:
+;
+;   bits  0..15   the keycode, exactly as the keyboard reported it
+;   bits 16..23   the character it produces, or 0 if it produces none
+;   bits 24..27   the modifiers held when it happened (KMOD_*)
+;   bit  28       this key IS a modifier - shift, control, alt or super
+;   bit  31       set on a release, clear on a press
+;
+; Both of those views are needed and neither can be worked out from the other up
+; here. A game wants the *key*: the raw code, and the release as well as the press,
+; so it can keep its own picture of what is currently held down. A program that is
+; being typed into wants the *character* - and SHIFT+2 is not a keycode, it is the
+; layout's answer to a keycode plus a modifier, which only the keyboard driver
+; knows. So the driver answers it once, in the one place that can, instead of every
+; program carrying its own copy of a keyboard layout.
+;
+; That is not the kernel deciding what a key means. It decides nothing about which
+; keys are shortcuts, which window is focused, or what any character is for; it
+; reports what the hardware did and which character the hardware's layout says that
+; is, and routing it remains entirely the window manager's business.
+;
+; The keycode occupies the low bits alone, so an unmodified press is numerically
+; equal to the bare keycode and a consumer that only cares about those can go on
+; comparing against one. A release, or a press with a modifier held, compares
+; unequal to every bare keycode - so such a consumer ignores it rather than
+; misreading it, which is why adding releases to this path broke nothing.
+;
+; Modifier state can only be tracked somewhere that sees releases, which is the
+; driver. Nothing else has to know that SHIFT is keycode 340 or 344 - not this file,
+; and not a program: KEV_MODKEY says "that was a modifier key" so an editor can
+; ignore one without naming it, and the keycodes stay the driver's business.
+;
+; A keyboard driver does not assemble any of this itself. It reports four facts to
+; input_key_pack - the keycode, the character its layout makes of it, the modifiers
+; held, and whether this was a press or a release - and gets the word back. So the
+; layout of these bits is written down exactly once, and a second keyboard driver
+; needs to know only its own hardware and the KMOD_* / KEYF_* vocabulary below.
+;
+; The KEV_* and KMOD_* values are the userland ABI and must stay in sync with the
+; list in user/sys.cat. KEYF_* is the driver-facing side and stays in the kernel.
+
+#define KEV_CODE_MASK, 0xFFFF    ; bits 0..15: the keycode on its own
+#define KEV_CHAR_SHIFT, 16       ; bits 16..23: the character, 0 = types nothing
+#define KEV_CHAR_MASK, 0xFF
+#define KEV_MOD_SHIFT, 24        ; bits 24..27: modifiers held at that moment
+#define KEV_MOD_MASK, 0xF
+#define KEV_MODKEY, 0x10000000   ; bit 28: this key is itself a modifier
+#define KEV_UP, 0x80000000       ; bit 31: this was a release, not a press
+
+#define KMOD_SHIFT, 1
+#define KMOD_CTRL, 2
+#define KMOD_ALT, 4
+#define KMOD_SUPER, 8
+#define KMOD_ALL, 15             ; every modifier bit, for masking them out of r3
+
+; The rest of r3 in an input_key_pack call: what happened, as opposed to what was
+; held. Kept above the KMOD_* bits so a driver can `or` them into one register.
+#define KEYF_RELEASE, 0x100      ; the key came up rather than going down
+#define KEYF_MODKEY, 0x200       ; the key is one of the modifiers itself
 
 #define GDEV_LINEAR, 0
 #define GDEV_TEXT, 4
@@ -59,9 +123,11 @@
 #define GDEV_H, 28
 
 #define MAX_GRAB, 8              ; keycodes the screen owner may hold at once
-#define INPUT_KEYS, 32           ; queued grabbed keys. A window manager holding the
+#define INPUT_KEYS, 64           ; queued grabbed keys. A window manager holding the
                                  ; whole keyboard drains this once per composited
-                                 ; frame, so it has to hold a burst of typing.
+                                 ; frame, so it has to hold a burst of typing - and
+                                 ; one typed capital is four events: shift down, key
+                                 ; down, key up, shift up.
 
 ; ---- state ----
 display_dev:
@@ -433,7 +499,43 @@ input_reset:
     ret
 
 
-; Queue a keycode for the screen owner, dropping it if the ring is full. r1 = keycode
+; Build a key event word out of the four things a keyboard driver knows about one
+; keystroke. This is the only routine that knows where the fields sit, so a driver
+; describes what its hardware did and never touches the layout - which is what keeps
+; a second keyboard driver down to its own device and its own key table.
+; r1 = keycode, r2 = the character it produces (0 for none),
+; r3 = the KMOD_* modifiers held, or-ed with any KEYF_* flags
+; -> r0 = the key event word
+input_key_pack:
+    push r4                          ; the word being assembled
+    mov r4, r1
+    and r4, KEV_CODE_MASK
+    and r2, KEV_CHAR_MASK
+    shl r2, KEV_CHAR_SHIFT
+    or r4, r2
+    mov r0, r3
+    and r0, KMOD_ALL
+    shl r0, KEV_MOD_SHIFT
+    or r4, r0
+    mov r0, r3
+    and r0, KEYF_MODKEY
+    cmp r0, 0
+    je .press
+    or r4, KEV_MODKEY
+    .press:
+    mov r0, r3
+    and r0, KEYF_RELEASE
+    cmp r0, 0
+    je .done
+    or r4, KEV_UP
+    .done:
+    mov r0, r4
+    pop r4
+    ret
+
+
+; Queue a key event for the screen owner, dropping it if the ring is full.
+; r1 = key event word
 input_key_push:
     mov r0, [input_keytail]
     mov r2, r0
@@ -454,13 +556,22 @@ input_key_push:
     ret
 
 
-; Called by a keyboard driver for every key-down, before the key is handed to the
-; console. If the screen's owner has grabbed this keycode, queue it for them and
-; report the key consumed so the console never sees it.
-; r1 = keycode -> r0 = 1 if consumed
-input_hotkey:
+; Called by a keyboard driver for every key event, press or release, before the key
+; is handed to the console. If the screen's owner has grabbed this keycode, queue
+; the whole event for them and report it consumed so the console never sees it.
+;
+; Matching is on the keycode alone, so a grab covers that key's release and its
+; shifted form as well as the bare press. That is deliberate: whether SHIFT+LEFT
+; ought to mean something different from LEFT is a question for the window manager,
+; which has the modifier bits in the event, and answering it here would be the
+; kernel having an opinion about what a key means.
+; r1 = key event word -> r0 = 1 if consumed
+input_offer_key:
     push r4                          ; index
     push r5                          ; grab count
+    push r6                          ; the keycode on its own
+    mov r6, r1
+    and r6, KEV_CODE_MASK
     mov r0, [gfx_owned]
     cmp r0, 0
     je .no                           ; plain text console: an ordinary key
@@ -476,24 +587,26 @@ input_hotkey:
         umul r0, 4
         add r0, input_grabs
         mov r0, [r0]
-        cmp r0, r1
+        cmp r0, r6
         je .take
         add r4, 1
         jmp .scan
     .take:
-    call input_key_push
+    call input_key_push              ; r1 is still the whole event
     mov r0, 1
+    pop r6
     pop r5
     pop r4
     ret
     .no:
     mov r0, 0
+    pop r6
     pop r5
     pop r4
     ret
 
 
-; SYS_GKEY: take the next queued grabbed keycode, or -1 if the ring is empty.
+; SYS_GKEY: take the next queued grabbed key event, or -1 if the ring is empty.
 input_key_h:
     mov r0, [input_keyhead]
     mov r1, [input_keytail]
@@ -502,7 +615,7 @@ input_key_h:
     mov r1, r0
     umul r1, 4
     add r1, input_keyring
-    mov r2, [r1]                     ; the keycode to hand back
+    mov r2, [r1]                     ; the event to hand back
     add r0, 1
     cmp r0, INPUT_KEYS
     jul .nowrap

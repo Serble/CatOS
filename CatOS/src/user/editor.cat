@@ -28,10 +28,17 @@
 ; window that is remains entirely the manager's business: tile.cat gives the keys
 ; to the last window clicked, desktop.cat to the page you are looking at.
 ;
-; Keycodes arrive exactly as the keyboard reported them (Raylib codes) rather than
-; as the ASCII the console would have mapped them to, so the folding of letters to
-; lower case happens here. There is no shift state anywhere in this machine - the
-; driver only ever sees key-down - so text is lower case, the same as the shell.
+; Each one arrives as the key event word sys.cat describes, and this program is the
+; worked example of why it carries two views of the same keystroke. Text comes from
+; the character field: the keyboard driver already knows that SHIFT+2 is '@' on this
+; layout, and an editor has no business owning a second copy of that table. Keys that
+; are not text - the arrows, Backspace, F2 - are matched on the raw keycode, because
+; they have no character to be. And the modifier field turns the same arrow into two
+; commands: SHIFT+Left extends a selection where Left just moves.
+;
+; Releases are ignored here. They exist for programs that need to know what is being
+; *held* - a game, not an editor - and they are easy to ignore precisely because a
+; release compares equal to no keycode at all.
 ;
 ;
 ; -- The buffer ---------------------------------------------------------------
@@ -52,12 +59,14 @@
 ; -- Keys ---------------------------------------------------------------------
 ;
 ;   printable      insert (replacing the selection, if there is one)
+;   SHIFT+key      the capital or the other character on that key
 ;   Enter / Tab    newline / four spaces
 ;   Backspace      delete the selection, or the character before the cursor
 ;   Delete         delete the selection, or the character under the cursor
 ;   arrows         move; up/down keep the column you were aiming for
 ;   Home / End     start / end of line
 ;   PgUp / PgDn    a screenful
+;   SHIFT+any move extend the selection instead of dropping it
 ;   F2             save
 ;   ESC            quit (twice, if there are unsaved changes)
 ;
@@ -79,7 +88,8 @@
 #define FONT_GLYPHS, 129
 #define TABSTOP, 4                   ; Tab inserts this many spaces
 
-; Raylib keycodes. Everything from 32..96 is already ASCII; these are the rest.
+; Raylib keycodes. Only the keys that produce no character need naming - anything
+; that types something comes through as the event's character field instead.
 #define KEY_ESCAPE, 256
 #define KEY_ENTER, 257
 #define KEY_TAB, 258
@@ -655,14 +665,17 @@ delete_fwd:
 ; ==========================
 ;   Moving about
 ; ==========================
-; Moving drops the selection (there is no shift state to extend one with) and, for
-; the horizontal moves, re-aims the goal column.
+; Every movement ends in one of these two, and they are where SHIFT turns moving into
+; selecting. The modifiers of the event being handled, and the cursor as it stood
+; before that event, are both recorded once by handle_keys, so no movement below has
+; to know that selections exist: with SHIFT held the anchor is planted where the
+; movement started and stays put while further moves drag the far end, and without it
+; the selection is dropped exactly as it always was.
+;
+; The horizontal moves also re-aim the goal column that up and down follow.
 
 after_move:
-    mov r0, 1
-    mov [dirty], r0
-    mov r0, -1
-    mov [anchor], r0
+    call after_vmove
     call set_goal
     ret
 
@@ -670,8 +683,20 @@ after_move:
 after_vmove:
     mov r0, 1
     mov [dirty], r0
+    mov r0, [kmods]
+    and r0, KMOD_SHIFT
+    cmp r0, 0
+    je .drop
+    mov r0, [anchor]                 ; already extending: the far end stays where it
+    cmp r0, 0                        ; was planted, however many moves ago
+    jige .done
+    mov r0, [precur]
+    mov [anchor], r0
+    jmp .done
+    .drop:
     mov r0, -1
     mov [anchor], r0
+    .done:
     ret
 
 
@@ -852,18 +877,39 @@ clamp_scroll:
 ;   Input
 ; ==========================
 
-; Drain the keys the window manager has given us. We only ever see them while it
-; considers us focused, and anything not recognised below is simply dropped.
-; -> r0 = 1 if the editor should quit.
+; Drain the key events the window manager has given us. We only ever see them while
+; it considers us focused, and anything not recognised below is simply dropped.
+;
+; Each event is taken apart once: the keycode for the keys that are commands, the
+; character for the keys that are text, and the modifiers - stashed in kmods, with
+; the cursor's position in precur - for the movements, which read them through
+; after_move. -> r0 = 1 if the editor should quit.
 handle_keys:
     push r4                          ; keycode
     push r5                          ; quit requested
+    push r6                          ; the character this key types, 0 if none
     mov r5, 0
     .drain:
         sys_wkey [sid]
         cmp r0, -1
         je .done                     ; nothing waiting for us
         mov r4, r0
+        mov r1, r4
+        and r1, KEV_UP
+        cmp r1, 0
+        jne .drain                   ; a release: we act on presses
+        mov r6, r4
+        kev_char r6
+        mov r1, r4
+        kev_mods r1
+        mov [kmods], r1
+        mov r1, r4                   ; a modifier on its own is not a keystroke: its
+        and r1, KEV_MODKEY           ; state is already in every event that matters,
+        cmp r1, 0                    ; and letting it through would cancel the quit
+        jne .drain                   ; confirmation below. Which keycodes those are
+        kev_code r4                  ; stays the keyboard driver's business
+        mov r0, [cur]                ; where a movement would be starting from
+        mov [precur], r0
         cmp r4, KEY_ESCAPE
         je .escape
         mov r0, 0                    ; any other key answers "no" to the quit
@@ -896,17 +942,9 @@ handle_keys:
         je .pgup
         cmp r4, KEY_PAGEDOWN
         je .pgdn
-        cmp r4, 32                   ; the printable range is already ASCII
-        jul .drain
-        cmp r4, 96
-        jug .drain
-        mov r1, r4
-        cmp r1, 65
-        jul .insert
-        cmp r1, 90
-        jug .insert
-        add r1, 32                   ; no shift state exists: fold to lower case
-        .insert:
+        cmp r6, 0                    ; not a command: if the key types something, the
+        je .drain                    ; driver has already told us what, shift and all
+        mov r1, r6
         call insert_char
         jmp .drain
 
@@ -978,6 +1016,7 @@ handle_keys:
         jmp .drain
     .done:
     mov r0, r5
+    pop r6
     pop r5
     pop r4
     ret
@@ -1733,6 +1772,10 @@ anchor:
     d32 -1                           ; the other end of the selection, -1 = none
 goalcol:
     d32 0                            ; the column up/down are aiming for
+kmods:
+    d32 0                            ; modifiers on the key being handled, and where
+precur:
+    d32 0                            ; the cursor was before it: what SHIFT+move needs
 curline:
     d32 0                            ; where the cursor is, from measure
 curcol:

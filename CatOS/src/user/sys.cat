@@ -335,16 +335,77 @@
     syscall
 #endmacro
 
-; keygrab(keycode, on) -> 0/-1. While you hold the screen, claim a keycode so it
-; is delivered to you through gkey instead of to the console line discipline (or
-; give it back with on = 0). This is how a window manager gets its shortcuts; the
+; ---- key events -------------------------------------------------------------
+; Everything that reads the keyboard without going through the console - a window
+; manager (gkey) and a windowed program (wkey) - gets one word per thing the
+; keyboard did. It carries both ways of looking at a keystroke, because programs
+; genuinely need both and neither can be derived from the other out here:
+;
+;   bits  0..15   KEV_CODE_MASK   the keycode, exactly as the keyboard reported it
+;   bits 16..23   KEV_CHAR_*      the character it produces, or 0 if none
+;   bits 24..27   KEV_MOD_*       the modifiers held at that moment (KMOD_*)
+;   bit  28       KEV_MODKEY      this key IS a modifier (shift, control, alt, super)
+;   bit  31       KEV_UP          set on a release, clear on a press
+;
+; A game wants the *key*: the raw code, and releases as well as presses, so it can
+; keep its own picture of what is held down right now. A program being typed into
+; wants the *character* - and SHIFT+2 is not a keycode, it is the keyboard layout's
+; answer to a keycode plus a modifier. Only the keyboard driver knows the layout, so
+; it answers that once and every program is spared its own copy of one.
+;
+; The keycode sits alone in the low bits, so an unmodified press is numerically equal
+; to the bare keycode: code that only cares about those can still compare against
+; one, and a release or a modified press compares unequal to every keycode rather
+; than being mistaken for a different one.
+;
+; KEV_MODKEY exists so that a program which wants to skip "somebody pressed shift"
+; does not have to know what keycode shift is - that stays with the keyboard driver,
+; along with the layout. Nothing out here should ever name a modifier keycode.
+;
+; Keep these in sync with the KEV_* / KMOD_* list in the kernel's gfx/display.cat.
+#define KEV_CODE_MASK, 0xFFFF
+#define KEV_CHAR_SHIFT, 16
+#define KEV_CHAR_MASK, 0xFF
+#define KEV_MOD_SHIFT, 24
+#define KEV_MOD_MASK, 0xF
+#define KEV_MODKEY, 0x10000000
+#define KEV_UP, 0x80000000
+#define KMOD_SHIFT, 1
+#define KMOD_CTRL, 2
+#define KMOD_ALT, 4
+#define KMOD_SUPER, 8
+
+; Reduce a key event held in a register to one of its fields, in place, so reading
+; one is a line rather than three. $1 = a register holding an event.
+;   kev_code r4    -> the keycode alone
+;   kev_char r4    -> the character it types, or 0
+;   kev_mods r4    -> the KMOD_* mask
+; For the direction, test the release bit yourself: `and r0, KEV_UP`.
+#macro kev_code, 1
+    and $1, KEV_CODE_MASK
+#endmacro
+
+#macro kev_char, 1
+    shr $1, KEV_CHAR_SHIFT
+    and $1, KEV_CHAR_MASK
+#endmacro
+
+#macro kev_mods, 1
+    shr $1, KEV_MOD_SHIFT
+    and $1, KEV_MOD_MASK
+#endmacro
+
+; keygrab(keycode, on) -> 0/-1. While you hold the screen, claim a keycode so its
+; events are delivered to you through gkey instead of to the console line discipline
+; (or give it back with on = 0). This is how a window manager gets its shortcuts; the
 ; kernel never interprets a keycode, it only compares. $1 = keycode, $2 = 1/0.
-; A keycode of -1 grabs *every* key, which is what a full-screen program that
-; wants the keyboard itself - editor.cat - asks for: the line discipline echoes,
-; buffers whole lines and needs Enter before it hands anything over, so a program
-; that wants raw keys has to take them all. Keycodes then arrive exactly as the
-; keyboard reports them (Raylib codes: letters are uppercase, 256+ are the
-; non-printing keys), not as the ASCII the console would have mapped them to.
+; A grab covers that key's release and its shifted form too - whether SHIFT+LEFT
+; means something other than LEFT is your decision, made from the modifier bits in
+; the event, not the kernel's.
+; A keycode of -1 grabs *every* key, which is what a full-screen program that wants
+; the keyboard itself asks for: the line discipline echoes, buffers whole lines and
+; needs Enter before it hands anything over, so a program that wants raw keys has to
+; take them all.
 #macro sys_keygrab, 2
     mov r3, $2
     mov r2, $1
@@ -452,12 +513,12 @@
     syscall
 #endmacro
 
-; wkeypost(sid, keycode) -> 0/-1. Hand a surface a key. A keystroke carries no
+; wkeypost(sid, event) -> 0/-1. Hand a surface a key. A keystroke carries no
 ; coordinates, so unlike the pointer there is nothing to route it by except focus,
 ; and focus is the window manager's decision - it takes the keyboard with
-; keygrab(-1) and posts each key to whichever window it considers focused. The
-; keycode is passed through exactly as the keyboard reported it. $1 = surface id,
-; $2 = keycode. Window manager only.
+; keygrab(-1) and posts each key to whichever window it considers focused. Pass the
+; event on whole: what a window makes of a release, or of a modifier, is its
+; business, not yours. $1 = surface id, $2 = the event from gkey. Window manager only.
 #macro sys_wkeypost, 2
     mov r3, $2
     mov r2, $1
@@ -465,11 +526,12 @@
     syscall
 #endmacro
 
-; wkey(sid) -> the next keycode posted to your window, or -1 if there is none.
+; wkey(sid) -> the next key event posted to your window, or -1 if there is none.
 ; This is how a windowed program reads the keyboard: reading the console instead
 ; would get you echoed, line-buffered text that the shell is already waiting for.
-; Keys arrive as Raylib keycodes (letters uppercase, 256+ for the non-printing
-; keys), not as ASCII - map them yourself. $1 = surface id.
+; Take it apart with kev_code / kev_char / kev_mods above - typing wants the
+; character, a shortcut or a held-down control wants the keycode and the release
+; bit. $1 = surface id.
 #macro sys_wkey, 1
     mov r2, $1
     mov r1, SYS_WKEY
@@ -487,9 +549,9 @@
     syscall
 #endmacro
 
-; gkey() -> the next queued page-switch keycode, or -1 if none. The keyboard ISR
-; routes the desktop's page keys here instead of to the console line discipline,
-; so the compositor sees them and the shell never does. Compositor only.
+; gkey() -> the next queued key event, or -1 if none. The keyboard ISR routes every
+; key you grabbed here instead of to the console line discipline, so you see them and
+; the shell never does. Compositor only; see the key event layout above.
 #macro sys_gkey, 0
     mov r1, SYS_GKEY
     syscall
