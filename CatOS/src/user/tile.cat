@@ -4,11 +4,9 @@
 ; nothing in the kernel is specific to one:
 ;
 ;   * desktop.cat pages - one window on screen at a time, a tab bar, arrow keys.
-;     tile.cat shows every window at once in a grid, has no tab bar, and takes the
-;     keyboard outright.
-;   * desktop.cat wants a 64x23 console to draw the shell on page 0. tile.cat never
-;     shows the console, so it passes 0 for the console geometry at gacquire and
-;     leaves it exactly as it was.
+;     tile.cat shows every window at once in a grid and has no tab bar.
+;   * desktop.cat gives the keyboard to the page you are looking at. tile.cat gives
+;     it to the last window clicked.
 ;   * desktop.cat accepts whatever size a program asked for and centres it.
 ;     tile.cat overrides every window's size with wresize, so each one is reshaped
 ;     to fit its cell and redraws itself at that size.
@@ -46,7 +44,29 @@
 ;   $ bg gdemo
 ;   $ bg gdemo
 ;   $ bg tile
-#include "sys.cat"
+;
+;
+; -- The launcher -------------------------------------------------------------
+;
+; CTRL+` opens a box that filters the applications in /apps as you type: Up/Down
+; choose, Enter starts the selected one in the background. CTRL+SHIFT+` opens the
+; same box as a raw command line, which is what it always used to be. Both answer
+; the chicken-and-egg above - this manager never draws the console, so without them
+; the only way to start a program is to quit, type at a shell you cannot see, and
+; start over - and the application list answers the harder half of it: what there
+; is to start at all, which "type the name of the binary" never told anybody.
+;
+; Pressing the chord you are already in closes the box; pressing the other one keeps
+; what you have typed and changes what it means. The line editing, the /apps list and
+; the spawn are in launch.cat, shared with desktop.cat; what is here is the policy -
+; which keys, that the prompt takes every other key while it is up, and where the box
+; and its list go.
+;
+; The backquote is grabbed for the whole session rather than only while we hold the
+; keyboard, because the case that needs it most is the one where we deliberately do
+; not: no windows, nothing tiled, no way in. And a manager that spawns must reap, or
+; sixteen launches from now nothing can start at all - see launch_reap.
+#include "lib/sys.cat"
 
 #define MAXFB, 786432                ; 512 * 384 * 4 - the largest screen we handle
 #define ARENA_BYTES, 1572864         ; framebuffer + a scratch of the same size
@@ -58,6 +78,12 @@
 #define WREC_SEQ, 20
 
 #define KEY_F1, 290                  ; quit back to the raw text console
+#define KEY_GRAVE, 96                ; with CTRL: the command prompt
+#define KEY_DOWN, 264                ; the launcher's selection; not grabbed by name,
+#define KEY_UP, 265                  ; they arrive because the prompt takes every key
+#define KEY_ESCAPE, 256
+#define KEY_ENTER, 257
+#define KEY_BACKSPACE, 259
 #define GAP, 4                       ; gutter around each tile
 #define GW, 8                        ; glyph size, for the "no windows" message
 #define GH, 16
@@ -68,6 +94,19 @@
 #define FRAME_OFF, 0x00243544        ; ... and around the rest
 #define TEXT_COLOUR, 0x008FA6BC
 #define CURSOR_COLOUR, 0x00FFFFFF
+#define PROMPT_BG, 0x00101820        ; the command prompt: box, its edge when the
+#define PROMPT_EDGE, 0x005A8FD0      ; last line ran, and its edge when it did not
+#define PROMPT_BAD, 0x00C05040
+#define PROMPT_TEXT, 0x00E8F0F5
+#define PROMPT_H, 28                 ; box height: one glyph plus a margin
+#define PROMPT_PAD, 6                ; (PROMPT_H - GH) / 2, the margin itself
+#define PROMPT_INSET, 32             ; gap to the screen edge either side
+#define PROMPT_SEL, 0x00243F55       ; the selected match's row
+#define LIST_ROWS, 5                 ; matches on screen at once
+#define LIST_ROW_H, 18               ; GH plus a little air
+#define LIST_DESC_X, 104             ; PROMPT_PAD + 12 glyphs: the name column's width
+#define LIST_LIFT, 90                ; how far above centre the box sits once a list
+                                     ; hangs under it: (LIST_ROWS * LIST_ROW_H) / 2
 
 main:
     sys_sbrk ARENA_BYTES
@@ -88,11 +127,18 @@ main:
     mov [scrh], r1
 
     sys_keygrab KEY_F1, 1            ; ours whatever else is going on; the rest of
-                                     ; the keyboard is taken only when there is a
-                                     ; window to type into (sync_grab)
+    sys_keygrab KEY_GRAVE, 1         ; the keyboard is taken only when there is a
+                                     ; window to type into, or the prompt is up
+                                     ; (sync_grab)
+    sys_getpid                       ; so launch_reap knows whose children to bury
+    mov [selfpid], r0
+    call launch_apps_init            ; read /apps once: it changes when something is
+                                     ; installed, not while we are compositing
 
     .loop:
-        call read_mouse
+        mov r1, [selfpid]
+        call launch_reap             ; free the slot of anything we started that has
+        call read_mouse              ; since exited, before it fills the table
         sys_wlist wlistbuf, MAXREC
         cmp r0, 0
         jige .havecount
@@ -108,6 +154,7 @@ main:
         call post_input              ; and route the pointer into its tile
         call clear_fb
         call draw_tiles
+        call draw_prompt             ; over the tiles, under the pointer
         call draw_cursor
         sys_gpresent
         sys_yield
@@ -121,9 +168,11 @@ main:
         sys_exit 1
 
 
-; Drain the keyboard. A plain press of F1 is ours; every other event goes to the
-; focused window untouched. That one branch is the whole of this manager's input
-; policy - the kernel neither knows nor asks what any of it means. -> r0 = 1 to quit
+; Drain the keyboard. CTRL+` toggles the command prompt and, while that is up, the
+; prompt takes everything; otherwise a plain press of F1 is ours and every other
+; event goes to the focused window untouched. That is the whole of this manager's
+; input policy - the kernel neither knows nor asks what any of it means.
+; -> r0 = 1 to quit
 poll_keys:
     push r4                          ; quit requested
     push r5                          ; the whole event
@@ -136,6 +185,34 @@ poll_keys:
         mov r5, r0
         mov r6, r5
         kev_code r6
+
+        cmp r6, KEY_GRAVE            ; CTRL+` in and out of the launcher, on the
+        jne .notgrave                ; press edge, whoever else has the keyboard
+        mov r0, r5
+        and r0, KEV_UP
+        cmp r0, 0
+        jne .drain
+        mov r0, r5
+        kev_mods r0
+        mov r1, r0
+        and r0, KMOD_CTRL
+        cmp r0, 0
+        je .notgrave                 ; a bare backquote is just a character
+        and r1, KMOD_SHIFT           ; SHIFT is what asks for the raw command line
+        cmp r1, 0
+        je .wantapps
+        mov r1, LMODE_RAW
+        jmp .gotmode
+        .wantapps:
+        mov r1, LMODE_APPS
+        .gotmode:
+        call toggle_prompt
+        jmp .drain
+        .notgrave:
+        mov r0, [promptup]           ; while it is up it is the only thing typed at,
+        cmp r0, 0                    ; F1 included - ESCAPE is the way out
+        jne .toprompt
+
         cmp r6, KEY_F1
         jne .send
         mov r0, r5                   ; ours only as an unmodified press; the release
@@ -154,12 +231,95 @@ poll_keys:
         jil .drain                   ; no window to type into: drop it
         sys_wkeypost r0, r5
         jmp .drain
+
+        .toprompt:                   ; the prompt's own line editing
+        mov r0, r5
+        and r0, KEV_UP
+        cmp r0, 0
+        jne .drain                   ; releases are nothing to type
+        cmp r6, KEY_ENTER
+        je .runit
+        cmp r6, KEY_ESCAPE
+        je .cancel
+        cmp r6, KEY_BACKSPACE
+        je .rubout
+        cmp r6, KEY_UP
+        je .selup
+        cmp r6, KEY_DOWN
+        je .seldown
+        mov r1, r5                   ; anything else: the character it makes, which
+        kev_char r1                  ; is 0 for the keys that make none
+        call launch_putc
+        jmp .edited
+        .rubout:
+        call launch_erase
+        .edited:
+        mov r0, 0                    ; editing clears a failure from the last run
+        mov [promptbad], r0
+        jmp .drain
+        .selup:
+        mov r1, -1                   ; moving the selection is not editing, so a
+        call launch_move             ; failed run stays reported
+        jmp .drain
+        .seldown:
+        mov r1, 1
+        call launch_move
+        jmp .drain
+        .runit:
+        call launch_commit
+        cmp r0, -1
+        je .badcmd
+        call close_prompt            ; started: get out of the way
+        jmp .drain
+        .badcmd:
+        mov r0, 1                    ; no such command - stay up, in red, so the
+        mov [promptbad], r0          ; typo can be fixed rather than retyped
+        jmp .drain
+        .cancel:
+        call close_prompt
+        jmp .drain
     .done:
     mov r0, r4
     pop r6
     pop r5
     pop r4
     ret
+
+
+; Open, close, or switch the mode of the prompt box. r1 = the LMODE_* the chord just
+; asked for: the same one we are already in closes the box, the other one switches to
+; it and keeps the line.
+;
+; Opening takes the keyboard immediately rather than waiting for the next sync_grab,
+; because for that one frame the console would otherwise still be reading - and the
+; first thing typed at a prompt that has just opened would land in the invisible
+; shell instead.
+toggle_prompt:
+    mov r0, [promptup]
+    cmp r0, 0
+    je open_prompt
+    mov r0, [launch_mode]
+    cmp r0, r1
+    je close_prompt
+    call launch_setmode              ; the other chord: change what the line means
+    mov r0, 0
+    mov [promptbad], r0
+    ret
+open_prompt:
+    call launch_open                 ; r1 = the mode it opens in
+    mov r0, 0
+    mov [promptbad], r0
+    mov r0, 1
+    mov [promptup], r0
+    call sync_grab
+    ret
+
+close_prompt:
+    mov r0, 0
+    mov [promptup], r0
+    mov [promptbad], r0
+    call sync_grab                   ; and the keyboard goes back to wherever
+    ret                              ; sync_grab thinks it belongs
 
 
 ; Refresh the pointer position, for the cursor and for click-to-focus.
@@ -180,11 +340,13 @@ track_focus:
     mov r0, r4                       ; bit 0 = left button
     and r0, 1
     cmp r0, 0
-    je .store
+    je .release
     mov r0, [prevbtn]
     and r0, 1
     cmp r0, 0
     jne .store                       ; still held from last frame: not an edge
+    mov r0, 1                        ; a press begins here; post_input works out
+    mov [presstart], r0              ; which window, if any, it belongs to
     call tile_hit
     cmp r0, -1
     je .store                        ; clicked the gap between tiles
@@ -196,20 +358,30 @@ track_focus:
     mov [prevbtn], r4
     pop r4
     ret
+    .release:
+    mov r0, 0                        ; the button is up, so the grab ends with it
+    mov [grabbed], r0
+    jmp .store
 
 
-; Hold the keyboard only while there is a window to give it to. With nothing to
-; tile, the keys fall through to the console line discipline exactly as they did
-; before this manager started - the shell is invisible but it is still running, and
-; typing "bg gdemo" blind at it is how you get something to tile in the first place.
+; Hold the keyboard only while there is something up here to give it to: a window,
+; or the command prompt. Otherwise the keys fall through to the console line
+; discipline exactly as they did before this manager started - the shell is
+; invisible but it is still running, and typing at it blind used to be the only way
+; to get something to tile at all. CTRL+` is grabbed on its own either way, so the
+; prompt can be opened out of that state.
 sync_grab:
     push r4                          ; the grab we want
     mov r4, 0
+    mov r0, [promptup]
+    cmp r0, 0
+    jne .want
     mov r0, [focus]
     cmp r0, 0
-    jil .want
-    mov r4, 1
+    jil .have
     .want:
+    mov r4, 1
+    .have:
     mov r0, [lastgrab]
     cmp r0, r4
     je .done                         ; already in that state
@@ -422,6 +594,18 @@ layout:
 ; Hand the pointer to whichever tile it is over, in that window's own coordinates,
 ; and tell the rest they do not have it. We are the only thing that knows where the
 ; tiles are, so we do the hit-testing.
+;
+; A press belongs to the tile it started on, and to no other, for as long as it is
+; held. That rule has to live here because we are the only thing that knows where
+; the pointer was when the button went down: a client sees only a level, and turns
+; it into a click by noticing it was 0 last frame and is 1 now. A tile that was not
+; being pointed at has a remembered 0, so a button that arrives already down - by
+; the window under it closing, or simply by being dragged across from a neighbour -
+; would read as a fresh press on it. Withholding the button until the next press
+; keeps every client honest without any of them needing to know about it.
+;
+; The owner is claimed below rather than at the press edge so that it is decided by
+; the very test that gates the buttons, and the two cannot drift apart.
 post_input:
     push r4                          ; index
     push r5                          ; record
@@ -480,6 +664,23 @@ post_input:
         mov r3, [r3]
         cmp r1, r3
         juge .send
+        mov r3, [presstart]          ; the pointer really is on this tile, so a press
+        cmp r3, 0                    ; starting this frame is this tile's press
+        je .owner
+        mov r3, [r5]
+        mov [grabsid], r3
+        mov r3, 1
+        mov [grabbed], r3
+        mov r3, 0
+        mov [presstart], r3
+        .owner:
+        mov r3, [grabbed]            ; a button that went down somewhere else stays
+        cmp r3, 0                    ; somewhere else's for as long as it is held
+        je .send
+        mov r3, [grabsid]
+        mov r1, [r5]
+        cmp r3, r1
+        jne .send
         mov r1, mousebuf
         add r1, 8
         mov r1, [r1]
@@ -490,6 +691,8 @@ post_input:
         add r4, 1
         jmp .each
     .done:
+    mov r0, 0                        ; a press that began in the gap between tiles
+    mov [presstart], r0              ; belongs to no window at all
     pop r7
     pop r6
     pop r5
@@ -638,6 +841,213 @@ draw_text:
         add r4, 1
         jmp .each
     .done:
+    pop r5
+    pop r4
+    ret
+
+
+; The command prompt: a box across the middle of the screen holding what has been
+; typed so far. Drawn after the tiles so it sits over them - it is a mode this
+; manager is in, not another window, and nothing it covers can be typed at anyway.
+; A run that found no such program turns the edge red and leaves the line alone, so
+; a mistyped name is corrected rather than retyped.
+draw_prompt:
+    push r4                          ; pen x
+    push r5                          ; box left
+    push r6                          ; box top
+    push r7                          ; cursor into the line
+    mov r0, [promptup]
+    cmp r0, 0
+    je .done
+    mov r5, PROMPT_INSET
+    mov r6, [scrh]                   ; centred down the screen, lifted by half the
+    sub r6, PROMPT_H                 ; match list so the two together are what is
+    shr r6, 1                        ; centred rather than the box alone
+    mov r0, [launch_nmatch]
+    cmp r0, 0
+    je .placed
+    sub r6, LIST_LIFT
+    .placed:
+    mov [promptx], r5                ; where draw_matches picks up
+    mov [prompty], r6
+
+    mov r0, r5                       ; the edge, as a rectangle one pixel larger all
+    sub r0, 1                        ; round with the box painted inside it
+    mov [fx], r0
+    mov r0, r6
+    sub r0, 1
+    mov [fy], r0
+    mov r0, [scrw]
+    sub r0, PROMPT_INSET
+    sub r0, PROMPT_INSET
+    add r0, 2
+    mov [fw], r0
+    mov [fh], PROMPT_H + 2
+    mov r0, [promptbad]
+    cmp r0, 0
+    je .edgeok
+    mov [fc], PROMPT_BAD
+    jmp .edge
+    .edgeok:
+    mov [fc], PROMPT_EDGE
+    .edge:
+    call fill_rect
+
+    mov [fx], r5
+    mov [fy], r6
+    mov r0, [scrw]
+    sub r0, PROMPT_INSET
+    sub r0, PROMPT_INSET
+    mov [fw], r0
+    mov [fh], PROMPT_H
+    mov [fc], PROMPT_BG
+    call fill_rect
+
+    mov r0, r6                       ; one glyph row, centred in the box
+    add r0, PROMPT_PAD
+    mov [gy], r0
+    mov [gc], PROMPT_TEXT
+    mov r4, r5
+    add r4, PROMPT_PAD
+    mov r0, 62                       ; '>' for a command line, ':' for a search, so
+    mov r1, [launch_mode]            ; which mode the box is in is legible without
+    cmp r1, LMODE_RAW                ; having to remember which chord was pressed
+    je .prefix
+    mov r0, 58
+    .prefix:
+    mov [gch], r0                    ; the prefix, a space, then the line
+    mov [gx], r4
+    call draw_glyph
+    add r4, GW
+    add r4, GW
+    mov r7, launch_line
+    .each:
+        mov8 r0, [r7]
+        cmp r0, 0
+        je .caret
+        mov [gch], r0
+        mov [gx], r4
+        call draw_glyph
+        add r4, GW
+        add r7, 1
+        jmp .each
+    .caret:
+    mov [fx], r4                     ; a solid block where the next one would go
+    mov r0, r6
+    add r0, PROMPT_PAD
+    mov [fy], r0
+    mov [fw], GW
+    mov [fh], GH
+    mov [fc], PROMPT_TEXT
+    call fill_rect
+    call draw_matches
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; The match list, under the box: one row per application the line matched, the
+; selected one on a highlight bar, name then description. Nothing at all in raw
+; mode, where there are no matches by definition, and nothing when a search found
+; none - an empty list under an empty box says "no such application" plainly enough.
+draw_matches:
+    push r4                          ; row on screen
+    push r5                          ; the match it shows
+    push r6                          ; that row's top edge
+    push r7                          ; the string being drawn
+    mov r1, LIST_ROWS
+    call launch_first
+    mov r5, r0
+    mov r4, 0
+    .rows:
+        cmp r4, LIST_ROWS
+        juge .done
+        mov r0, [launch_nmatch]
+        cmp r5, r0
+        juge .done                   ; ran out of matches before running out of room
+        mov r6, r4
+        umul r6, LIST_ROW_H
+        mov r0, [prompty]
+        add r6, r0
+        add r6, PROMPT_H + 2
+
+        mov r0, [launch_sel]         ; the selected row gets a bar behind it
+        cmp r0, r5
+        jne .text
+        mov r0, [promptx]
+        mov [fx], r0
+        mov [fy], r6
+        mov r0, [scrw]
+        sub r0, PROMPT_INSET
+        sub r0, PROMPT_INSET
+        mov [fw], r0
+        mov [fh], LIST_ROW_H
+        mov [fc], PROMPT_SEL
+        call fill_rect
+
+        .text:
+        mov r0, r6
+        add r0, 1
+        mov [gy], r0
+        mov [gc], PROMPT_TEXT
+        mov r1, r5
+        call launch_match_name
+        mov r7, r0
+        mov r1, r7
+        mov r2, [promptx]
+        add r2, PROMPT_PAD
+        mov r3, 12
+        call draw_clipped
+        mov [gc], TEXT_COLOUR        ; the description, dimmer, in its own column
+        mov r1, r5
+        call launch_match_desc
+        mov r7, r0
+        cmp r7, 0
+        je .next
+        mov r1, r7
+        mov r2, [promptx]
+        add r2, LIST_DESC_X
+        mov r3, 44
+        call draw_clipped
+        .next:
+        add r4, 1
+        add r5, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Draw at most r3 glyphs of the string at r1, starting at x = r2, on the row and in
+; the colour already set in gy/gc.
+draw_clipped:
+    push r4                          ; read cursor
+    push r5                          ; pen x
+    push r6                          ; glyphs left
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    .each:
+        cmp r6, 0
+        jile .done
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .done
+        mov [gch], r0
+        mov [gx], r5
+        call draw_glyph
+        add r5, GW
+        add r4, 1
+        sub r6, 1
+        jmp .each
+    .done:
+    pop r6
     pop r5
     pop r4
     ret
@@ -907,8 +1317,24 @@ focus:
     d32 -1                           ; sid of the window that gets the keyboard
 lastgrab:
     d32 0                            ; 1 while we are holding the whole keyboard
+selfpid:
+    d32 0                            ; our own pid, for launch_reap
+promptx:
+    d32 0                            ; where draw_prompt put the box, so the match
+prompty:
+    d32 0                            ; list under it lands in the same place
+promptup:
+    d32 0                            ; 1 while the command prompt is open
+promptbad:
+    d32 0                            ; 1 when the last line named nothing runnable
 prevbtn:
     d32 0                            ; last frame's buttons, for press-edge detection
+presstart:
+    d32 0                            ; a press began this frame, owner not yet known
+grabbed:
+    d32 0                            ; a press is in progress and a window owns it
+grabsid:
+    d32 0                            ; which one - only meaningful while grabbed
 framec:
     d32 0                            ; the colour draw_frame is about to use
 gcols:
@@ -955,3 +1381,5 @@ gc:
     d32 0
 gsrc:
     d32 0
+
+#include "lib/launch.cat"

@@ -1,0 +1,175 @@
+; hello - the reference loadable driver, for the VM's HelloWorld device.
+;
+; The HelloWorld device (type 0xC0D370A1, attached with `-d HelloWorld`) is the
+; simplest hardware there is: every word written to its port is printed on the
+; launcher's stdout as "Hello World: <word>", and every read of its port returns
+; 5. This driver puts each one the scan finds on /dev/helloN:
+;
+;   * writing to /dev/helloN sends each byte to the device, one `out` per byte;
+;   * reading /dev/helloN gives one line, the word the device answers with,
+;     then end of file - so `cat /dev/hello0` prints "5".
+;
+; It is built like a program (catasm hello.cat -o hello) and installed into
+; /drivers, where the kernel finds it at boot because its descriptor names the
+; HelloWorld type and a HelloWorld device is attached that nothing else took.
+; `drvload /drivers/hello` loads it by hand. Everything a driver can do is in
+; lib/drvabi.cat; this one uses the entries that matter for a device that does
+; not interrupt: init, bind and op.
+#include "lib/drv.cat"
+
+#define HELLO_TYPE, 0xC0D370A1       ; the HelloWorld device's type id
+#define HELLO_MAXUNITS, 4
+#define HELLO_XLEN, 256              ; transfer buffer: the most one op moves
+#define HELLO_STACK, 512
+#define HELLO_XBUF, hello_end        ; the transfer buffer sits just past the image,
+                                     ; in memory the loader zeroes rather than bytes
+                                     ; the file has to carry
+
+
+; ---- the descriptor: must be the very first thing in the image ----
+    d32 DRV_MAGIC
+    d32 DRV_ABI_VERSION
+    d32 hello_end + HELLO_XLEN + HELLO_STACK  ; memory: image, buffer, then stack
+    d32 hello_init
+    d32 hello_bind
+    d32 hello_op
+    d32 0                            ; no irq entry: this device never interrupts
+    d32 HELLO_XBUF
+    d32 HELLO_XLEN
+    d32 1                            ; it binds one device type ...
+    d32 HELLO_TYPE                   ; ... this one
+    d32 0
+    d32 0
+    d32 0
+    drv_name "hello\0"
+
+
+; init() -> 0. Runs once, when the driver is loaded and before any bind.
+hello_init:
+    drv_log msg_loaded
+    mov r0, 0
+    ret
+
+
+; bind(r1 = port, r2 = unit) -> 0 if we took the device. Called for each
+; HelloWorld device nobody has claimed; unit counts them from 0. The unit doubles
+; as the node's cookie, so an op knows which device it is for.
+hello_bind:
+    cmp r2, HELLO_MAXUNITS
+    juge .refuse
+    mov r0, r2                       ; remember the unit's port
+    shl r0, 2
+    add r0, hello_ports
+    mov [r0], r1
+    mov r0, r2                       ; name it "hello<unit>"
+    add r0, 48                       ; '0'
+    mov8 [hello_unitch], r0
+    drv_publish hello_nodename, r2
+    cmp r0, 0
+    jne .refuse
+    mov r0, 0
+    ret
+    .refuse:
+    mov r0, -1
+    ret
+
+
+; op(r1 = cookie, r2 = DOP_*, r3 = position, r4 = length) -> bytes, or -1.
+; The bytes of a write are already in the transfer buffer; a read leaves its
+; bytes there for the kernel to copy out. Length is never more than HELLO_XLEN.
+hello_op:
+    push r4                          ; length
+    push r5                          ; the unit's port
+    push r6                          ; byte index
+    mov r5, r1
+    shl r5, 2
+    add r5, hello_ports
+    mov r5, [r5]
+    cmp r2, DOP_WRITE
+    je .write
+    cmp r2, DOP_READ
+    je .read
+    mov r0, -1
+    jmp .done
+
+    .write:                          ; one `out` per byte; the device prints each
+        mov r6, 0
+        .wloop:
+            cmp r6, r4
+            juge .wdone
+            mov r0, HELLO_XBUF
+            add r0, r6
+            mov8 r0, [r0]
+            out r5, r0
+            add r6, 1
+            jmp .wloop
+        .wdone:
+        mov r0, r4
+        jmp .done
+
+    .read:                           ; one line at position 0, then end of file
+        cmp r3, 0
+        jne .eof
+        in r1, r5                    ; ask the device for its word
+        call hello_fmt               ; r0 = length of "<word>\n" in the buffer
+        cmp r0, r4
+        jule .done
+        mov r0, r4                   ; the caller asked for less: give it that much
+        jmp .done
+        .eof:
+        mov r0, 0
+
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Write r1 as decimal plus a newline at the start of the transfer buffer.
+; returns r0 = the number of bytes written
+hello_fmt:
+    push r4                          ; digit cursor (built backwards)
+    push r5                          ; output cursor
+    mov r4, hello_digits + 10
+    .digits:
+        mov r2, 10
+        udiv r1, r2                  ; r1 = quotient, r2 = remainder
+        add r2, 48                   ; '0'
+        sub r4, 1
+        mov8 [r4], r2
+        cmp r1, 0
+        jne .digits
+    mov r5, HELLO_XBUF
+    .copy:
+        cmp r4, hello_digits + 10
+        je .newline
+        mov8 r0, [r4]
+        mov8 [r5], r0
+        add r4, 1
+        add r5, 1
+        jmp .copy
+    .newline:
+    mov r0, 10                       ; '\n'
+    mov8 [r5], r0
+    add r5, 1
+    mov r0, r5
+    sub r0, HELLO_XBUF
+    pop r5
+    pop r4
+    ret
+
+
+msg_loaded:
+    dstr "hello: driver loaded\n\0"
+hello_nodename:
+    dstr "hello"
+hello_unitch:
+    dstr "0\0"
+hello_ports:
+    res8 HELLO_MAXUNITS * 4
+hello_digits:
+    res8 10
+
+; end of the image: everything past here is zeroed memory, not file
+hello_end:

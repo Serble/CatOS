@@ -89,6 +89,19 @@ timer_find:
     ret
 
 
+; Mark the timer sched_start will use as the kernel's (hwclaim), so a loaded
+; driver is never offered it. No built-in driver binds the timer - sched_start
+; finds it for itself, later - so without this it would look unowned.
+timer_reserve:
+    call timer_find
+    cmp r0, -1
+    je .none
+    mov r1, r0
+    call hwclaim
+    .none:
+    ret
+
+
 ; Arm (or re-arm) the one-shot timer for the next tick using the stored
 ; interval and id. Clobbers r1, r2 (caller-saved).
 timer_arm:

@@ -2,7 +2,7 @@
 ; absolute. Reads the file in fixed-size chunks and forwards each chunk straight
 ; to stdout until end of file. r5-r7 survive syscalls, so the fd and byte count
 ; live there across the read/write calls.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define BUFSZ, 256
 

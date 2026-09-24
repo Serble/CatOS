@@ -22,7 +22,7 @@
 ; Signalling is a request, not a guarantee: SIGTERM's default action terminates,
 ; but a process that installed a handler decides for itself, and the kernel
 ; refuses the signal outright for the idle process it needs to stay runnable.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define DECBUF, 13                   ; 10 digits, spare, and the terminator
 

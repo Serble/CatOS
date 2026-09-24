@@ -37,6 +37,8 @@
 #define INT_SYSCALL, 0x10        ; interrupt raised by the `syscall` instruction
 
 #define FRAME_KERNEL, 0          ; interrupt-frame marker for a kernel-mode frame
+#define FRAME_DRIVER, 2          ; ... and for a driver-mode one (drvhost.cat); it
+                                 ; has the same layout as a user-mode frame
 #define SYSFRAME_R0, 49          ; offset of saved r0 in a user-mode frame
 
 ; ---- syscall numbers (keep in sync with user/sys.cat) ----
@@ -78,6 +80,21 @@
 #define SYS_PSLIST, 38        ; list the live processes (proc.cat)
 #define SYS_WKEYPOST, 39      ; route a key to a surface (surface.cat)
 #define SYS_WKEY, 40          ; take a key posted to your own surface (surface.cat)
+#define SYS_MOUNT, 41         ; mount a filesystem on a path (fdio.cat)
+#define SYS_UMOUNT, 42        ; unmount the filesystem at a path (fdio.cat)
+#define SYS_STAT, 43          ; read a path's type, size and flags (fdio.cat)
+#define SYS_REMOVE, 44        ; unlink a file or empty directory (fdio.cat)
+#define SYS_RENAME, 45        ; move an entry within one filesystem (fdio.cat)
+#define SYS_CONKEY, 46        ; type a key into the console session (display.cat)
+#define SYS_PTYNEW, 47        ; claim a pseudo-terminal session (pty.cat)
+#define SYS_PTYGRID, 48       ; snapshot one's character grid (pty.cat)
+#define SYS_PTYKEY, 49        ; type a key into one (pty.cat)
+#define SYS_PTYCLOSE, 50      ; release one (pty.cat)
+#define SYS_SETTTY, 51        ; set the controlling terminal, inherited by
+                              ; children (fdio.cat)
+#define SYS_REBOOT, 52        ; reset the machine and boot again (hwman.cat)
+#define SYS_DRVLOAD, 53       ; load a driver from a file (drvhost.cat)
+#define SYS_DRVLIST, 54       ; list the loaded drivers (drvhost.cat)
 
 
 ; Register the syscall dispatcher. Call once at boot, after intinit.
@@ -109,8 +126,12 @@ sysret:
 
 ; The syscall dispatcher (interrupt 0x10 handler). Decodes r1. Process-control
 ; calls jump to their handlers in sched.cat with the frame still at sp; the rest
-; compute r0 and jump to sysret.
+; compute r0 and jump to sysret. A `syscall` from a loaded driver is one of the
+; driver calls instead, a separate set with its own numbers (drvhost.cat).
 syscall_handler:
+    mov8 r0, [sp]                ; frame marker (r0 is the result, so it is free)
+    cmp r0, FRAME_DRIVER
+    je drv_syscall
     cmp r1, SYS_YIELD
     je sys_yield_h
     cmp r1, SYS_EXIT
@@ -135,6 +156,12 @@ syscall_handler:
     je sys_readdir_h
     cmp r1, SYS_CREATE
     je sys_create_h
+    cmp r1, SYS_STAT
+    je sys_stat_h
+    cmp r1, SYS_REMOVE
+    je sys_remove_h
+    cmp r1, SYS_RENAME
+    je sys_rename_h
     cmp r1, SYS_SIGNAL
     je sys_signal_h
     cmp r1, SYS_KILL
@@ -145,6 +172,8 @@ syscall_handler:
     je sys_getcwd_h
     cmp r1, SYS_POWEROFF
     je sys_poweroff_h
+    cmp r1, SYS_REBOOT
+    je sys_reboot_h
     cmp r1, SYS_GACQUIRE
     je gfx_acquire_h
     cmp r1, SYS_GRELEASE
@@ -179,10 +208,30 @@ syscall_handler:
     je input_grab_h
     cmp r1, SYS_CONREAD
     je sys_conread_h
+    cmp r1, SYS_CONKEY
+    je sys_conkey_h
+    cmp r1, SYS_PTYNEW
+    je sys_ptynew_h
+    cmp r1, SYS_PTYGRID
+    je sys_ptygrid_h
+    cmp r1, SYS_PTYKEY
+    je sys_ptykey_h
+    cmp r1, SYS_PTYCLOSE
+    je sys_ptyclose_h
+    cmp r1, SYS_SETTTY
+    je sys_settty_h
     cmp r1, SYS_SBRK
     je sys_sbrk_h
+    cmp r1, SYS_MOUNT
+    je sys_mount_h
+    cmp r1, SYS_UMOUNT
+    je sys_umount_h
     cmp r1, SYS_PSLIST
     je sys_pslist_h
+    cmp r1, SYS_DRVLOAD
+    je sys_drvload_h
+    cmp r1, SYS_DRVLIST
+    je sys_drvlist_h
     cmp r1, SYS_PRINT
     je .print
     cmp r1, SYS_TEST
@@ -204,5 +253,18 @@ syscall_handler:
 sys_poweroff_h:
     call hwshutdown
     call hwhalt
+    .spin:
+    jmp .spin
+
+
+; SYS_REBOOT: reset the machine and come up again through the firmware, which
+; reloads the kernel off the disk - so a rebuilt image is what boots. Does not
+; return, and needs no teardown of its own: every filesystem write is already
+; committed by the time a syscall returns (CatFS journals per operation and the
+; disk driver waits for each block), so there is nothing buffered to lose, and
+; the reset takes memory, processes and devices with it regardless. If the
+; hardware ignores us we freeze rather than pretend the call failed.
+sys_reboot_h:
+    call hwreset
     .spin:
     jmp .spin

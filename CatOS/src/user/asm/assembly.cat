@@ -1,0 +1,76 @@
+; actual assembler logic
+
+#define ASM_RESULT_SIZE, 0
+#define ASM_RESULT_BUFF, 4
+#define ASM_RESULT_STRUCT 8
+
+; macro to load a constant string into the ASM_RESULT
+; buffer that is pushed into the stack in assemble.
+#macro loadasmreserr, 1
+    mov r0, r7
+    sub r0, 4                 ; select result struct ptr
+    mov r0, [r0]              ; deref to get actual ptr
+    mov [r0], $1_end - $1     ; load string size
+    add r0, 4
+    mov [r0], $1              ; load string ptr
+#endmacro
+
+; r1 - main asm file size
+; r2 - main asm file buffer
+; r3 - ptr to where to place the ASM result struct data
+; returns 0 for success, else non zero and the result
+; struct will contain an error message.
+assemble:
+    push r4
+    push r5
+    push r6
+    push r7
+    mov r7, sp                ; set a base ptr
+
+    push r3                   ; don't waste a register on it, store in stack
+
+    ; preserve our args past vec_init
+    mov r4, r1                ; main file size
+    mov r5, r2                ; main file buff
+
+    sub sp, VEC_STRUCT        ; a struct to put the vector data into
+    mov r3, sp                ; store that
+
+    ; init a vector for tokenise to output to
+    mov r1, r3                ; now move the position of that vec buf into first arg
+    mov r2, TOKEN_STRUCT      ; it's a vec of tokens, so size of element is token struct
+    call vec_init
+
+    ; file size, file buff, vector buff (already in r3)
+    mov r1, r4
+    mov r2, r5
+    call tokenise             ; call with the same args that were passed to us
+
+    cmp r0, 0
+    jne .tokenise_failed
+
+    ; done, success
+    mov r0, 0
+    jmp .end
+
+    .tokenise_failed:
+    loadasmreserr tokenise_failed_msg
+    jmp .fail
+
+    .fail:
+    mov r0, 1
+
+    .end:
+    mov sp, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+tokenise_failed_msg:
+    dstr "Tokenisation failed"
+tokenise_failed_msg_end:
+
+

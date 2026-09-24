@@ -1,0 +1,149 @@
+; mv - move or rename.
+;
+;   mv <source> <destination>
+;
+; As with cp, a destination that is an existing directory means "move it in
+; there" and anything else is taken as the new name. An existing file is never
+; overwritten: mv fails and says so rather than destroying it.
+;
+; Two different operations wear this name. Within one filesystem it is a rename -
+; the kernel re-links the entry and no data moves, so a directory and its whole
+; subtree cost the same as an empty file. Across a mount there is nothing to
+; re-link, because an inode number means nothing to a filesystem that did not
+; issue it, so mv falls back to copying the bytes and deleting the original. That
+; fallback only works for a file; moving a directory across a mount would be a
+; recursive copy, which cp does not do either.
+;
+; The distinction is deliberately visible here rather than hidden in the kernel:
+; a rename is instant and a cross-mount move rewrites every byte, and a program
+; that cannot tell you which it did would be lying about the cost.
+#include "lib/sys.cat"
+
+main:
+    mov r5, r1                       ; argc
+    cmp r5, 3
+    jne .usage
+
+    mov r1, r2                       ; argv[1] = source
+    add r1, 4
+    mov r7, [r1]
+    mov r1, r2                       ; argv[2] = destination
+    add r1, 8
+    mov r4, [r1]
+    mov [rpath], r7                  ; the name an error should name, which is
+                                     ; the source for all but one of them
+
+    sys_stat r7, st
+    cmp r0, 0
+    jne .nosrc
+    mov r6, [st + ST_TYPE]           ; remembered for the fallback below
+
+    mov r1, r7
+    mov r2, r4
+    call dstpath
+    cmp r0, -1
+    je .toolong
+    mov r4, r0
+
+    mov r1, r7
+    mov r2, r4
+    call fstreq
+    cmp r0, 0
+    jne .same
+
+    sys_rename r7, r4                ; the cheap path, when both ends agree on
+    cmp r0, 0                        ; which filesystem they are on
+    je .ok
+
+    sys_stat r4, st                  ; a destination that already exists is the
+    cmp r0, 0                        ; likeliest reason, and not one to retry
+    je .exists
+
+    cmp r6, T_DIR                    ; otherwise: different filesystems, so copy
+    je .dircross
+    mov r1, r7
+    mov r2, r4
+    call copyfile
+    cmp r0, 0
+    jne .copyfailed
+    sys_remove r7                    ; only once the bytes are safely elsewhere
+    cmp r0, 0
+    jne .stuck
+
+.ok:
+    sys_exit 0
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+.nosrc:
+    mov r1, enosrc
+    jmp .report
+.toolong:
+    mov r1, elong
+    jmp .report
+.same:
+    mov r1, esame
+    jmp .report
+.exists:
+    mov [rpath], r4                  ; here it is the destination that is at fault
+    mov r1, eexists
+    jmp .report
+.dircross:
+    mov r1, edircross
+    jmp .report
+.stuck:
+    mov r1, estuck
+    jmp .report
+.copyfailed:
+    cmp r0, CPE_DST
+    je .edst
+    cmp r0, CPE_WRITE
+    je .ewrite
+    mov r1, eopen
+    jmp .report
+    .edst:
+    mov r1, ecreate
+    jmp .report
+    .ewrite:
+    mov r1, ewrite
+
+.report:
+    call emit_str
+    mov r1, [rpath]
+    call emit_str
+    mov r1, 10                       ; '\n'
+    call emit_char
+    call flush
+    sys_exit 1
+
+
+usage:
+    dstr "usage: mv <source> <destination>\n"
+usage_end:
+enosrc:
+    dstr "mv: no such file: \0"
+elong:
+    dstr "mv: path too long: \0"
+esame:
+    dstr "mv: source and destination are the same file: \0"
+eexists:
+    dstr "mv: destination already exists, refusing to replace it: \0"
+edircross:
+    dstr "mv: cannot move a directory to another filesystem: \0"
+eopen:
+    dstr "mv: cannot read \0"
+ecreate:
+    dstr "mv: cannot create the destination for \0"
+ewrite:
+    dstr "mv: write failed (out of space, or past the file size limit): \0"
+estuck:
+    dstr "mv: copied, but the original could not be removed: \0"
+
+rpath:
+    d32 0
+st:
+    res8 ST_STRUCT
+
+#include "lib/fmt.cat"
+#include "lib/fileutil.cat"

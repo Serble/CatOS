@@ -3,7 +3,7 @@
 ; is written to stdout on its own line. Uses the readdir syscall, which fills the
 ; buffer with one null-terminated entry name per call (returns 1 per entry, 0 at
 ; the end).
-#include "sys.cat"
+#include "lib/sys.cat"
 
 main:
     mov r5, r1                       ; argc (survives syscalls)

@@ -1,0 +1,1517 @@
+; ==========================
+;   CatOS loadable drivers
+; ==========================
+; The kernel half of the driver ABI in src/drivers/lib/drvabi.cat: loading a
+; driver off the disk, running its entry points in driver mode, the calls it
+; makes back, and the /dev nodes and interrupt vectors it owns. The built-in
+; drivers (disk, PPU, timer) are untouched by any of this; a loaded driver is
+; for a device the kernel was built without.
+;
+;
+; -- Running a driver --------------------------------------------------------
+;
+; drv_call enters one of a driver's entry points and does not return until the
+; entry has. It works the way a process is first entered: build an interrupt
+; frame by hand - marker FRAME_DRIVER, ip = the entry, sp = the top of the
+; driver's memory, MBase/MLen = its segment, the arguments in r1-r4 - and `iret`
+; into it. The one trick is Ksp. Every trap out of the driver (a driver call, an
+; interrupt, a fault, the return) pushes its frame at Ksp, so drv_call first
+; points Ksp at its own stack: those traps land just below drv_call's saved
+; state and nest on the current kernel stack like any other call, and the
+; process whose stack it is never notices. drv_resume puts Ksp back.
+;
+; An entry is an ordinary procedure and ends with `ret`. The word at the top of
+; the driver's stack - what that `ret` pops - is DRV_RETMAGIC, an address no
+; driver can have, so returning faults on the instruction fetch. The page-fault
+; handler recognises the address (as it recognises SIGRETURN_MAGIC for signal
+; handlers) and passes the frame's r0 to drv_resume, which discards the frame
+; and returns it from drv_call. Any other fault in driver mode goes the same way
+; with -1, after marking the driver dead: its nodes fail from then on and its
+; interrupts are dropped, and the machine carries on.
+;
+; None of this touches the interrupt-enable state, and none of it needs to. A
+; driver runs to completion: the scheduler only switches when it interrupts
+; *user* mode, and an interrupt for a driver that is already running is held
+; (IS_PEND) and delivered by drv_resume once it has returned. So a driver is
+; never preempted and never re-entered, and one stack each is enough.
+;
+;
+; -- What a driver can reach -------------------------------------------------
+;
+; Its own memory, its hardware, and the DRVC_* calls, which drv_syscall handles
+; when a `syscall` arrives with a FRAME_DRIVER frame (syscall_handler checks the
+; marker first). A driver's /dev node carries drv_proxy_ops, which runs its op
+; entry and moves the bytes through its transfer buffer; a vector it claims
+; points at one of the drvirq_stub trampolines, which runs its irq entry. The
+; driver never holds a kernel pointer.
+;
+;
+; -- Finding drivers ---------------------------------------------------------
+;
+; hwman.cat records who owns each enumerated device (HWDEV_OWNER). Once the
+; built-in drivers have bound, drv_autoload reads the descriptor of every file
+; in /drivers and loads each one that names the type of a device nobody owns;
+; the loader then offers the driver every such device. SYS_DRVLOAD does the same
+; for one path at runtime, whether or not it drives anything. Nothing is ever
+; unloaded: a node cannot leave devfs, and an open file on it would be left
+; pointing into freed code.
+
+#include "../../drivers/lib/drvabi.cat"
+
+#define DRV_RETMAGIC, 0xFFFFFE00     ; the return address an entry's final ret pops
+#define LDRV_MAX, 8                  ; loaded-driver table capacity
+#define LDRV_MAXNODES, 16            ; /dev nodes all drivers together can publish
+#define LDRV_MAXIRQ, 8               ; vectors all drivers together can claim
+#define LDRV_MAXMEM, 0x100000        ; the most memory one driver may ask for (1 MiB)
+#define LDRV_LOGMAX, 256             ; longest line DRVC_LOG prints
+
+; ---- a loaded driver ----
+#define LD_STATE, 0                  ; LDS_*
+#define LD_BASE, 4                   ; physical base of its segment (its MBase)
+#define LD_LEN, 8                    ; segment length (its MLen); the stack starts here
+#define LD_PAGES, 12                 ; segment pages, to free a driver whose init failed
+#define LD_BUSY, 16                  ; 1 while one of its entries is running
+#define LD_KIND, 20                  ; which entry that is (LDK_*)
+#define LD_SAVESP, 24                ; the kernel sp drv_resume unwinds to
+#define LD_NREG, 28                  ; nodes and vectors it has registered
+#define LD_ENTRY, 32                 ; its entry addresses, indexed by LDK_*
+#define LD_XBUF, 48                  ; transfer buffer (a driver address) ...
+#define LD_XLEN, 52                  ; ... and its length
+#define LD_NTYPES, 56                ; the device types it binds
+#define LD_TYPES, 60                 ; DRV_MAXTYPES words
+#define LD_NAME, 76                  ; DRV_NAMELEN bytes, always terminated
+#define LD_STRUCT, 92
+
+#define LDS_FREE, 0
+#define LDS_LIVE, 1
+#define LDS_DEAD, 2                  ; faulted, or refused to init after registering
+                                     ; something: kept, so nothing dangles, but
+                                     ; never run again
+
+#define LDK_INIT, 0                  ; entries, in descriptor order
+#define LDK_BIND, 1
+#define LDK_OP, 2
+#define LDK_IRQ, 3
+
+; ---- a published node ----
+#define DN_DRV, 0                    ; owning driver record, 0 = free slot
+#define DN_COOKIE, 4
+#define DN_NODE, 8                   ; the devfs node - also its readers' wake channel
+#define DN_STRUCT, 12
+
+; ---- a claimed vector ----
+#define IS_DRV, 0                    ; owning driver record, 0 = free slot
+#define IS_VEC, 4
+#define IS_PEND, 8                   ; 1 if it fired while the driver was busy
+#define IS_STRUCT, 12
+
+; ---- SYS_DRVLOAD errors (keep in sync with user/lib/sys.cat) ----
+#define DRVE_NOFILE, -1              ; the file could not be opened or read
+#define DRVE_FORMAT, -2              ; not a driver, or built for another ABI
+#define DRVE_NOMEM, -3               ; no memory for its segment
+#define DRVE_FULL, -4                ; the driver table is full
+#define DRVE_INIT, -5                ; its init refused, or it faulted there
+#define DRVE_LOADED, -6              ; a driver of that name is already loaded
+
+; ---- SYS_DRVLIST record (keep in sync with user/lib/sys.cat) ----
+#define DRVREC_STATE, 0              ; LDS_LIVE or LDS_DEAD
+#define DRVREC_UNITS, 4              ; devices it owns
+#define DRVREC_NAME, 8               ; DRV_NAMELEN bytes
+#define DRVREC_BYTES, 24
+
+
+; ==========================
+;   State
+; ==========================
+drv_table:
+    res8 LDRV_MAX * LD_STRUCT
+drv_nodes:
+    res8 LDRV_MAXNODES * DN_STRUCT
+drv_irqs:
+    res8 LDRV_MAXIRQ * IS_STRUCT
+drv_active:
+    d32 0                        ; the driver whose entry is running, 0 if none
+drv_noargs:
+    d32 0                        ; the argument block for an entry that takes none
+    d32 0
+    d32 0
+    d32 0
+drv_namebuf:
+    res8 DRV_NAMELEN             ; a name DRVC_PUBLISH is copying in
+drv_pathbuf:
+    res8 VFS_PATH_MAX            ; the /drivers entry drv_autoload is looking at
+drv_peekbuf:
+    res8 DRVD_SIZE               ; a descriptor, read ahead of the rest of the file
+
+
+; ==========================
+;   Running an entry
+; ==========================
+
+; Run one of a driver's entry points.
+; r1 - driver record
+; r2 - which entry (LDK_*)
+; r3 - its arguments: four words, for r1-r4, or 0 for none
+; returns r0 = what the entry returned, or -1 if the driver is dead, is already
+;         running, has no such entry, or faulted
+drv_call:
+    push r4                      ; driver
+    push r5                      ; entry kind
+    push r6                      ; arguments
+    push r7                      ; entry address
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    vload r0, r4, LD_STATE
+    cmp r0, LDS_LIVE
+    jne drv_call_fail
+    vload r0, r4, LD_BUSY
+    cmp r0, 0
+    jne drv_call_fail            ; never re-enter a driver
+    mov r7, r5
+    shl r7, 2
+    add r7, LD_ENTRY
+    add r7, r4
+    mov r7, [r7]
+    cmp r7, 0
+    je drv_call_fail             ; it has no such entry
+
+    mov r0, [drv_active]         ; what to put back afterwards: whose entry was
+    push r0                      ; running (one driver's interrupt can arrive in
+    getksp r0                    ; the middle of another's entry) ...
+    push r0                      ; ... and where traps were landing
+    mov r0, 1
+    vstore r4, LD_BUSY, r0, r1
+    vstore r4, LD_KIND, r5, r1
+    mov [drv_active], r4
+    mov r0, sp
+    vstore r4, LD_SAVESP, r0, r1
+    setksp r0                    ; the driver's traps now land just below us
+
+    vload r0, r4, LD_BASE        ; the entry's return address, at the top of its
+    vload r1, r4, LD_LEN         ; memory: DRV_RETMAGIC, so that its `ret` traps
+    add r0, r1
+    sub r0, 4
+    mov r1, DRV_RETMAGIC
+    mov [r0], r1
+
+    sub sp, FRM_SIZE             ; the frame iret will consume
+    mov r3, sp
+    mov r0, FRAME_DRIVER
+    mov8 [r3], r0
+    vstore r3, FRM_IP, r7, r1
+    vload r0, r4, LD_LEN
+    sub r0, 4
+    vstore r3, FRM_SP, r0, r1
+    vstore r3, FRM_FL, 0, r1
+    vload r0, r4, LD_BASE
+    vstore r3, FRM_MBASE, r0, r1
+    vload r0, r4, LD_LEN
+    vstore r3, FRM_MLEN, r0, r1
+    vstore r3, FRM_R0, 0, r1
+    vstore r3, FRM_R5, 0, r1
+    vstore r3, FRM_R6, 0, r1
+    vstore r3, FRM_R7, 0, r1
+    cmp r6, 0
+    jne .args
+    mov r6, drv_noargs
+    .args:
+    mov r0, [r6]
+    vstore r3, FRM_R1, r0, r1
+    add r6, 4
+    mov r0, [r6]
+    vstore r3, FRM_R2, r0, r1
+    add r6, 4
+    mov r0, [r6]
+    vstore r3, FRM_R3, r0, r1
+    add r6, 4
+    mov r0, [r6]
+    vstore r3, FRM_R4, r0, r1
+    iret                         ; into the driver; back by way of drv_resume
+
+drv_call_fail:
+    mov r0, -1
+drv_call_out:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Where the trap that ends an entry arrives: its return (drv_pagefault) or a
+; fault (drv_fault). Unwinds to the drv_call that entered it and returns from
+; that, delivering any interrupt the driver was sent in the meantime first.
+; r0 - the entry's result
+drv_resume:
+    mov r4, [drv_active]
+    vload r1, r4, LD_SAVESP
+    mov sp, r1                   ; drop the trap frame and anything under it
+    pop r1
+    setksp r1
+    pop r1
+    mov [drv_active], r1
+    mov r1, 0
+    vstore r4, LD_BUSY, r1, r2
+    push r0
+    mov r1, r4
+    call drv_irqflush
+    pop r0
+    jmp drv_call_out
+
+
+; A page fault in driver mode (pagefault_handler checks the marker first, before
+; it touches the interrupt state). Either an entry returning - its `ret` popped
+; DRV_RETMAGIC - or a real fault.
+drv_pagefault:
+    mov r0, sp
+    add r0, FRM_IP
+    mov r0, [r0]
+    cmp r0, DRV_RETMAGIC
+    jne drv_fault
+    mov r0, sp                   ; the result is the r0 it returned with
+    add r0, FRM_R0
+    mov r0, [r0]
+    jmp drv_resume
+
+
+; Any other fault in driver mode (fault_common sends them here too): the driver
+; is broken. Stop it for good and fail the entry it was running.
+drv_fault:
+    mov r4, [drv_active]
+    cmp r4, 0
+    je .panic                    ; driver mode with no entry running cannot happen
+    mov r0, LDS_DEAD
+    vstore r4, LD_STATE, r0, r1
+    mov r1, drv_msg_driver
+    call drv_kputs
+    mov r1, r4
+    add r1, LD_NAME
+    call drv_kputs
+    mov r1, drv_msg_faulted
+    call drv_kputs
+    mov r0, -1
+    jmp drv_resume
+    .panic:
+    kpanic PANIC_KERNEL_FAULT
+
+
+; Deliver the interrupts that arrived for a driver while it was running. Each
+; was held in its vector's IS_PEND; clearing the flag before the call means one
+; that fires again during it is not lost, only merged.
+; r1 - driver record
+drv_irqflush:
+    push r4                      ; driver
+    push r5                      ; slot
+    push r6                      ; slot index
+    push r7                      ; delivered anything this pass
+    mov r4, r1
+    .pass:
+        mov r7, 0
+        mov r5, drv_irqs
+        mov r6, 0
+        .slot:
+            cmp r6, LDRV_MAXIRQ
+            juge .endpass
+            vload r0, r5, IS_DRV
+            cmp r0, r4
+            jne .next
+            vload r0, r5, IS_PEND
+            cmp r0, 0
+            je .next
+            vstore r5, IS_PEND, 0, r1
+            vload r0, r5, IS_VEC
+            push 0
+            push 0
+            push 0
+            push r0                  ; irq(vector)
+            mov r1, r4
+            mov r2, LDK_IRQ
+            mov r3, sp
+            call drv_call
+            add sp, 16
+            mov r7, 1
+            .next:
+            add r5, IS_STRUCT
+            add r6, 1
+            jmp .slot
+        .endpass:
+        cmp r7, 0
+        jne .pass
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Interrupts
+; ==========================
+; A vector a driver claims points at the stub for its slot in drv_irqs. The CPU
+; says nothing about which vector fired, so each slot needs code of its own; the
+; stub only names its slot and the common tail does the rest.
+
+#macro drvirq_stub, 1
+drvirq_stub$1:
+    int_prologue
+    mov r1, $1
+    jmp drvirq_common
+#endmacro
+
+drvirq_stub 0
+drvirq_stub 1
+drvirq_stub 2
+drvirq_stub 3
+drvirq_stub 4
+drvirq_stub 5
+drvirq_stub 6
+drvirq_stub 7
+
+drvirq_stubs:                    ; the stub for each slot, LDRV_MAXIRQ of them
+    d32 drvirq_stub0
+    d32 drvirq_stub1
+    d32 drvirq_stub2
+    d32 drvirq_stub3
+    d32 drvirq_stub4
+    d32 drvirq_stub5
+    d32 drvirq_stub6
+    d32 drvirq_stub7
+
+; r1 - slot index; the stack holds int_prologue's state
+drvirq_common:
+    mov r4, r1
+    umul r4, IS_STRUCT
+    add r4, drv_irqs
+    vload r5, r4, IS_DRV
+    cmp r5, 0
+    je .out
+    vload r0, r5, LD_STATE
+    cmp r0, LDS_LIVE
+    jne .out                     ; a dead driver's interrupts are dropped
+    vload r0, r5, LD_BUSY
+    cmp r0, 0
+    je .run
+    vstore r4, IS_PEND, 1, r1    ; it is running: drv_resume delivers this after
+    jmp .out
+    .run:
+    vload r0, r4, IS_VEC
+    push 0
+    push 0
+    push 0
+    push r0                      ; irq(vector)
+    mov r1, r5
+    mov r2, LDK_IRQ
+    mov r3, sp
+    call drv_call
+    add sp, 16
+    .out:
+    int_epilogue
+
+
+; ==========================
+;   Driver calls
+; ==========================
+
+; A `syscall` from driver mode. r1 = the call, r2-r3 its arguments. The result
+; goes into the frame's r0, and iret restores every other register, so the
+; handlers may use any register - but must leave sp at the frame, and reach the
+; end through drv_sysret.
+drv_syscall:
+    cmp r1, DRVC_LOG
+    je drvc_log
+    cmp r1, DRVC_PUBLISH
+    je drvc_publish
+    cmp r1, DRVC_WAKEUP
+    je drvc_wakeup
+    cmp r1, DRVC_CLAIMINT
+    je drvc_claimint
+    cmp r1, DRVC_PHYSBASE
+    je drvc_physbase
+    mov r0, -1                   ; no such call
+drv_sysret:
+    mov r1, sp
+    add r1, FRM_R0
+    mov [r1], r0
+    iret
+
+
+; DRVC_LOG: r2 = string. Printed on the console as it stands.
+drvc_log:
+    mov r6, r2
+    mov r1, r2
+    mov r2, LDRV_LOGMAX
+    call drv_ustr
+    cmp r0, -1
+    je drv_sysret
+    mov r5, r0                   ; length
+    mov r4, [drv_active]
+    vload r3, r4, LD_BASE
+    add r3, r6                   ; the string, physically
+    mov r1, 0
+    mov r2, 0
+    push r5
+    call console_write
+    add sp, 4
+    mov r0, 0
+    jmp drv_sysret
+
+
+; DRVC_PUBLISH: r2 = name, r3 = cookie. Makes /dev/<name>, whose reads and
+; writes run the driver's op entry with that cookie. Only from init and bind:
+; devfs allocates, and an irq entry can arrive with the heap half-updated.
+drvc_publish:
+    mov r4, [drv_active]
+    vload r0, r4, LD_KIND
+    cmp r0, LDK_BIND
+    jug .fail                    ; init and bind only
+    mov r6, r3                   ; cookie
+    mov r7, r2                   ; name
+    mov r1, r2
+    mov r2, DRV_NAMELEN - 1
+    call drv_ustr
+    cmp r0, 0
+    jile .fail                   ; empty, too long, or off the end of its memory
+    mov r5, r0
+    vload r1, r4, LD_BASE        ; copy it in and terminate it
+    add r1, r7
+    mov r0, drv_namebuf
+    cpy r1, r5
+    mov r0, drv_namebuf
+    add r0, r5
+    mov r1, 0
+    mov8 [r0], r1
+    mov r1, 0                    ; a name /dev already has is refused, rather
+    mov r2, drv_namebuf          ; than shadowed
+    call devfs_lookup
+    cmp r0, 0
+    je .fresh
+    mov r1, r0
+    call vfsnodeunref
+    jmp .fail
+    .fresh:
+    mov r5, drv_nodes            ; a free node slot
+    mov r7, 0
+    .scan:
+        cmp r7, LDRV_MAXNODES
+        juge .fail
+        vload r0, r5, DN_DRV
+        cmp r0, 0
+        je .slot
+        add r5, DN_STRUCT
+        add r7, 1
+        jmp .scan
+    .slot:
+    mov r1, drv_namebuf
+    mov r2, NODE_CHARDEV
+    mov r3, drv_proxy_ops
+    push r5                      ; fsdata: the slot
+    call devfs_add
+    add sp, 4
+    cmp r0, 0
+    je .fail
+    vstore r5, DN_NODE, r0, r1
+    vstore r5, DN_COOKIE, r6, r1
+    vstore r5, DN_DRV, r4, r1
+    vload r0, r4, LD_NREG
+    add r0, 1
+    vstore r4, LD_NREG, r0, r1
+    mov r0, 0
+    jmp drv_sysret
+    .fail:
+    mov r0, -1
+    jmp drv_sysret
+
+
+; DRVC_WAKEUP: r2 = cookie. Wakes whoever is blocked reading one of the driver's
+; nodes with that cookie; the read is then tried again.
+drvc_wakeup:
+    mov r4, [drv_active]
+    mov r6, r2
+    mov r5, drv_nodes
+    mov r7, 0
+    .loop:
+        cmp r7, LDRV_MAXNODES
+        juge .done
+        vload r0, r5, DN_DRV
+        cmp r0, r4
+        jne .next
+        vload r0, r5, DN_COOKIE
+        cmp r0, r6
+        jne .next
+        vload r1, r5, DN_NODE    ; sys_read_h blocks a reader on the node
+        call proc_wakeup
+        .next:
+        add r5, DN_STRUCT
+        add r7, 1
+        jmp .loop
+    .done:
+    mov r0, 0
+    jmp drv_sysret
+
+
+; DRVC_CLAIMINT: r2 = vector. From then on the driver's irq entry runs when it
+; fires. Refuses the CPU's own vectors, the ones the VM answers itself, and any
+; vector somebody already has - intregister would silently replace it. Only from
+; init and bind.
+drvc_claimint:
+    mov r4, [drv_active]
+    vload r0, r4, LD_KIND
+    cmp r0, LDK_BIND
+    jug .fail
+    mov r6, r2
+    cmp r6, INT_SYSCALL
+    jule .fail                   ; the CPU exceptions and the syscall vector
+    cmp r6, 0xFF
+    jug .fail
+    cmp r6, 0x80                 ; the VM's print and debug vectors never reach
+    je .fail                     ; the table
+    cmp r6, 0x90
+    je .fail
+    mov r1, r6
+    call intlookup
+    cmp r0, 0
+    jne .fail                    ; taken
+    mov r5, drv_irqs             ; a free slot
+    mov r7, 0
+    .scan:
+        cmp r7, LDRV_MAXIRQ
+        juge .fail
+        vload r0, r5, IS_DRV
+        cmp r0, 0
+        je .slot
+        add r5, IS_STRUCT
+        add r7, 1
+        jmp .scan
+    .slot:
+    vstore r5, IS_VEC, r6, r1
+    vstore r5, IS_PEND, 0, r1
+    vstore r5, IS_DRV, r4, r1    ; the owner last: it is what the stub checks
+    mov r1, r7
+    shl r1, 2
+    add r1, drvirq_stubs
+    mov r2, [r1]
+    mov r1, r6
+    call intregister
+    cmp r0, 0
+    jne .undo                    ; the interrupt table is full
+    vload r0, r4, LD_NREG
+    add r0, 1
+    vstore r4, LD_NREG, r0, r1
+    mov r0, 0
+    jmp drv_sysret
+    .undo:
+    vstore r5, IS_DRV, 0, r1
+    .fail:
+    mov r0, -1
+    jmp drv_sysret
+
+
+; DRVC_PHYSBASE: the physical address of the driver's address 0.
+drvc_physbase:
+    mov r4, [drv_active]
+    vload r0, r4, LD_BASE
+    jmp drv_sysret
+
+
+; Length of a NUL-terminated string in the running driver's memory.
+; r1 - driver address
+; r2 - the longest length allowed (terminator excluded)
+; returns r0 = the length, or -1 if it is longer or runs off the end of memory
+drv_ustr:
+    push r4                      ; physical cursor
+    push r5                      ; bytes left before the end of its memory
+    push r6                      ; length so far
+    mov r4, [drv_active]
+    vload r5, r4, LD_LEN
+    cmp r1, r5
+    juge .bad
+    sub r5, r1
+    vload r4, r4, LD_BASE
+    add r4, r1
+    mov r6, 0
+    .loop:
+        cmp r5, 0
+        je .bad
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .done
+        cmp r6, r2
+        juge .bad
+        add r6, 1
+        add r4, 1
+        sub r5, 1
+        jmp .loop
+    .done:
+    mov r0, r6
+    jmp .out
+    .bad:
+    mov r0, -1
+    .out:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Print a kernel string on the console.
+; r1 - string
+drv_kputs:
+    push r4
+    mov r4, r1
+    call vfsstrlen
+    mov r3, r4
+    mov r1, 0
+    mov r2, 0
+    push r0
+    call console_write
+    add sp, 4
+    pop r4
+    ret
+
+
+; ==========================
+;   Nodes
+; ==========================
+; The vtable every driver-published node carries. A node's NODE_FSDATA is its
+; slot in drv_nodes, which names the driver and the cookie.
+
+drv_proxy_ops:
+    d32 0                        ; OP_LOOKUP
+    d32 drv_proxy_read           ; OP_READ
+    d32 drv_proxy_write          ; OP_WRITE
+    d32 0                        ; OP_CREATE
+    d32 0                        ; OP_REMOVE
+    d32 0                        ; OP_READDIR
+    d32 0                        ; OP_TRUNCATE
+    d32 0                        ; OP_STAT
+    d32 0                        ; OP_SYNC
+    d32 0                        ; OP_RENAME
+
+
+; read(r1 = node, r2 = pos, r3 = buf, [sp] = len) -> bytes, or negative. Runs
+; the op entry for DOP_READ and copies what it left in its transfer buffer out.
+; DRV_WOULDBLOCK passes straight through, and sys_read_h blocks the reader.
+drv_proxy_read:
+    push r4                      ; driver
+    push r5                      ; node slot
+    push r6                      ; caller's buffer
+    push r7                      ; length
+    mov r6, r3
+    mov r7, sp
+    add r7, 20
+    mov r7, [r7]
+    vload r5, r1, NODE_FSDATA
+    vload r4, r5, DN_DRV
+    vload r0, r4, LD_XLEN        ; never more than its transfer buffer holds
+    cmp r7, r0
+    jule .fits
+    mov r7, r0
+    .fits:
+    push r7                      ; op(cookie, DOP_READ, pos, len)
+    push r2
+    push DOP_READ
+    vload r0, r5, DN_COOKIE
+    push r0
+    mov r1, r4
+    mov r2, LDK_OP
+    mov r3, sp
+    call drv_call
+    add sp, 16
+    cmp r0, 0
+    jile .done                   ; end of file, an error, or DRV_WOULDBLOCK
+    cmp r0, r7
+    jule .copy
+    mov r0, r7                   ; it cannot hand back more than it was asked for
+    .copy:
+    push r0
+    vload r1, r4, LD_BASE
+    vload r2, r4, LD_XBUF
+    add r1, r2
+    mov r2, r0
+    mov r0, r6
+    cpy r1, r2
+    pop r0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; write(r1 = node, r2 = pos, r3 = buf, [sp] = len) -> bytes, or negative. Copies
+; the bytes into the driver's transfer buffer and runs its op entry for
+; DOP_WRITE.
+drv_proxy_write:
+    push r4                      ; driver
+    push r5                      ; node slot
+    push r6                      ; caller's buffer
+    push r7                      ; length
+    mov r6, r3
+    mov r7, sp
+    add r7, 20
+    mov r7, [r7]
+    vload r5, r1, NODE_FSDATA
+    vload r4, r5, DN_DRV
+    vload r0, r4, LD_XLEN
+    cmp r7, r0
+    jule .fits
+    mov r7, r0
+    .fits:
+    push r2                      ; pos, across the copy
+    vload r0, r4, LD_BASE
+    vload r1, r4, LD_XBUF
+    add r0, r1                   ; into its transfer buffer
+    mov r1, r6
+    mov r2, r7
+    cpy r1, r2
+    pop r2
+    push r7                      ; op(cookie, DOP_WRITE, pos, len)
+    push r2
+    push DOP_WRITE
+    vload r0, r5, DN_COOKIE
+    push r0
+    mov r1, r4
+    mov r2, LDK_OP
+    mov r3, sp
+    call drv_call
+    add sp, 16
+    cmp r0, 0
+    jil .done
+    cmp r0, r7
+    jule .done
+    mov r0, r7                   ; it cannot have taken more than it was given
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Loading
+; ==========================
+
+; Load a driver file: check its descriptor, give it a segment, run its init,
+; and offer it every unowned device of a type it names.
+; r1 - absolute path (kernel address)
+; returns r0 = the driver's table index, or a DRVE_* error
+drv_load:
+    push r4                      ; file handle, then the driver record
+    push r5                      ; file size
+    push r6                      ; segment bytes
+    push r7                      ; scratch
+    mov r2, O_READ
+    call vfsopen
+    cmp r0, -1
+    je .nofile
+    mov r4, r0
+    mov r1, r4                   ; size = seek to the end
+    mov r2, 0
+    mov r3, SEEK_END
+    call vfsseek
+    mov r5, r0
+    cmp r5, DRVD_SIZE
+    jul .formatclose
+    cmp r5, LDRV_MAXMEM          ; also catches a failed seek (-1)
+    jug .formatclose
+    mov r1, r4                   ; the descriptor first, to size the segment
+    mov r2, 0
+    mov r3, SEEK_SET
+    call vfsseek
+    mov r1, r4
+    mov r2, drv_peekbuf
+    mov r3, DRVD_SIZE
+    call drv_readall
+    cmp r0, DRVD_SIZE
+    jne .nofileclose
+    mov r1, drv_peekbuf
+    mov r2, r5
+    call drv_check
+    cmp r0, 0
+    je .formatclose
+    mov r6, r0
+    mov r1, drv_peekbuf          ; one of each: a second copy would publish the
+    add r1, DRVD_NAME            ; same names as the first
+    call drv_byname
+    cmp r0, 0
+    jne .loadedclose
+    call drv_freerec
+    cmp r0, 0
+    je .fullclose
+    mov r7, r0
+    mov r1, r6
+    shr r1, PAGE_SHIFT_FAC
+    call allocpages
+    cmp r0, 0
+    je .nomemclose
+    vstore r7, LD_BASE, r0, r1
+    vstore r7, LD_LEN, r6, r1
+    mov r1, r6
+    shr r1, PAGE_SHIFT_FAC
+    vstore r7, LD_PAGES, r1, r2
+    mov r1, r0                   ; zeroed memory, then the image over the bottom
+    mov r2, r6
+    call proc_memzero
+    mov r1, r4
+    mov r2, 0
+    mov r3, SEEK_SET
+    call vfsseek
+    mov r1, r4
+    vload r2, r7, LD_BASE
+    mov r3, r5
+    call drv_readall
+    cmp r0, r5
+    jne .unreadable
+    mov r1, r4
+    call vfsclose
+    mov r4, r7                   ; from here on r4 is the record
+
+    mov r1, r4
+    mov r2, drv_peekbuf
+    call drv_fillrec
+    mov r1, r4
+    call drv_start
+    cmp r0, 0
+    jne .done                    ; DRVE_INIT
+    mov r1, r4
+    call drv_bindall
+    mov r1, r4                   ; its index
+    sub r1, drv_table
+    mov r2, LD_STRUCT
+    udiv r1, r2
+    mov r0, r1
+    jmp .done
+
+    .unreadable:
+    vload r1, r7, LD_BASE
+    vload r2, r7, LD_PAGES
+    call freepages
+    .nofileclose:
+    mov r1, r4
+    call vfsclose
+    .nofile:
+    mov r0, DRVE_NOFILE
+    jmp .done
+    .formatclose:
+    mov r7, DRVE_FORMAT
+    jmp .close
+    .loadedclose:
+    mov r7, DRVE_LOADED
+    jmp .close
+    .fullclose:
+    mov r7, DRVE_FULL
+    jmp .close
+    .nomemclose:
+    mov r7, DRVE_NOMEM
+    .close:
+    mov r1, r4
+    call vfsclose
+    mov r0, r7
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Read up to r3 bytes from a handle, however many reads that takes.
+; r1 - handle, r2 - buffer, r3 - length
+; returns r0 = bytes read (short only at end of file or on an error)
+drv_readall:
+    push r4                      ; handle
+    push r5                      ; buffer
+    push r6                      ; length
+    push r7                      ; read so far
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    mov r7, 0
+    .loop:
+        cmp r7, r6
+        juge .done
+        mov r1, r4
+        mov r2, r5
+        add r2, r7
+        mov r3, r6
+        sub r3, r7
+        call vfsread
+        cmp r0, 0
+        jile .done
+        add r7, r0
+        jmp .loop
+    .done:
+    mov r0, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Check a descriptor against the file it came from.
+; r1 - descriptor (kernel copy)
+; r2 - file size
+; returns r0 = the segment it needs, in bytes (whole pages), or 0 if it is not a
+;         driver this kernel can run
+drv_check:
+    push r4                      ; descriptor
+    push r5                      ; file size
+    push r6                      ; memory it asks for
+    push r7                      ; scratch
+    mov r4, r1
+    mov r5, r2
+    vload r0, r4, DRVD_MAGIC
+    cmp r0, DRV_MAGIC
+    jne .bad
+    vload r0, r4, DRVD_ABI
+    cmp r0, DRV_ABI_VERSION
+    jne .bad
+    vload r0, r4, DRVD_NTYPES
+    cmp r0, DRV_MAXTYPES
+    jug .bad
+    vload r6, r4, DRVD_MEM       ; room for the image and a stack, within reason
+    cmp r6, LDRV_MAXMEM
+    jug .bad
+    mov r0, r5
+    add r0, DRV_MINSTACK
+    cmp r6, r0
+    jul .bad
+    mov r7, DRVD_INIT            ; every entry is 0, or code in the image
+    .entry:
+        cmp r7, DRVD_IRQ
+        jug .entriesok
+        mov r0, r4
+        add r0, r7
+        mov r0, [r0]
+        cmp r0, 0
+        je .nextentry
+        cmp r0, DRVD_SIZE
+        jul .bad                 ; inside the descriptor
+        cmp r0, r5
+        juge .bad                ; past the image
+        .nextentry:
+        add r7, 4
+        jmp .entry
+    .entriesok:
+    vload r0, r4, DRVD_XBUF      ; the transfer buffer lies within its memory
+    cmp r0, LDRV_MAXMEM
+    jug .bad
+    vload r7, r4, DRVD_XLEN
+    cmp r7, LDRV_MAXMEM
+    jug .bad
+    add r0, r7
+    cmp r0, r6
+    jug .bad
+    mov r1, r4                   ; a name, terminated inside its field
+    add r1, DRVD_NAME
+    mov8 r0, [r1]
+    cmp r0, 0
+    je .bad
+    mov r7, 0
+    .name:
+        cmp r7, DRV_NAMELEN
+        juge .bad
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .nameok
+        add r1, 1
+        add r7, 1
+        jmp .name
+    .nameok:
+    mov r0, r6                   ; round up to whole pages
+    add r0, PAGE_SIZE - 1
+    shr r0, PAGE_SHIFT_FAC
+    shl r0, PAGE_SHIFT_FAC
+    jmp .out
+    .bad:
+    mov r0, 0
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Fill a record from a checked descriptor and mark it live. Its segment (LD_BASE,
+; LD_LEN, LD_PAGES) is already set.
+; r1 - record
+; r2 - descriptor
+drv_fillrec:
+    push r4                      ; record
+    push r5                      ; descriptor
+    push r6                      ; field index
+    mov r4, r1
+    mov r5, r2
+    mov r6, 0                    ; the four entries, in LDK_* order
+    .entry:
+        cmp r6, 16
+        juge .entriesdone
+        mov r0, r5
+        add r0, DRVD_INIT
+        add r0, r6
+        mov r0, [r0]
+        mov r1, r4
+        add r1, LD_ENTRY
+        add r1, r6
+        mov [r1], r0
+        add r6, 4
+        jmp .entry
+    .entriesdone:
+    vload r0, r5, DRVD_XBUF
+    vstore r4, LD_XBUF, r0, r1
+    vload r0, r5, DRVD_XLEN
+    vstore r4, LD_XLEN, r0, r1
+    vload r0, r5, DRVD_NTYPES
+    vstore r4, LD_NTYPES, r0, r1
+    mov r0, r4
+    add r0, LD_TYPES
+    mov r1, r5
+    add r1, DRVD_TYPES
+    cpy r1, DRV_MAXTYPES * 4
+    mov r0, r4
+    add r0, LD_NAME
+    mov r1, r5
+    add r1, DRVD_NAME
+    cpy r1, DRV_NAMELEN
+    mov r0, r4                   ; drv_check found a terminator, but keep the
+    add r0, LD_NAME + DRV_NAMELEN - 1 ; field safe on its own terms
+    mov r1, 0
+    mov8 [r0], r1
+    vstore r4, LD_BUSY, 0, r1
+    vstore r4, LD_KIND, 0, r1
+    vstore r4, LD_NREG, 0, r1
+    vstore r4, LD_STATE, LDS_LIVE, r1
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Run a freshly loaded driver's init. If it refuses (or faults) the driver is
+; gone: freed outright if it registered nothing, or kept dead if it did, since
+; a node or a vector would otherwise point into freed memory.
+; r1 - record
+; returns r0 = 0, or DRVE_INIT
+drv_start:
+    push r4
+    mov r4, r1
+    vload r0, r4, LD_ENTRY + LDK_INIT * 4
+    cmp r0, 0
+    je .ok                       ; no init: nothing to refuse
+    mov r1, r4
+    mov r2, LDK_INIT
+    mov r3, 0
+    call drv_call
+    cmp r0, 0
+    jil .failed
+    .ok:
+    mov r0, 0
+    jmp .out
+    .failed:
+    vload r0, r4, LD_NREG
+    cmp r0, 0
+    jne .dead
+    vload r1, r4, LD_BASE
+    vload r2, r4, LD_PAGES
+    call freepages
+    vstore r4, LD_STATE, LDS_FREE, r1
+    jmp .refused
+    .dead:
+    vstore r4, LD_STATE, LDS_DEAD, r1
+    .refused:
+    mov r0, DRVE_INIT
+    .out:
+    pop r4
+    ret
+
+
+; Offer a driver every unowned device of a type it names, in scan order. A
+; device whose bind returns 0 or more is the driver's from then on.
+; r1 - record
+; returns r0 = the number of devices it took
+drv_bindall:
+    push r4                      ; record
+    push r5                      ; device cursor
+    push r6                      ; device index
+    push r7                      ; devices taken
+    mov r4, r1
+    mov r5, hwdevs
+    mov r6, 0
+    mov r7, 0
+    .loop:
+        mov r0, [hwdevcount]
+        cmp r6, r0
+        juge .done
+        vload r0, r5, HWDEV_OWNER
+        cmp r0, 0
+        jne .next
+        vload r1, r5, HWDEV_TYPE
+        mov r2, r4
+        call drv_hastype
+        cmp r0, 0
+        je .next
+        vload r1, r5, HWDEV_TYPE  ; unit = devices of the type before this one,
+        mov r2, r6                ; the numbering devscan gives built-in drivers
+        call hwcountbefore
+        push 0
+        push 0
+        push r0                   ; bind(port, unit)
+        vload r1, r5, HWDEV_PORT
+        push r1
+        mov r1, r4
+        mov r2, LDK_BIND
+        mov r3, sp
+        call drv_call
+        add sp, 16
+        cmp r0, 0
+        jil .next
+        vstore r5, HWDEV_OWNER, r4, r1
+        add r7, 1
+        .next:
+        add r5, HWDEV_STRUCT
+        add r6, 1
+        jmp .loop
+    .done:
+    mov r0, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Whether a driver binds a device type.
+; r1 - type, r2 - record
+; returns r0 = 1 if it does, 0 if not
+drv_hastype:
+    push r4                      ; types left
+    vload r4, r2, LD_NTYPES
+    add r2, LD_TYPES
+    .loop:
+        cmp r4, 0
+        je .no
+        mov r0, [r2]
+        cmp r0, r1
+        je .yes
+        add r2, 4
+        sub r4, 1
+        jmp .loop
+    .yes:
+    mov r0, 1
+    jmp .out
+    .no:
+    mov r0, 0
+    .out:
+    pop r4
+    ret
+
+
+; The loaded driver called this, live or dead.
+; r1 - name
+; returns r0 = its record, or 0
+drv_byname:
+    push r4                      ; record
+    push r5                      ; name
+    mov r5, r1
+    mov r4, drv_table
+    .loop:
+        cmp r4, drv_table + LDRV_MAX * LD_STRUCT
+        juge .none
+        vload r0, r4, LD_STATE
+        cmp r0, LDS_FREE
+        je .next
+        mov r1, r4
+        add r1, LD_NAME
+        mov r2, r5
+        call vfsstreq
+        cmp r0, 0
+        jne .found
+        .next:
+        add r4, LD_STRUCT
+        jmp .loop
+    .found:
+    mov r0, r4
+    jmp .out
+    .none:
+    mov r0, 0
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; A free driver record, or 0 if the table is full.
+drv_freerec:
+    mov r0, drv_table
+    .loop:
+        cmp r0, drv_table + LDRV_MAX * LD_STRUCT
+        juge .full
+        mov r1, [r0]             ; LD_STATE
+        cmp r1, LDS_FREE
+        je .out
+        add r0, LD_STRUCT
+        jmp .loop
+    .full:
+    mov r0, 0
+    .out:
+    ret
+
+
+; How many devices a driver owns.
+; r1 - record
+; returns r0 = the count
+drv_units:
+    push r4                      ; device cursor
+    push r5                      ; devices left
+    mov r4, hwdevs
+    mov r5, [hwdevcount]
+    mov r0, 0
+    .loop:
+        cmp r5, 0
+        je .done
+        vload r2, r4, HWDEV_OWNER
+        cmp r2, r1
+        jne .next
+        add r0, 1
+        .next:
+        add r4, HWDEV_STRUCT
+        sub r5, 1
+        jmp .loop
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Boot-time loading
+; ==========================
+
+; Load every driver in /drivers that binds a device nobody owns. Call once the
+; built-in drivers have bound (after devscan). A driver that fails to load is
+; reported and skipped; the boot carries on without it.
+drv_autoload:
+    push r4                      ; directory handle
+    push r5                      ; entry
+    call timer_reserve           ; the scheduler's timer is taken, bound or not
+    mov r1, 0
+    call hwunowned
+    cmp r0, 0
+    je .out                      ; every device has a driver already
+    mov r1, drv_dirpath
+    mov r2, O_READ
+    call vfsopen
+    cmp r0, -1
+    je .out                      ; no /drivers, nothing to load
+    mov r4, r0
+    .entry:
+        mov r1, r4
+        call vfsreaddir
+        cmp r0, 0
+        je .close
+        mov r5, r0
+        mov r1, r5
+        call drv_mkpath
+        push r0
+        mov r1, r5
+        call vfsnodeunref
+        pop r0
+        cmp r0, 0
+        jne .entry               ; a name too long to be a path
+        mov r1, drv_pathbuf
+        call drv_wanted
+        cmp r0, 0
+        je .entry
+        mov r1, drv_pathbuf
+        call drv_load
+        cmp r0, 0
+        jige .entry
+        mov r1, drv_msg_driver
+        call drv_kputs
+        mov r1, drv_pathbuf
+        call drv_kputs
+        mov r1, drv_msg_noload
+        call drv_kputs
+        jmp .entry
+    .close:
+    mov r1, r4
+    call vfsclose
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; drv_pathbuf = "/drivers/" + a directory entry's name.
+; r1 - the entry's node
+; returns r0 = 0, or -1 if the path would not fit
+drv_mkpath:
+    vload r1, r1, NODE_NAME
+    mov r0, drv_pathbuf
+    mov r2, drv_dirpath
+    .prefix:
+        mov8 r3, [r2]
+        cmp r3, 0
+        je .slash
+        mov8 [r0], r3
+        add r0, 1
+        add r2, 1
+        jmp .prefix
+    .slash:
+    mov r3, 47                   ; '/'
+    mov8 [r0], r3
+    add r0, 1
+    .name:
+        cmp r0, drv_pathbuf + VFS_PATH_MAX - 1
+        juge .long
+        mov8 r3, [r1]
+        mov8 [r0], r3
+        cmp r3, 0
+        je .ok
+        add r0, 1
+        add r1, 1
+        jmp .name
+    .ok:
+    mov r0, 0
+    ret
+    .long:
+    mov r0, -1
+    ret
+
+
+; Whether a file is a driver for some device nobody owns, going by its
+; descriptor alone.
+; r1 - path
+; returns r0 = 1 if so, 0 if not (or it is not a driver)
+drv_wanted:
+    push r4                      ; handle, then types left
+    push r5                      ; type cursor
+    mov r2, O_READ
+    call vfsopen
+    cmp r0, -1
+    je .no
+    mov r4, r0
+    mov r1, r4
+    mov r2, drv_peekbuf
+    mov r3, DRVD_SIZE
+    call drv_readall
+    push r0
+    mov r1, r4
+    call vfsclose
+    pop r0
+    cmp r0, DRVD_SIZE
+    jne .no
+    mov r0, [drv_peekbuf + DRVD_MAGIC]
+    cmp r0, DRV_MAGIC
+    jne .no
+    mov r4, [drv_peekbuf + DRVD_NTYPES]
+    cmp r4, DRV_MAXTYPES
+    jug .no
+    mov r5, drv_peekbuf + DRVD_TYPES
+    .type:
+        cmp r4, 0
+        je .no
+        mov r1, [r5]
+        call hwunowned
+        cmp r0, 0
+        jne .yes
+        add r5, 4
+        sub r4, 1
+        jmp .type
+    .yes:
+    mov r0, 1
+    jmp .out
+    .no:
+    mov r0, 0
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   System calls
+; ==========================
+
+; SYS_DRVLOAD: r2 = path (user). Loads the driver there and binds it to every
+; unowned device it names; loading one that drives nothing is allowed. Returns
+; its index in the driver table, or a DRVE_* error.
+sys_drvload_h:
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .nofile
+    mov r1, spawn_pathbuf
+    call abspath                 ; root a relative path against the cwd
+    mov r1, r0
+    call drv_load
+    jmp sysret
+    .nofile:
+    mov r0, DRVE_NOFILE
+    jmp sysret
+
+
+; SYS_DRVLIST: r2 = buffer (user), r3 = records it has room for. Writes one
+; DRVREC per loaded driver, live or dead, and returns how many; -1 if the buffer
+; is not the caller's.
+sys_drvlist_h:
+    mov r6, r3
+    cmp r6, LDRV_MAX             ; never more than the table holds, which also
+    jule .room                   ; keeps the size below from overflowing
+    mov r6, LDRV_MAX
+    .room:
+    mov r1, r2
+    mov r2, r6
+    umul r2, DRVREC_BYTES
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r5, r0                   ; output cursor (physical)
+    mov r7, 0                    ; records written
+    mov r4, drv_table
+    .loop:
+        cmp r4, drv_table + LDRV_MAX * LD_STRUCT
+        juge .done
+        cmp r7, r6
+        juge .done
+        vload r0, r4, LD_STATE
+        cmp r0, LDS_FREE
+        je .next
+        vstore r5, DRVREC_STATE, r0, r1
+        mov r1, r4
+        call drv_units
+        vstore r5, DRVREC_UNITS, r0, r1
+        mov r0, r5
+        add r0, DRVREC_NAME
+        mov r1, r4
+        add r1, LD_NAME
+        cpy r1, DRV_NAMELEN
+        add r5, DRVREC_BYTES
+        add r7, 1
+        .next:
+        add r4, LD_STRUCT
+        jmp .loop
+    .done:
+    mov r0, r7
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; ---- strings ----
+drv_dirpath:
+    dstr "/drivers\0"
+drv_msg_driver:
+    dstr "driver \0"
+drv_msg_faulted:
+    dstr " faulted and was stopped\n\0"
+drv_msg_noload:
+    dstr " did not load\n\0"

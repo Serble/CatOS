@@ -13,55 +13,98 @@
 ; so the desktop is paged instead: one full-screen page at a time, with a tab bar
 ; along the bottom to move between them.
 ;
-;   page 0        the text console - i.e. the shell. The PPU is in linear mode so
-;                 the tile engine that normally draws the console is not running;
-;                 instead the kernel keeps a plain character grid (see the text
-;                 mirror in kernel/io/console.cat) and hands it over with conread,
-;                 and we rasterise it here with our own copy of the console font.
-;   pages 1..n    one per live surface. Any program that calls wcreate gets a page;
-;                 it commits pixels into its surface and we pull them out with
-;                 wread and centre them in the content area.
+; A page is a surface, and nothing else. Any program that calls wcreate gets one;
+; it commits pixels into its surface and we pull them out with wread and blit them
+; into the content area. So "spawn a window" and "spawn a page" are the same act,
+; and a client needs to know nothing about paging - gdemo is unchanged in that
+; respect.
 ;
-; So "spawn a window" and "spawn a page" are the same act, and a client needs to
-; know nothing about paging - gdemo is unchanged in that respect.
+; The layout this manager imposes is the simplest one there is: every window gets
+; the whole page (fit_pages). Only one page is on screen at a time, so a window has
+; nothing to share the space with, and a small window centred on a 512x368 page just
+; leaves two thirds of a small screen as unusable background - which is what the
+; editor and the stopwatch used to do. The size passed to wcreate is a first guess;
+; wresize is the answer, and the client reshapes itself through wconfig exactly as
+; it would under tile.cat.
+;
+; That subsumes the maximum this always had to enforce: the tab bar makes the page
+; shorter than the display the kernel bounds a surface by, and a full-height window
+; is not merely clipped but invisible, since the scratch buffer wread copies into is
+; exactly one page big.
+;
+; There used to be a page 0 that rasterised the console's text mirror (conread), so
+; that the desktop carried a shell around with it. term.cat replaced it: a terminal
+; is a window like any other, you can have several, and each one gets a pty of its
+; own instead of every view sharing the machine's single console session. Keeping a
+; built-in one would have meant this manager owning a special page that behaves
+; unlike every other page - a tab that cannot be closed, a page with no program
+; behind it, a focus rule with an exception in it - to do worse what an ordinary
+; client now does well. So the console page is gone, and with nothing open the
+; desktop is an empty background: CTRL+` and "term" is how you get a shell, exactly
+; as it is under tile.
 ;
 ;
 ; -- Input --------------------------------------------------------------------
 ;
-; Left/Right arrow change page. Those two keycodes never reach the console: the
-; keyboard ISR diverts them to the window manager while the screen is owned, and
+; CTRL+Left / CTRL+Right change page. Those two keycodes never reach the console:
+; the keyboard ISR diverts them to the window manager while the screen is owned, and
 ; we drain them with gkey.
 ;
-; Only an *unmodified* press of one is ours, which is the whole reason the kernel
-; hands over modifier bits rather than deciding for us: SHIFT+Left is not paging, it
-; is a selection, so it goes to the window like any other key and the editor on that
-; page extends its selection with it.
+; Only the CTRL chord is ours, which is the whole reason the kernel hands over
+; modifier bits rather than deciding for us. A bare Left is a cursor movement and
+; SHIFT+Left is a selection, and both of those belong to the window on the page: an
+; editor needs every arrow there is, and a manager that took the unmodified ones
+; would leave it half a keyboard. That is the general rule a window manager's
+; shortcuts have to follow - an unmodified key is text, and text is the window's -
+; and it is why the launcher is a chord too.
 ;
-; Where every *other* key goes depends on which page you are looking at, and that
-; is the one input decision this program makes:
+; Every *other* key belongs to the page you are looking at: the whole keyboard is
+; grabbed (keygrab -1) and each event is handed to that page's window with
+; wkeypost, whole and uninterpreted, so a program with a window can be typed into.
+; editor.cat and term.cat both need this. That grab is dropped whenever there is no
+; window at all, so an empty desktop leaves the keys to the console line discipline
+; and the boot shell behind it goes on working - the same rule tile.cat follows, and
+; the reason it is a rule is that a manager holding the keyboard with nothing to
+; give it to would be a machine you cannot type at.
 ;
-;   page 0        nothing is grabbed, so keys fall through to the console line
-;                 discipline exactly as they always did - which is what makes
-;                 page 0 a working shell.
-;   pages 1..n    the whole keyboard is grabbed (keygrab -1) and each event is handed
-;                 to that page's window with wkeypost, whole and uninterpreted, so a
-;                 program with a window can be typed into. editor.cat needs this.
+; The grab follows the page, which is the entire focus policy: the window you are
+; looking at is the window you are typing into.
 ;
-; The grab is turned on and off as the page changes, which is the entire focus
-; policy: the window you are looking at is the window you are typing into.
+; CTRL+` opens the launcher over whatever page is up: type to filter the
+; applications in /apps, Up/Down to choose, Enter to start the selected one in the
+; background. CTRL+SHIFT+` opens the same box as a raw command line instead, for
+; anything /apps does not list - a list of what is worth starting can never be
+; complete, and a command with arguments has to stay possible. Pressing the chord
+; you are already in closes the box; pressing the other one switches mode and keeps
+; what you have typed, since a name that matched no application is exactly the thing
+; you then want to run as a command.
 ;
-; Clicking a tab also switches to it, and every window tab carries a small "x" at
-; its right-hand end that closes that window. There is no kernel call for closing
-; one - a surface belongs to the program that made it and goes away when that
-; program does - so the button does the only thing it can: it sends SIGTERM to the
-; owning pid, which wlist reports, exactly as pkill would. A program that installs
-; a SIGTERM handler therefore decides for itself what closing means, and one that
-; does not simply dies and takes its window with it (proc teardown calls gfx_reap).
+; With no console page this is the only way to start a program without quitting
+; first, exactly as in tile.cat. While it is open it takes every key, so nothing is
+; typed into the window behind it, and the backquote is grabbed for the whole session
+; so it works with nothing open too. The line editing, the application list and the
+; spawn live in launch.cat, shared with tile.cat; the keys, the box and the rule
+; about who gets the keyboard are policy and stay here.
+;
+; The bar carries a launcher button at its left-hand end, before the first tab, which
+; opens the same box in application mode. A chord is not discoverable - CTRL+` is
+; something you have to be told - and with nothing open the desktop otherwise offers
+; the pointer nothing at all to click on, which is a machine that looks broken. The
+; button is the visible half of what the chord does, so it goes through toggle_prompt
+; too and the two can never disagree about whether the box is up.
+;
+; Clicking a tab also switches to it, and every tab carries a small "x" at its
+; right-hand end that closes that window. There is no kernel call for closing one -
+; a surface belongs to the program that made it and goes away when that program
+; does - so the button does the only thing it can: it sends SIGTERM to the owning
+; pid, which wlist reports, exactly as pkill would. A program that installs a
+; SIGTERM handler therefore decides for itself what closing means, and one that does
+; not simply dies and takes its window with it (proc teardown calls gfx_reap).
 ;
 ; F1 quits and hands the screen back to the text console; the pointer deliberately
 ; cannot, so a misplaced click never throws you out of the desktop - the worst a
 ; stray click can do is close one window.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define FBW, 512
 #define FBH, 384
@@ -78,20 +121,27 @@
 #define WREC_SEQ, 20
 #define WREC_PID, 24                 ; who to signal when its close button is hit
 
-; ---- the console page ----
+; ---- text, for the tab labels and the command prompt ----
 #define GW, 8                        ; glyph width
 #define GH, 16                       ; glyph height
-#define CON_COLS, 64                 ; FBW / GW        (must match wm.cat's
-#define CON_ROWS, 23                 ; CONTENT_H / GH   CON_GCOLS / CON_GROWS)
-#define CON_HDR, 20                  ; conread header: cols, rows, cursor col/row, seq
-#define CON_SEQ_OFF, 16              ; the change counter within that header
-#define CONBUF_BYTES, 1492           ; CON_HDR + CON_COLS * CON_ROWS
 #define FONT_GLYPHS, 129             ; glyphs the converted font provides
 
 #define KEY_RIGHT, 262               ; raylib keycodes, claimed with keygrab
 #define KEY_LEFT, 263
+#define KEY_DOWN, 264                ; the launcher's selection; not grabbed by name,
+#define KEY_UP, 265                  ; they arrive because the prompt takes every key
 #define KEY_F1, 290                  ; quit back to the raw text console
-#define CON_GEOM, 4194327            ; (CON_COLS << 16) | CON_ROWS, for gacquire
+#define KEY_GRAVE, 96                ; with CTRL: the launcher. With CTRL+SHIFT: the
+                                     ; same box as a raw command line
+#define KEY_ESCAPE, 256
+#define KEY_ENTER, 257
+#define KEY_BACKSPACE, 259
+
+#define START_W, 20                  ; the launcher button, before the first tab
+#define START_ICON_X, 5              ; the icon inside it: a 2x2 grid of squares,
+#define START_ICON_Y, 3              ; (START_W - 10) / 2 and (BAR_H - 10) / 2 in
+#define START_CELL, 4                ; from the button's corner. 4px squares, 2px apart
+#define START_PITCH, 6               ; START_CELL + the gap: one square to the next
 
 #define TAB_W, 56                    ; one tab button, including its 2px gutter
 #define CLOSE_W, 14                  ; the close button's hit area, at the tab's
@@ -110,6 +160,20 @@
 #define TEXT_ON, 0x00FFFFFF
 #define TEXT_OFF, 0x008FA6BC
 #define CURSOR_COLOUR, 0x00FFFFFF
+#define PROMPT_BG, 0x00101820        ; the command prompt: box, its edge when the
+#define PROMPT_EDGE, 0x005A8FD0      ; last line ran, and its edge when it did not
+#define PROMPT_BAD, 0x00C05040
+#define PROMPT_TEXT, 0x00E8F0F5
+#define PROMPT_H, 28                 ; box height: one glyph plus a margin
+#define PROMPT_PAD, 6                ; (PROMPT_H - GH) / 2, the margin itself
+#define PROMPT_INSET, 32             ; gap to the screen edge either side
+#define PROMPT_Y, 140                ; the box, with the match list hanging below it
+#define PROMPT_SEL, 0x002A4A66       ; the selected match's row
+#define LIST_BG, 0x00161E28          ; behind the match list, a shade off the box so
+                                     ; the two read as one panel rather than one thing
+#define LIST_ROWS, 5                 ; matches on screen at once
+#define LIST_ROW_H, 18               ; GH plus a little air
+#define LIST_DESC_X, 104             ; PROMPT_PAD + 12 glyphs: the name column's width
 
 main:
     sys_sbrk ARENA_BYTES             ; r0 = base of the new region, or -1
@@ -119,16 +183,27 @@ main:
     add r0, FB_BYTES
     mov [surfptr], r0                ; surface scratch after it
 
-    sys_gacquire [fbptr], CON_GEOM   ; scan the display out of our own buffer, and
-    cmp r0, -1                       ; ask for a console sized to our content area
-    je .fail
+    sys_gacquire [fbptr], 0          ; scan the display out of our own buffer. We
+    cmp r0, -1                       ; draw no console, so its geometry is left
+    je .fail                         ; alone (0) - nothing here reads it
 
-    sys_keygrab KEY_LEFT, 1          ; claim the keys we page with, so the shell on
-    sys_keygrab KEY_RIGHT, 1         ; page 0 never sees them
-    sys_keygrab KEY_F1, 1            ; ... and the one that gets you out
+    sys_keygrab KEY_LEFT, 1          ; claim the keys we page with. A grab matches on
+    sys_keygrab KEY_RIGHT, 1         ; the keycode alone, so this covers the CTRL
+                                     ; chord that actually pages, and it keeps an
+                                     ; arrow off a console we are not showing
+    sys_keygrab KEY_F1, 1            ; ... the one that gets you out
+    sys_keygrab KEY_GRAVE, 1         ; ... and the one that opens the prompt
+    sys_getpid                       ; so launch_reap knows whose children to bury
+    mov [selfpid], r0
+    call launch_apps_init            ; read /apps once: it changes when something is
+                                     ; installed, not while we are compositing
 
     .loop:
+        mov r1, [selfpid]
+        call launch_reap             ; free the slot of anything we started that has
+                                     ; since exited, before it fills the table
         call read_pages
+        call fit_pages               ; nothing may be bigger than the page it is on
         call handle_keys             ; F1 is the only way out
         cmp r0, 1
         je .quit
@@ -142,6 +217,7 @@ main:
         call clear_content
         call draw_page
         call draw_bar
+        call draw_prompt             ; over the page and the bar, under the pointer
         call draw_cursor
         .flush:
         sys_gpresent                 ; always: the present blocks until the display
@@ -160,23 +236,92 @@ main:
 ;   Page list and input
 ; ==========================
 
-; Refresh the page list: page 0 is always the console, then one page per live
-; surface, so pagecount = surfaces + 1.
+; Refresh the page list: one page per live surface, and nothing else - so with no
+; windows open there are no pages and the desktop is a bare background.
 read_pages:
     sys_wlist wlistbuf, MAXREC
     cmp r0, 0
     jige .ok
     mov r0, 0                        ; treat an error as "no surfaces"
     .ok:
-    add r0, 1
     mov [pagecount], r0
     ret
 
 
-; Drain the key events the ISR diverted to us. An unmodified press of Left/Right
-; steps one page and stops at the ends rather than wrapping; F1 asks to quit.
-; Everything else - modified presses, and every release - belongs to the window on
-; the current page, if there is one, and goes over untouched.
+; Give every window the whole page. A page *is* the screen minus the tab bar, and
+; only one of them is visible at a time, so there is nothing for a window to share
+; the space with and no reason to leave any of it empty: a 400x300 editor floating
+; in the middle of a 512x368 page wastes a third of a screen that is already small,
+; and every pixel it does not claim is background nobody can use. So the size a
+; client asks for is treated as a first guess and the page area is what it gets -
+; the same bargain tile.cat strikes with its cells, arrived at from the opposite
+; direction. wcreate's request survives in the listing (WREC_REQW/H) for anything
+; that wants to know what was wanted.
+;
+; The maximum this used to enforce comes along for free, and it was never optional:
+; the kernel bounds a surface by the *display* and knows nothing about the tab bar,
+; so a full-height window is not merely clipped here but invisible - surfptr is
+; exactly one page big, so wread on a taller surface is refused and the page comes
+; out blank. term.cat found that by asking for the whole screen.
+;
+; wresize is skipped when the size already matches, so the config counter only moves
+; when something really changed and this can run unconditionally every frame. The
+; listing was read before the resize, so it is corrected in place for the rest of
+; this frame; the client hears about it through wconfig and reshapes itself.
+fit_pages:
+    push r4                          ; page index
+    push r5                          ; its record
+    push r6                          ; the width every page gets
+    push r7                          ; and the height
+    mov r6, FBW
+    mov r7, CONTENT_H
+    mov r4, 0
+    .each:
+        mov r0, [pagecount]
+        cmp r4, r0
+        juge .done
+        mov r5, r4
+        umul r5, WREC_BYTES
+        add r5, wlistbuf
+        mov r0, r5                   ; already the right size? then leave it alone,
+        add r0, WREC_W               ; so its config counter stays still
+        mov r0, [r0]
+        cmp r0, r6
+        jne .set
+        mov r0, r5
+        add r0, WREC_H
+        mov r0, [r0]
+        cmp r0, r7
+        je .next
+        .set:
+        mov r0, r6                   ; packed (w << 16) | h
+        shl r0, 16
+        or r0, r7
+        mov r1, [r5]                 ; sid
+        sys_wresize r1, r0
+        cmp r0, -1
+        je .next                     ; refused: draw what is there, clipped
+        mov r0, r5
+        add r0, WREC_W
+        mov [r0], r6
+        mov r0, r5
+        add r0, WREC_H
+        mov [r0], r7
+        .next:
+        add r4, 1
+        jmp .each
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Drain the key events the ISR diverted to us. CTRL+Left / CTRL+Right step one page
+; and stop at the ends rather than wrapping; an unmodified F1 asks to quit.
+; Everything else - the bare arrows included, and every release - belongs to the
+; window on the current page, if there is one, and goes over untouched.
 ; -> r0 = 1 if F1 was pressed.
 handle_keys:
     push r4                          ; the whole event, which is what a window wants
@@ -190,20 +335,52 @@ handle_keys:
         mov r4, r0
         mov r5, r4
         kev_code r5
+
+        cmp r5, KEY_GRAVE            ; CTRL+` in and out of the launcher, on the
+        jne .notgrave                ; press edge, whichever page is up
+        mov r0, r4
+        and r0, KEV_UP
+        cmp r0, 0
+        jne .drain
+        mov r0, r4
+        kev_mods r0
+        mov r1, r0
+        and r0, KMOD_CTRL
+        cmp r0, 0
+        je .notgrave                 ; a bare backquote is just a character
+        and r1, KMOD_SHIFT           ; SHIFT is what asks for the raw command line
+        cmp r1, 0
+        je .wantapps
+        mov r1, LMODE_RAW
+        jmp .gotmode
+        .wantapps:
+        mov r1, LMODE_APPS
+        .gotmode:
+        call toggle_prompt
+        jmp .drain
+        .notgrave:
+        mov r0, [promptup]           ; while it is up it is the only thing typed at,
+        cmp r0, 0                    ; paging and F1 included - ESCAPE is the way out
+        jne .toprompt
+
         mov r0, r4                   ; a release is nobody's shortcut
         and r0, KEV_UP
         cmp r0, 0
         jne .toclient
-        mov r0, r4                   ; nor is a modified press: SHIFT+Left belongs to
-        kev_mods r0                  ; the window, so an editor can select with it
-        cmp r0, 0
-        jne .toclient
-        cmp r5, KEY_F1
-        je .wantquit
+        mov r0, r4                   ; which chord it is decides whose key it is
+        kev_mods r0
+        cmp r0, KMOD_CTRL            ; CTRL+Left / CTRL+Right page; any other CTRL
+        jne .unmod                   ; chord is the window's
         cmp r5, KEY_LEFT
         je .left
         cmp r5, KEY_RIGHT
         je .right
+        jmp .toclient
+        .unmod:
+        cmp r0, 0                    ; a bare arrow is a cursor movement and SHIFT+Left
+        jne .toclient                ; a selection: both belong to the window
+        cmp r5, KEY_F1
+        je .wantquit
         .toclient:
         call page_sid                ; not ours: it belongs to the window on show
         cmp r0, -1
@@ -228,11 +405,94 @@ handle_keys:
         juge .drain
         mov [page], r0
         jmp .drain
+
+        .toprompt:                   ; the prompt's own line editing
+        mov r0, r4
+        and r0, KEV_UP
+        cmp r0, 0
+        jne .drain                   ; releases are nothing to type
+        cmp r5, KEY_ENTER
+        je .runit
+        cmp r5, KEY_ESCAPE
+        je .cancel
+        cmp r5, KEY_BACKSPACE
+        je .rubout
+        cmp r5, KEY_UP
+        je .selup
+        cmp r5, KEY_DOWN
+        je .seldown
+        mov r1, r4                   ; anything else: the character it makes, which
+        kev_char r1                  ; is 0 for the keys that make none
+        call launch_putc
+        jmp .edited
+        .rubout:
+        call launch_erase
+        .edited:
+        mov r0, 0                    ; editing clears a failure from the last run
+        mov [promptbad], r0
+        jmp .drain
+        .selup:
+        mov r1, -1                   ; moving the selection is not editing, so a
+        call launch_move             ; failed run stays reported
+        jmp .drain
+        .seldown:
+        mov r1, 1
+        call launch_move
+        jmp .drain
+        .runit:
+        call launch_commit
+        cmp r0, -1
+        je .badcmd
+        call close_prompt            ; started: get out of the way, and it turns up
+        jmp .drain                   ; as a new page a frame or two from now
+        .badcmd:
+        mov r0, 1                    ; no such command - stay up, in red, so the
+        mov [promptbad], r0          ; typo can be fixed rather than retyped
+        jmp .drain
+        .cancel:
+        call close_prompt
+        jmp .drain
     .done:
     mov r0, r6
     pop r6
     pop r5
     pop r4
+    ret
+
+
+; Open, close, or switch the mode of the prompt box. r1 = the LMODE_* the chord just
+; asked for: the same one we are already in closes the box, the other one switches to
+; it and keeps the line.
+;
+; Opening takes the keyboard immediately rather than waiting for the next sync_grab:
+; with nothing open we are not holding it, the console is still reading, and the
+; first thing typed at a prompt that has just opened would otherwise land in the
+; shell behind us.
+toggle_prompt:
+    mov r0, [promptup]
+    cmp r0, 0
+    je open_prompt
+    mov r0, [launch_mode]
+    cmp r0, r1
+    je close_prompt
+    call launch_setmode              ; the other chord: change what the line means
+    mov r0, 0
+    mov [promptbad], r0
+    ret
+open_prompt:
+    call launch_open                 ; r1 = the mode it opens in
+    mov r0, 0
+    mov [promptbad], r0
+    mov r0, 1
+    mov [promptup], r0
+    call sync_grab
+    ret
+
+close_prompt:
+    mov r0, 0
+    mov [promptup], r0
+    mov [promptbad], r0
+    call sync_grab                   ; and the keyboard goes back to the page
     ret
 
 
@@ -248,37 +508,49 @@ handle_mouse:
     mov r0, r4                       ; bit 0 = left button
     and r0, 1
     cmp r0, 0
-    je .store                        ; not pressed
+    je .release                      ; not pressed
     mov r1, [prevbtn]
     and r1, 1
     cmp r1, 0
     jne .store                       ; still held from last frame -> not an edge
+    mov r1, 1                        ; a press begins here; post_input works out
+    mov [presstart], r1              ; which window, if any, it belongs to
     call tab_hit
     .store:
     mov [prevbtn], r4
     pop r4
     ret
+    .release:
+    mov r1, 0                        ; the button is up, so the grab ends with it
+    mov [grabbed], r1
+    jmp .store
 
 
-; If the pointer is over the tab bar, act on whichever tab it is on: the "x" at the
-; right-hand end of a window tab closes that window, anywhere else on the tab
-; switches to it. The console tab has no close button - there is no program behind
-; page 0 to signal, and the shell is the one thing you cannot get rid of.
+; If the pointer is over the tab bar, act on whatever is under it: the button at the
+; left opens the launcher, the "x" at a tab's right-hand end closes that window, and
+; anywhere else on a tab switches to it.
+;
+; The launcher button is a toggle, exactly as its chord is - clicking it while the box
+; is already up in application mode closes it, and clicking it while the box is up as a
+; raw command line switches modes and keeps the line, since going through
+; toggle_prompt means the pointer and the keyboard cannot disagree about what the box
+; is doing.
 tab_hit:
     mov r0, mousebuf
     add r0, 4
     mov r0, [r0]                     ; y
     cmp r0, CONTENT_H
-    jul .done                        ; above the bar -> not a tab click
+    jul .done                        ; above the bar -> not a bar click
     mov r0, mousebuf
     mov r0, [r0]                     ; x
+    cmp r0, START_W
+    jul .start
+    sub r0, START_W                  ; the tabs begin past the launcher button
     mov r1, TAB_W
     udiv r0, r1                      ; r0 = tab index, r1 = x within that tab
     mov r2, [pagecount]
     cmp r0, r2
     juge .done                       ; past the last tab
-    cmp r0, 0
-    je .select                       ; the console tab is all label
     cmp r1, CLOSE_LEFT
     jul .select                      ; left of the button
     cmp r1, CLOSE_RIGHT
@@ -289,6 +561,10 @@ tab_hit:
     mov [page], r0
     .done:
     ret
+    .start:
+    mov r1, LMODE_APPS               ; the pointer only ever asks for applications; a
+    jmp toggle_prompt                ; raw command line is a thing you type, so it
+                                     ; keeps its chord and no button of its own
 
 
 ; Close the window on page r0 by asking its program to exit. SIGTERM rather than
@@ -299,9 +575,7 @@ tab_hit:
 close_page:
     push r4                          ; the record for that page
     mov r4, r0
-    sub r4, 1                        ; page 1 is record 0
     mov r0, [pagecount]
-    sub r0, 1                        ; surfaces = pages - the console page
     cmp r4, r0
     juge .done                       ; the page list moved under us
     umul r4, WREC_BYTES
@@ -334,14 +608,7 @@ need_redraw:
     mov r0, 0
     mov [needread], r0
 
-    mov r0, [page]                   ; whatever is in the content area
-    cmp r0, 0
-    je .console
-    call check_surface
-    jmp .common
-    .console:
-    call check_console
-    .common:
+    call check_surface               ; whatever is in the content area
     or r4, r0
 
     mov r0, [page]                   ; which page, and how many tabs
@@ -375,37 +642,42 @@ need_redraw:
     je .c4
     mov r4, 1
     .c4:
+    mov r0, [promptup]               ; the prompt box and everything drawn in it -
+    shl r0, 24                       ; what has been typed, which mode it is in,
+    mov r1, [launch_mode]            ; which match is selected and how many there
+    shl r1, 23                       ; are - in one word, since all of it is drawn
+    or r0, r1                        ; into the frame like everything else
+    mov r1, [launch_len]
+    shl r1, 16
+    or r0, r1
+    mov r1, [launch_sel]
+    shl r1, 8
+    or r0, r1
+    mov r1, [launch_nmatch]
+    shl r1, 4
+    or r0, r1
+    mov r1, [promptbad]
+    or r0, r1
+    mov r1, [lastprompt]
+    mov [lastprompt], r0
+    cmp r0, r1
+    je .c5
+    mov r4, 1
+    .c5:
     mov r0, r4
     pop r4
-    ret
-
-
-; Snapshot the console and report whether it changed. Reads it every frame - the
-; grid is only ~1.5KB - so draw_console can just use the buffer we filled here.
-; Uses only r0-r3 so need_redraw's accumulator survives.
-check_console:
-    call read_console
-    mov r0, conbuf
-    add r0, CON_SEQ_OFF
-    mov r0, [r0]
-    mov r1, [lastconseq]
-    mov [lastconseq], r0
-    cmp r0, r1
-    je .same
-    mov r0, 1
-    ret
-    .same:
-    mov r0, 0
     ret
 
 
 ; Report whether the current page's window has committed new pixels, and if so set
 ; needread so draw_surface pulls them across. A different surface in this slot also
 ; counts as new - the id is a slot index and gets recycled.
-; Uses only r0-r3.
+; Uses only r0-r3 so need_redraw's accumulator survives.
 check_surface:
+    mov r0, [pagecount]
+    cmp r0, 0
+    je .nothing                      ; nothing open: the content area is empty
     mov r0, [page]
-    sub r0, 1                        ; page 1 is record 0
     umul r0, WREC_BYTES
     add r0, wlistbuf
     mov r2, r0                       ; this page's wlist record
@@ -431,20 +703,10 @@ check_surface:
     mov r0, 1
     mov [needread], r0
     ret
-
-
-; Pull the console grid into conbuf. On failure present an empty grid rather than
-; drawing whatever the buffer happened to hold.
-read_console:
-    sys_conread conbuf, CONBUF_BYTES
-    cmp r0, -1
-    jne .ok
+    .nothing:
+    mov r0, -1                       ; no surface at all, which is a change from
+    mov [lastsid], r0                ; whatever was here before
     mov r0, 0
-    mov [conbuf], r0                 ; zero columns and rows
-    mov r1, conbuf
-    add r1, 4
-    mov [r1], r0
-    .ok:
     ret
 
 
@@ -452,15 +714,30 @@ read_console:
 ; tell every other window it does not have it. Runs every frame, before the redraw
 ; decision - a click has to be delivered even on a frame we would otherwise skip,
 ; and the program acting on it will bump its commit counter and cause the redraw.
+;
+; A press belongs to the window it started on, and to no other, for as long as it
+; is held. That rule has to live here because we are the only thing that knows
+; where the pointer was when the button went down: a client sees only a level, and
+; turns it into a click by noticing it was 0 last frame and is 1 now. So a window
+; that was not being pointed at - it was a background page, and every background
+; page is told (-1, -1, 0) - has a remembered 0, and the first frame it becomes
+; visible under a button that is still down looks exactly like a fresh press on it.
+; That is how closing one window used to close the one behind it when their buttons
+; happened to line up. Withholding the button until the next press keeps every
+; client honest without any of them needing to know about it, and it is the same
+; reason dragging out of one window and into another does not click the second.
+;
+; The owner is claimed below rather than at the press edge so that it is decided by
+; the very test that gates the buttons, and the two cannot drift apart.
 post_input:
     push r4                          ; index
     push r5                          ; record
     push r6                          ; this page's record, or 0
     mov r6, 0
-    mov r0, [page]
+    mov r0, [pagecount]
     cmp r0, 0
-    je .scan                         ; the console page owns no surface
-    sub r0, 1
+    je .scan                         ; nothing open: everyone gets "not you"
+    mov r0, [page]
     umul r0, WREC_BYTES
     add r0, wlistbuf
     mov r6, r0
@@ -468,7 +745,6 @@ post_input:
     mov r4, 0
     .each:
         mov r0, [pagecount]
-        sub r0, 1                    ; surfaces = pages - the console page
         cmp r4, r0
         juge .done
         mov r5, r4
@@ -516,6 +792,23 @@ post_input:
         mov r3, [r3]
         cmp r1, r3
         juge .send
+        mov r3, [presstart]          ; the pointer really is on this window, so a
+        cmp r3, 0                    ; press starting this frame is this window's
+        je .owner
+        mov r3, [r5]
+        mov [grabsid], r3
+        mov r3, 1
+        mov [grabbed], r3
+        mov r3, 0
+        mov [presstart], r3
+        .owner:
+        mov r3, [grabbed]            ; a button that went down somewhere else stays
+        cmp r3, 0                    ; somewhere else's for as long as it is held
+        je .send
+        mov r3, [grabsid]
+        mov r1, [r5]
+        cmp r3, r1
+        jne .send
         mov r1, mousebuf
         add r1, 8
         mov r1, [r1]
@@ -526,6 +819,8 @@ post_input:
         add r4, 1
         jmp .each
     .done:
+    mov r0, 0                        ; a press that began over no window at all - the
+    mov [presstart], r0              ; tab bar, or the bare desktop - belongs to none
     pop r6
     pop r5
     pop r4
@@ -534,12 +829,24 @@ post_input:
 
 ; Where the current page's window is drawn: centred in the content area. Writes
 ; sx, sy. Uses the record at r6.
+;
+; fit_pages has normally made that the whole content area, so both differences are
+; zero and this is simply the origin. The centring is what happens when they are
+; not: a window whose resize was refused - the surface went away between the
+; listing and the call - sits in the middle of its page rather than in a corner.
+; One that left it *bigger* than the page is pinned to the top-left corner and
+; clipped rather than centred, because the arithmetic is unsigned: half of "minus
+; eight" is two billion, and everything drawn at it lands off the screen.
 surface_rect:
     mov r0, r6
     add r0, WREC_W
     mov r0, [r0]
     mov r1, FBW
     sub r1, r0
+    cmp r1, 0
+    jig .cx
+    mov r1, 0
+    .cx:
     mov r2, 2
     udiv r1, r2
     mov [sx], r1
@@ -548,21 +855,21 @@ surface_rect:
     mov r0, [r0]
     mov r1, CONTENT_H
     sub r1, r0
+    cmp r1, 0
+    jig .cy
+    mov r1, 0
+    .cy:
     mov r2, 2
     udiv r1, r2
     mov [sy], r1
     ret
 
 
-; The surface shown on the current page -> r0 = its sid, or -1 on page 0 (the
-; console) or if the page list has moved under us.
+; The surface shown on the current page -> r0 = its sid, or -1 if there is nothing
+; open or the page list has moved under us.
 page_sid:
     mov r0, [page]
-    cmp r0, 0
-    je .none
-    sub r0, 1                        ; page 1 is record 0
     mov r1, [pagecount]
-    sub r1, 1
     cmp r0, r1
     juge .none
     umul r0, WREC_BYTES
@@ -574,18 +881,23 @@ page_sid:
     ret
 
 
-; Hold the keyboard only while a window is on screen. On page 0 the grab is dropped
-; so the console gets its keys back and the shell works exactly as it does without
-; a window manager running; on any other page we take the lot and relay it to that
-; window. Left/Right/F1 are grabbed by name throughout, so paging always works.
+; Hold the keyboard only while there is a window to give it to. With nothing open
+; the grab is dropped so the console gets its keys back and the shell behind us
+; works exactly as it does without a window manager running; with a page up we take
+; the lot and relay it to that window. Left/Right/F1 are grabbed by name throughout,
+; so CTRL+Left and CTRL+Right always page.
 sync_grab:
     push r4                          ; the grab we want
     mov r4, 0
-    mov r0, [page]
+    mov r0, [promptup]               ; the prompt outranks the pages: while it is up
+    cmp r0, 0                        ; the keys are ours even with nothing open
+    jne .want
+    mov r0, [pagecount]
     cmp r0, 0
-    je .want
-    mov r4, 1
+    je .have
     .want:
+    mov r4, 1
+    .have:
     mov r0, [lastgrab]
     cmp r0, r4
     je .done                         ; already in that state
@@ -597,14 +909,21 @@ sync_grab:
 
 
 ; Keep the selection inside the live page list - the page we were on disappears
-; when the program owning it exits.
+; when the program owning it exits, and the list empties altogether when the last
+; window goes.
 clamp_page:
-    mov r0, [page]
-    mov r1, [pagecount]
-    cmp r0, r1
+    mov r0, [pagecount]
+    cmp r0, 0
+    je .empty
+    mov r1, [page]
+    cmp r1, r0
     jul .done
-    sub r1, 1
-    mov [page], r1
+    sub r0, 1
+    mov [page], r0
+    ret
+    .empty:
+    mov r0, 0
+    mov [page], r0
     .done:
     ret
 
@@ -613,81 +932,14 @@ clamp_page:
 ;   Drawing
 ; ==========================
 
-; Draw whichever page is current into the content area.
+; Draw whichever page is current into the content area. With nothing open there is
+; nothing to draw: clear_content has already left the bare background.
 draw_page:
-    mov r0, [page]
+    mov r0, [pagecount]
     cmp r0, 0
-    je draw_console
+    je .done
     jmp draw_surface
-
-
-; Page 0: rasterise the character grid check_console already fetched into conbuf,
-; then underline the cursor cell. Blank cells are skipped - the background is
-; already there.
-draw_console:
-    push r4                          ; row
-    push r5                          ; column
-    push r6                          ; address of the row in the grid
-    push r7                          ; columns
-    mov r7, [conbuf]                 ; columns
-    mov r0, conbuf
-    add r0, 4
-    mov r0, [r0]
-    mov [conrows], r0
-    mov r4, 0
-    .rows:
-        mov r0, [conrows]
-        cmp r4, r0
-        juge .cursor
-        mov r6, r4                   ; grid + row*cols
-        umul r6, r7
-        add r6, conbuf
-        add r6, CON_HDR
-        mov r5, 0
-        .cols:
-            cmp r5, r7
-            juge .nextrow
-            mov r0, r6
-            add r0, r5
-            mov8 r0, [r0]            ; the character in this cell
-            cmp r0, 32
-            jule .nextcol            ; blank / control -> nothing to draw
-            mov [gch], r0
-            mov r0, r5
-            umul r0, GW
-            mov [gx], r0
-            mov r0, r4
-            umul r0, GH
-            mov [gy], r0
-            mov [gc], TEXT_ON
-            call draw_glyph
-            .nextcol:
-            add r5, 1
-            jmp .cols
-        .nextrow:
-        add r4, 1
-        jmp .rows
-    .cursor:
-    mov r0, conbuf                   ; a two-pixel underline in the cursor cell
-    add r0, 8
-    mov r0, [r0]                     ; cursor column
-    umul r0, GW
-    mov [fx], r0
-    mov r0, conbuf
-    add r0, 12
-    mov r0, [r0]                     ; cursor row
-    umul r0, GH
-    add r0, GH - 2
-    mov [fy], r0
-    mov [fw], GW
-    mov [fh], 2
-    mov [fc], CURSOR_COLOUR
-    call fill_rect
     .done:
-    pop r7
-    pop r6
-    pop r5
-    pop r4
     ret
 
 
@@ -699,7 +951,6 @@ draw_surface:
     push r4                          ; this page's wlist record
     push r6                          ; surface_rect's input
     mov r0, [page]
-    sub r0, 1                        ; page 1 is record 0
     umul r0, WREC_BYTES
     add r0, wlistbuf
     mov r4, r0
@@ -734,9 +985,9 @@ draw_surface:
     ret
 
 
-; The tab bar: one button per page, the current one highlighted, labelled "sh"
-; for the console and "w<n>" for surface page n, with an "x" on every window tab
-; to close it.
+; The tab bar: the launcher button at the left, then one button per page, the current
+; one highlighted, labelled "w<n>", with an "x" on each to close it. With nothing open
+; it is the button and an otherwise empty strip.
 draw_bar:
     push r4                          ; page index
     push r5                          ; tab left edge
@@ -746,6 +997,7 @@ draw_bar:
     mov [fh], BAR_H
     mov [fc], BAR_BG
     call fill_rect
+    call draw_start
     mov r4, 0
     .tabs:
         mov r0, [pagecount]
@@ -753,6 +1005,7 @@ draw_bar:
         juge .done
         mov r5, r4
         umul r5, TAB_W
+        add r5, START_W              ; the tabs start past the launcher button
         mov r0, r5
         add r0, TAB_W
         cmp r0, FBW
@@ -783,9 +1036,64 @@ draw_bar:
     ret
 
 
-; Draw what is inside one tab: a two-glyph label - "w<n>" for a window, "sh" for
-; the console - and, on a window tab only, the "x" that closes it. r1 = the tab's
-; left edge, r2 = page index.
+; The launcher button, at the left-hand end of the bar. It is drawn like a tab and lit
+; like the current one while the box is open, because that is what it is: a control
+; that shows the state it toggles.
+;
+; The icon is a 2x2 grid of squares rather than a letter. The font here is the console's
+; 8x16 blob, which has glyphs and nothing else, so anything pictorial has to be drawn -
+; and four rectangles is a picture the fill_rect already on hand can make. It reads as
+; "the things you can run", which is exactly what the button opens.
+draw_start:
+    push r4                          ; icon row
+    push r5                          ; icon column
+    mov [fx], 0
+    mov [fy], CONTENT_H
+    mov [fw], START_W - 1            ; a 1px gutter, as the tabs have either side
+    mov [fh], BAR_H
+    mov r0, [promptup]
+    cmp r0, 0
+    je .off
+    mov [fc], TAB_ON
+    jmp .paint
+    .off:
+    mov [fc], TAB_OFF
+    .paint:
+    call fill_rect
+    mov r4, 0
+    .rows:
+        cmp r4, 2
+        juge .done
+        mov r5, 0
+        .cols:
+            cmp r5, 2
+            juge .nextrow
+            mov r0, r5
+            umul r0, START_PITCH
+            add r0, START_ICON_X
+            mov [fx], r0
+            mov r0, r4
+            umul r0, START_PITCH
+            add r0, CONTENT_H + START_ICON_Y
+            mov [fy], r0
+            mov [fw], START_CELL
+            mov [fh], START_CELL
+            mov [fc], TEXT_ON
+            call fill_rect
+            add r5, 1
+            jmp .cols
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Draw what is inside one tab: a two-glyph label "w<n>", numbered from 1 so the
+; first window is "w1", and the "x" that closes it. r1 = the tab's left edge,
+; r2 = page index.
 draw_tab_label:
     push r4                          ; the tab's left edge
     push r5                          ; page index
@@ -803,32 +1111,20 @@ draw_tab_label:
     mov r0, r4
     add r0, LABEL_X
     mov [gx], r0
-    cmp r5, 0
-    je .console
     mov [gch], 119                   ; 'w'
     call draw_glyph
-    mov r0, r5                       ; the page number, single digit
-    add r0, 48
+    mov r0, r5                       ; the page number, single digit, 1-based
+    add r0, 49
     mov [gch], r0
     mov r0, r4
     add r0, LABEL_X + GW
     mov [gx], r0
     call draw_glyph
-    mov [gch], 120                   ; 'x': tab_hit closes the window on a click
-    mov r0, r4                       ; here. The console tab does not get one.
+    mov [gch], 120                   ; 'x': tab_hit closes the window on a click here
+    mov r0, r4
     add r0, CLOSE_X
     mov [gx], r0
     call draw_glyph
-    jmp .done
-    .console:
-    mov [gch], 115                   ; 's'
-    call draw_glyph
-    mov [gch], 104                   ; 'h'
-    mov r0, r4
-    add r0, LABEL_X + GW
-    mov [gx], r0
-    call draw_glyph
-    .done:
     pop r5
     pop r4
     ret
@@ -888,10 +1184,211 @@ clear_content:
 ;   Primitives
 ; ==========================
 
+; The command prompt: a box across the middle of the content area holding what has
+; been typed so far. Drawn after the page and the bar so it sits over both - it is a
+; mode this manager is in rather than another page, and while it is up nothing
+; underneath is being typed at anyway. A run that found no such program in /bin
+; turns the edge red and leaves the line alone, so a mistyped name can be corrected
+; instead of retyped.
+draw_prompt:
+    push r4                          ; pen x
+    push r5                          ; cursor into the line
+    mov r0, [promptup]
+    cmp r0, 0
+    je .done
+
+    mov [fx], PROMPT_INSET - 1       ; the edge, as a rectangle one pixel larger all
+    mov [fy], PROMPT_Y - 1           ; round with the box painted inside it
+    mov [fw], FBW - PROMPT_INSET - PROMPT_INSET + 2
+    mov [fh], PROMPT_H + 2
+    mov r0, [promptbad]
+    cmp r0, 0
+    je .edgeok
+    mov [fc], PROMPT_BAD
+    jmp .edge
+    .edgeok:
+    mov [fc], PROMPT_EDGE
+    .edge:
+    call fill_rect
+
+    mov [fx], PROMPT_INSET
+    mov [fy], PROMPT_Y
+    mov [fw], FBW - PROMPT_INSET - PROMPT_INSET
+    mov [fh], PROMPT_H
+    mov [fc], PROMPT_BG
+    call fill_rect
+
+    mov [gy], PROMPT_Y + PROMPT_PAD  ; one glyph row, centred in the box
+    mov [gc], PROMPT_TEXT
+    mov r4, PROMPT_INSET + PROMPT_PAD
+    mov r0, 62                       ; '>' for a command line, ':' for a search, so
+    mov r1, [launch_mode]            ; which mode the box is in is legible without
+    cmp r1, LMODE_RAW                ; having to remember which chord was pressed
+    je .prefix
+    mov r0, 58
+    .prefix:
+    mov [gch], r0                    ; the prefix, a space, then the line
+    mov [gx], r4
+    call draw_glyph
+    add r4, GW
+    add r4, GW
+    mov r5, launch_line
+    .each:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .caret
+        mov [gch], r0
+        mov [gx], r4
+        call draw_glyph
+        add r4, GW
+        add r5, 1
+        jmp .each
+    .caret:
+    mov [fx], r4                     ; a solid block where the next one would go
+    mov [fy], PROMPT_Y + PROMPT_PAD
+    mov [fw], GW
+    mov [fh], GH
+    mov [fc], PROMPT_TEXT
+    call fill_rect
+    call draw_matches
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; The match list, under the box: a panel exactly as many rows tall as there are
+; matches to show, one row per application the line matched, the selected one on a
+; highlight bar, name then description. Nothing at all in raw mode, where there are no
+; matches by definition, and nothing when a search found none - an empty list under an
+; empty box says "no such application" plainly enough.
+;
+; The panel is drawn first, edged like the box and butted straight up against it, so
+; the two are one surface with a divider rather than text floating over whatever page
+; happens to be underneath. Sizing it to the rows in hand rather than to LIST_ROWS is
+; the same idea: an empty strip below the last match would be a list claiming to have
+; more in it.
+draw_matches:
+    push r4                          ; row on screen
+    push r5                          ; the match it shows
+    push r6                          ; that row's top edge; first, the rows on screen
+    push r7                          ; the record's name / desc
+    mov r1, LIST_ROWS
+    call launch_first
+    mov r5, r0
+    mov r0, [launch_nmatch]
+    sub r0, r5
+    cmp r0, 0
+    jile .done                       ; nothing matched: no panel either
+    cmp r0, LIST_ROWS
+    jule .havecount
+    mov r0, LIST_ROWS
+    .havecount:
+    mov r6, r0
+    mov [fx], PROMPT_INSET - 1       ; the edge, meeting the box's own
+    mov [fy], PROMPT_Y + PROMPT_H + 1
+    mov [fw], FBW - PROMPT_INSET - PROMPT_INSET + 2
+    mov r0, r6
+    umul r0, LIST_ROW_H
+    add r0, 2
+    mov [fh], r0
+    mov [fc], PROMPT_EDGE
+    call fill_rect
+    mov [fx], PROMPT_INSET           ; and the panel inside it
+    mov [fy], PROMPT_Y + PROMPT_H + 2
+    mov [fw], FBW - PROMPT_INSET - PROMPT_INSET
+    mov r0, r6
+    umul r0, LIST_ROW_H
+    mov [fh], r0
+    mov [fc], LIST_BG
+    call fill_rect
+    mov r4, 0
+    .rows:
+        cmp r4, LIST_ROWS
+        juge .done
+        mov r0, [launch_nmatch]
+        cmp r5, r0
+        juge .done                   ; ran out of matches before running out of room
+        mov r6, r4
+        umul r6, LIST_ROW_H
+        add r6, PROMPT_Y + PROMPT_H + 2
+
+        mov r0, [launch_sel]         ; the selected row gets a bar behind it
+        cmp r0, r5
+        jne .text
+        mov [fx], PROMPT_INSET
+        mov [fy], r6
+        mov [fw], FBW - PROMPT_INSET - PROMPT_INSET
+        mov [fh], LIST_ROW_H
+        mov [fc], PROMPT_SEL
+        call fill_rect
+
+        .text:
+        mov r0, r6
+        add r0, 1
+        mov [gy], r0
+        mov [gc], PROMPT_TEXT
+        mov r1, r5
+        call launch_match_name
+        mov r7, r0
+        mov r1, r7
+        mov r2, PROMPT_INSET + PROMPT_PAD
+        mov r3, 12
+        call draw_clipped
+        mov [gc], TEXT_OFF           ; the description, dimmer, in its own column
+        mov r1, r5
+        call launch_match_desc
+        mov r7, r0
+        cmp r7, 0
+        je .next
+        mov r1, r7
+        mov r2, PROMPT_INSET + LIST_DESC_X
+        mov r3, 44
+        call draw_clipped
+        .next:
+        add r4, 1
+        add r5, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Draw at most r3 glyphs of the string at r1, starting at x = r2, on the row and in
+; the colour already set in gy/gc.
+draw_clipped:
+    push r4                          ; read cursor
+    push r5                          ; pen x
+    push r6                          ; glyphs left
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    .each:
+        cmp r6, 0
+        jile .done
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .done
+        mov [gch], r0
+        mov [gx], r5
+        call draw_glyph
+        add r5, GW
+        add r4, 1
+        sub r6, 1
+        jmp .each
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
 ; Draw one 8x16 glyph from the embedded console font. Inputs (globals): gx, gy
 ; (top-left pixel), gch (character), gc (colour). Rows whose font byte is zero
-; are skipped - most of a glyph is empty and the console is redrawn every frame,
-; so this is the hot loop.
+; are skipped - most of a glyph is empty.
 draw_glyph:
     push r4                          ; glyph row
     push r5                          ; the row's font byte
@@ -1064,8 +1561,8 @@ blit_rect:
 
 
 ; ---- the console font -------------------------------------------------------
-; The same 8x16 1bpp blob the kernel's PPU driver embeds, so the console page
-; looks exactly like the text console it stands in for. Path is relative to this
+; The same 8x16 1bpp blob the kernel's PPU driver embeds, so the tab labels and the
+; command prompt are set in the machine's own typeface. Path is relative to this
 ; source file (src/user/).
 font:
     dfile "../../build/font.bin"
@@ -1077,15 +1574,25 @@ fbptr:
 surfptr:
     d32 0                            ; base of the surface scratch buffer
 page:
-    d32 0                            ; the page on screen (0 = console)
+    d32 0                            ; the page on screen
 pagecount:
-    d32 1                            ; console + live surfaces
+    d32 0                            ; live surfaces, and nothing else
 lastgrab:
     d32 0                            ; 1 while we are holding the whole keyboard
+selfpid:
+    d32 0                            ; our own pid, for launch_reap
+promptup:
+    d32 0                            ; 1 while the command prompt is open
+promptbad:
+    d32 0                            ; 1 when the last line named nothing runnable
 prevbtn:
     d32 0                            ; last frame's buttons, for press-edge detection
-conrows:
-    d32 0                            ; rows in the last console snapshot
+presstart:
+    d32 0                            ; a press began this frame, owner not yet known
+grabbed:
+    d32 0                            ; a press is in progress and a window owns it
+grabsid:
+    d32 0                            ; which one - only meaningful while grabbed
 ; ---- what the frame on screen was composed from (see need_redraw) ----
 lastpage:
     d32 -1                           ; -1 so the first frame always draws
@@ -1095,8 +1602,9 @@ lastmx:
     d32 -1
 lastmy:
     d32 -1
-lastconseq:
-    d32 0
+lastprompt:
+    d32 -1                           ; the prompt state the frame on screen was drawn
+                                     ; from, packed by need_redraw
 lastsid:
     d32 -1                           ; slot ids are recycled, so track it explicitly
 lastseq:
@@ -1113,8 +1621,6 @@ mousebuf:
     res8 12                          ; x, y, buttons
 wlistbuf:
     res8 MAXREC * WREC_BYTES
-conbuf:
-    res8 CONBUF_BYTES                ; conread header + character grid
 ; fill_rect inputs
 fx:
     d32 0
@@ -1148,3 +1654,5 @@ gc:
     d32 0
 gsrc:
     d32 0                            ; font address of the glyph being drawn
+
+#include "lib/launch.cat"

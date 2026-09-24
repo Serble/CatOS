@@ -1,0 +1,17 @@
+; reboot - restart the machine.
+;
+; Asks the kernel to reset the hardware; the firmware then reloads the kernel
+; off the boot disk, so this comes back up on whatever image is on the disk
+; now. The syscall does not return; the message below is the last thing
+; printed, and the console it was printed on is gone a moment later.
+#include "lib/sys.cat"
+
+main:
+    sys_write 1, msg, msg_end - msg
+    sys_reboot
+    ; not reached
+    sys_exit 0
+
+msg:
+    dstr "Rebooting...\n"
+msg_end:

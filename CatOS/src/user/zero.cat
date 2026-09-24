@@ -1,0 +1,153 @@
+; zero - fill the specified file with the specified amount of zero bytes
+; starting from the start of the file, this will also create the file if it
+; doesn't exist and expand it if it isn't big enough.
+
+jmp main
+
+#include "lib/sys.cat"
+#include "lib/heap.cat"
+
+main:
+    mov r5, r1                       ; argc
+    cmp r5, 3                        ; prog, file, bytes
+    jul .usage
+
+    mov r6, r2                       ; argv[1] -> path
+    add r6, 4
+    mov r6, [r6]                     ; r6 is now path
+
+    mov r1, r2
+    add r1, 8
+    mov r1, [r1]                     ; r1 is now bytes str ptr
+
+    call atoi                        ; number goes to r0
+    mov r7, r0                       ; r7 is now the byte count to write
+
+    sub sp, 12                       ; stat buff space
+    sys_stat r6, sp
+    cmp r0, -1
+    je .notadir                      ; it's not a directory because it doesn't exist (we're about to create it)
+
+    ; it exists
+    mov r0, [sp]                     ; get the type
+    cmp r0, T_DIR                    ; is it a directory?
+    jne .notadir
+
+    ; okay it's a directory, let's not touch that
+    jmp .fail_dir
+
+.notadir:
+    add sp, 12                       ; remove the stat buffer space
+
+    sys_open r6, O_WRITE + O_CREATE
+    cmp r0, -1
+    je .fail
+    mov r5, r0                       ; fd (r0 will be overwritten by future sys calls)
+
+    mov r1, 512
+    call halloc                      ; let's get memory for writing to
+    
+    cmp r0, 0
+    je .fail_storage
+    mov r4, r0                       ; store base of zero span
+
+    ; let's fill it with zero
+    mov r2, 0
+.zerospan:
+    mov [r0], 0
+    add r0, 4
+    add r2, 4
+    cmp r2, 512
+    jne .zerospan
+
+    ; zero
+    sys_seek r5, 0, SEEK_SET          ; ensure we're at the start
+.zeroloop:
+    cmp r7, 0
+    je .finishzero
+
+    cmp r7, 512
+    jule .lastzero
+
+    ; okay let's zero an entire 512 byte section
+    sys_write r5, r4, 512
+    cmp r0, 512
+    jne .fail_write
+    sub r7, 512
+    jmp .zeroloop
+.lastzero:
+    sys_write r5, r4, r7             ; write the remaining bytes
+    cmp r0, r7
+    jne .fail_write
+.finishzero:
+
+    sys_close r5
+    sys_exit 0
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+.fail:
+    sys_write 1, fail_msg, fail_msg_end - fail_msg
+    sys_exit 1
+.fail_write:
+    sys_write 1, fail_write_msg, fail_write_msg_end - fail_write_msg
+    sys_exit 1
+.fail_dir:
+    sys_write 1, fail_dir_msg, fail_dir_msg_end - fail_dir_msg
+    sys_exit 1
+.fail_unknown:                       ; put code in r1, must be less than 10
+    add r1, '0'                      ; turn the number into the char
+    sub sp, 1
+    mov8 [sp], '\n'                  ; newline at end of msg
+    sub sp, 1
+    mov8 [sp], r1                    ; move it into memory for write
+    mov r4, sp                       ; the macros will change sp so we can't pass directly
+    sys_write 1, unknown_error_msg, unknown_error_msg_end - unknown_error_msg
+    sys_write 1, r4, 2               ; write our number, then \n
+    sys_exit 1
+
+.fail_storage:
+    mov r1, 1
+    jmp .fail_unknown
+
+; parse a null-terminated decimal string into r0. Stops at the first
+; non-digit, a leading non-digit yields 0.
+; r1 - string pointer
+atoi:
+    push r4
+    push r5
+    mov r0, 0                        ; accumulator
+    mov r4, r1                       ; cursor
+    .loop:
+        mov8 r5, [r4]
+        cmp r5, '0'                   ; '0'
+        jil .fin
+        cmp r5, '9'                   ; '9'
+        jig .fin
+        umul r0, 10
+        sub r5, '0'
+        add r0, r5
+        add r4, 1
+        jmp .loop
+    .fin:
+    pop r5
+    pop r4
+    ret
+
+usage:
+    dstr "usage: zero <file> <bytes>\n"
+usage_end:
+fail_msg:
+    dstr "zero: cannot open file\n"
+fail_msg_end:
+fail_write_msg:
+    dstr "zero: cannot write file\n"
+fail_write_msg_end:
+unknown_error_msg:
+    dstr "zero: an unknown error has occured: "
+unknown_error_msg_end:
+fail_dir_msg:
+    dstr "zero: cannot target directory\n"
+fail_dir_msg_end:
+

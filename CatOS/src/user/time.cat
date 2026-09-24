@@ -12,7 +12,7 @@
 ;   exit=0
 ;   time=1234 ms
 ;
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define OBUFLEN, 24                  ; enough for any 64-bit value in decimal
 #define PATHBUF, 64                  ; "/bin/" + command name

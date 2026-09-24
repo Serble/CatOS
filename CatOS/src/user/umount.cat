@@ -1,0 +1,37 @@
+; umount - detach the filesystem mounted at a path.
+;
+;   umount <target>
+;
+; Fails while anything is still using the filesystem, which includes a shell
+; sitting in one of its directories: the kernel refuses if any reference to the
+; mount root survives besides the mount itself. cd out and close your files first.
+;
+; On success the kernel also releases the block-backed descriptor the mount was
+; using and, for CatFS, that mount's instance - so unmounting really does give the
+; memory back rather than just hiding the filesystem.
+#include "lib/sys.cat"
+
+main:
+    cmp r1, 2
+    jul .usage
+    mov r1, r2                       ; argv[1] -> mount path
+    add r1, 4
+    mov r1, [r1]
+    sys_umount r1
+    cmp r0, 0
+    jne .failed
+    sys_exit 0
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+.failed:
+    sys_write 1, efail, efail_end - efail
+    sys_exit 1
+
+usage:
+    dstr "usage: umount <target>\n"
+usage_end:
+efail:
+    dstr "umount: failed (not a mount point, or still in use)\n"
+efail_end:

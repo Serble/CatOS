@@ -6,14 +6,17 @@
 ; recover from a crash, and funnels every mutation through a write-ahead redo
 ; log so a power loss can never leave the metadata half-updated.
 ;
-; The filesystem lives inside one partition, reached through a block-backed
-; file descriptor (BF, see disk.cat): BF_PORT + BF_BASE give the disk port and
-; the partition's first block. Every CatFS block number below is partition
-; relative; the absolute disk block is BF_BASE + fsblock.
+; The filesystem lives inside one region, reached through a block-backed file
+; descriptor (BF, see disk.cat). Every CatFS block number below is region
+; relative and the descriptor applies its own base, so the same driver works
+; whether that region is a partition on a disk or a range inside an ordinary
+; file - CatFS itself cannot tell the difference and does not need to.
 ;
-; This driver assumes a single mounted CatFS instance (the root). Its cached
-; superblock and scratch buffers are global; a VFS node stores only its inode
-; number in NODE_FSDATA.
+; Several CatFS filesystems can be mounted at once, and the driver is re-entrant,
+; so one of them may live inside a file on another. Each mount owns an *instance*
+; holding its geometry, buffers and journal; a node records its inode number in
+; NODE_FSDATA and its mount in NODE_FSCTX. See "Per-mount state" below for how
+; only one instance is live at a time and why that is still re-entrant.
 ;
 ;   mov r1, catfs_name
 ;   mov r2, catfs_mount
@@ -85,17 +88,70 @@
 #define CATFS_MAXTXN, 32
 
 ; ---- panic codes ----
-#define CATFS_PANIC_MAGIC, 0xC5       ; superblock magic mismatch at mount
+; A bad superblock is deliberately NOT a panic code: mounting the wrong partition
+; is a user mistake, so catfs_mount just fails. Only a driver bug panics.
 #define CATFS_PANIC_TXN, 0xC6         ; transaction overflowed the log buffer
 
 
 ; ==========================
-;   Global state
+;   Per-mount state
 ; ==========================
-catfs_port:
+; Everything between catfs_state and catfs_stateend belongs to ONE mount: the
+; descriptor, the geometry read out of the superblock, the block-cache tags, and
+; the transaction log. The driver works out of this one fixed region, so all the
+; code below reaches its buffers by name exactly as it always did.
+;
+; A second mount gets an *instance*: a heap block the same size as this region.
+; catfs_enter swaps the region out to the outgoing instance and the incoming one
+; in, so only one mount is ever "live" - which is what lets the driver keep using
+; fixed addresses while still supporting several filesystems at once.
+;
+; That swap is also what makes the driver re-entrant. Reading a CatFS image that
+; lives inside another CatFS re-enters this driver with a different instance
+; part-way through an operation on the outer one; because the inner instance's
+; state is swapped in wholesale and the outer's is preserved in its own instance,
+; the outer operation resumes untouched when the inner one finishes. Each op
+; restores the instance that was live when it was entered, so the nesting unwinds
+; correctly however deep it goes.
+;
+; The cost is a copy of the whole region on a switch, roughly 19 KiB each way.
+; Switching only happens when the live instance actually changes, so ordinary
+; work on a single filesystem never pays it: catfs_enter compares and returns.
+; A loopback mount pays it twice per block, which is slow but correct - and
+; loopback block access was never going to be cheap.
+
+catfs_cur:
+    d32 0                            ; instance whose state is currently live
+
+; ---- Nested-image bounce buffers -------------------------------------------
+; Every buffer CatFS reads a block into lives in the swappable region below, and
+; that is exactly what broke a CatFS image stored inside another CatFS. The nested
+; read re-enters this driver, catfs_enter swaps our region out to our instance and
+; the inner one in, and the bytes the read delivers land in whichever instance is
+; live when they arrive - then vanish when ours is restored. A nested write has the
+; mirror problem: the source pointer still reads from the region, which by then
+; holds somebody else's state.
+;
+; So a block that has to travel through another filesystem lands here first,
+; outside the region, and is copied to or from the caller's buffer while our own
+; instance is live. Only a BFK_NODE descriptor can re-enter the driver - a raw disk
+; cannot reach the VFS at all - so a filesystem sitting straight on a partition,
+; which is every mount made at boot, never pays for any of this.
+;
+; A nested read can itself nest, so the slot is depth-indexed. The kernel is not
+; preemptible, so a plain counter is enough to hand out a private slot per level -
+; the same argument disk.cat's own bounce depth rests on.
+#define CATFS_MAXDEPTH, 4
+
+catfs_bouncedepth:
     d32 0
-catfs_base:
-    d32 0
+catfs_bounce:
+    res8 BLOCK_SIZE * CATFS_MAXDEPTH
+
+
+catfs_state:                         ; ---- start of the swappable region ----
+catfs_dev:
+    d32 0                            ; block-backed descriptor for this partition
 catfs_total:
     d32 0
 catfs_icount:
@@ -158,8 +214,146 @@ catfs_bmbuf:
     res8 512                         ; bitmap scratch
 catfs_jdesc:
     res8 512                         ; journal descriptor scratch
+catfs_stateend:                      ; ---- end of the swappable region ----
+
+; Shared by every mount, so deliberately outside the region above: it is only ever
+; read, and it always holds the same thing.
 catfs_zeros:
     res8 512                         ; a permanently-zero block
+
+
+; ==========================
+;   Instance switching
+; ==========================
+
+; Size of the swappable region, computed from the labels so that adding a field
+; to it cannot leave a hand-written constant behind.
+; returns r0 = byte count
+catfs_statebytes:
+    mov r0, catfs_stateend
+    sub r0, catfs_state
+    ret
+
+
+; Make an instance's state live, saving whatever was live before back into its own
+; instance.
+;
+; This is the only way the region changes hands, and it is deliberately cheap in
+; the case that matters: if the wanted instance is already live it compares and
+; returns, so single-filesystem work never copies anything.
+;
+; Entering 0 is a no-op. There is no instance 0, and every op restores "whatever
+; was live when I was called" on the way out - which is nothing at all for a
+; top-level operation. Making that a no-op rather than a release is what stops an
+; ordinary file read from copying the region out and straight back in. Teardown
+; that really does want to let go of the region calls catfs_park.
+; r1 - instance, or 0 to leave the region alone
+catfs_enter:
+    push r4                          ; wanted instance
+    push r5                          ; outgoing instance
+    mov r4, r1
+    cmp r4, 0
+    je .done
+    mov r5, [catfs_cur]
+    cmp r5, r4
+    je .done                         ; already live
+
+    cmp r5, 0
+    je .load                         ; nothing live to preserve
+    mov r0, r5                       ; save the live region into its instance
+    mov r1, catfs_state
+    call catfs_statebytes_into
+    .load:
+    mov r0, catfs_state              ; bring the wanted instance's state in
+    mov r1, r4
+    call catfs_statebytes_into
+    mov [catfs_cur], r4
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Save the live instance's state and leave no instance live. Teardown only; normal
+; switching goes through catfs_enter.
+catfs_park:
+    push r4
+    mov r4, [catfs_cur]
+    cmp r4, 0
+    je .done
+    mov r0, r4
+    mov r1, catfs_state
+    call catfs_statebytes_into
+    mov r0, 0
+    mov [catfs_cur], r0
+    .done:
+    pop r4
+    ret
+
+
+; Copy the whole swappable region. r0 - destination, r1 - source.
+; Split out so catfs_enter states the direction once per copy instead of
+; recomputing the length inline.
+catfs_statebytes_into:
+    push r4
+    push r5
+    mov r4, r0
+    mov r5, r1
+    call catfs_statebytes             ; r0 = length
+    mov r2, r0
+    mov r0, r4
+    mov r1, r5
+    cpy r1, r2
+    pop r5
+    pop r4
+    ret
+
+
+; Allocate an instance and make it live, without reading its (uninitialised) save
+; area back over the region. Used by mount, which then fills the region in from
+; the superblock it is about to read.
+; returns r0 = instance, or 0 on OOM
+catfs_instance_new:
+    push r4                          ; instance
+    call catfs_statebytes
+    mov r1, r0
+    call heapalloc
+    cmp r0, 0
+    je .fail
+    mov r4, r0
+
+    call catfs_park                  ; preserve whatever was live before we take over
+    mov [catfs_cur], r4
+
+    call catfs_statebytes            ; a fresh mount starts from a clean region
+    mov r2, r0
+    mov r1, catfs_state
+    call catfs_zerobuf
+    mov r0, r4
+    jmp .done
+    .fail:
+    mov r0, 0
+    .done:
+    pop r4
+    ret
+
+
+; Release an instance. The caller must have parked it (catfs_enter with another
+; instance, or 0) before freeing, or the region would still be pointing at it.
+; r1 - instance
+catfs_instance_free:
+    push r4
+    mov r4, r1
+    cmp r4, 0
+    je .done
+    mov r0, [catfs_cur]              ; never free the live one
+    cmp r0, r4
+    je .done
+    mov r1, r4
+    call heapfree
+    .done:
+    pop r4
+    ret
 
 
 ; ==========================
@@ -190,31 +384,131 @@ catfs_cpy:
     ret
 
 
-; Read an absolute-from-partition block straight off the disk.
+; Read a partition-relative block through the backing descriptor. The descriptor
+; owns both the base offset and the choice of backend, so CatFS never learns
+; whether it is sitting on a disk partition or inside somebody else's file - and
+; it cannot address a block outside its own region, because bf_readblock bounds
+; every access against BF_COUNT.
 ; r1 - fsblock, r2 - destination buffer
+; returns r0 = 0 on success, -1 on failure
 catfs_diskread:
-    push r4
+    push r4                          ; the caller's destination
+    push r5                          ; our bounce slot
+    push r6                          ; fsblock
+    push r7                          ; the descriptor
+    mov r6, r1
     mov r4, r2
-    mov r3, [catfs_base]
-    add r3, r1
-    mov r1, [catfs_port]
+    mov r7, [catfs_dev]              ; read it now - it lives in the region too
+    vload r0, r7, BF_KIND
+    cmp r0, BFK_NODE
+    jne .direct                      ; a raw disk cannot re-enter this driver
+
+    call catfs_bounce_take
+    cmp r0, 0
+    je .toodeep
+    mov r5, r0
+    mov r1, r7
+    mov r2, r5
+    mov r3, r6
+    call bf_readblock                ; this may run the driver on another instance
+    push r0                          ; status, across the copy and the release
+    mov r1, r4                       ; our instance is live again, so the caller's
+    mov r2, r5                       ; buffer address means what it should again
+    mov r3, BLOCK_SIZE
+    call catfs_cpy
+    call catfs_bounce_drop
+    pop r0
+    jmp .done
+
+    .direct:
+    mov r1, r7
     mov r2, r4
-    call disk_readblock
+    mov r3, r6
+    call bf_readblock
+    jmp .done
+    .toodeep:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
     pop r4
     ret
 
 
-; Write a block straight to the disk.
+; Write a partition-relative block through the backing descriptor.
 ; r1 - fsblock, r2 - source buffer
+; returns r0 = 0 on success, -1 on failure
 catfs_diskwrite:
-    push r4
+    push r4                          ; the caller's source
+    push r5                          ; our bounce slot
+    push r6                          ; fsblock
+    push r7                          ; the descriptor
+    mov r6, r1
     mov r4, r2
-    mov r3, [catfs_base]
-    add r3, r1
-    mov r1, [catfs_port]
+    mov r7, [catfs_dev]
+    vload r0, r7, BF_KIND
+    cmp r0, BFK_NODE
+    jne .direct
+
+    call catfs_bounce_take
+    cmp r0, 0
+    je .toodeep
+    mov r5, r0
+    mov r1, r5                       ; take the block out of the region before the
+    mov r2, r4                       ; write can swap it away underneath us
+    mov r3, BLOCK_SIZE
+    call catfs_cpy
+    mov r1, r7
+    mov r2, r5
+    mov r3, r6
+    call bf_writeblock
+    push r0
+    call catfs_bounce_drop
+    pop r0
+    jmp .done
+
+    .direct:
+    mov r1, r7
     mov r2, r4
-    call disk_writeblock
+    mov r3, r6
+    call bf_writeblock
+    jmp .done
+    .toodeep:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
     pop r4
+    ret
+
+
+; Claim a bounce slot for one level of nesting.
+; returns r0 = slot address, or 0 when the nesting is deeper than CATFS_MAXDEPTH
+catfs_bounce_take:
+    mov r0, [catfs_bouncedepth]
+    cmp r0, CATFS_MAXDEPTH
+    juge .full
+    mov r1, r0
+    add r1, 1
+    mov [catfs_bouncedepth], r1
+    shl r0, BLOCK_SHIFT
+    add r0, catfs_bounce
+    ret
+    .full:
+    mov r0, 0
+    ret
+
+
+; Release the innermost bounce slot.
+catfs_bounce_drop:
+    mov r0, [catfs_bouncedepth]
+    cmp r0, 0
+    je .done
+    sub r0, 1
+    mov [catfs_bouncedepth], r0
+    .done:
     ret
 
 
@@ -883,6 +1177,8 @@ catfs_makenode:
     mov r5, r0
     vstore r5, NODE_OPS, catfs_ops, r1
     vstore r5, NODE_FSDATA, r4, r1
+    mov r1, [catfs_cur]              ; remember which mount this inode came from,
+    vstore r5, NODE_FSCTX, r1, r2    ; so an op on it can make that mount live
     ; size from the inode
     mov r1, r4
     call catfs_load_inode            ; r0 = inode addr
@@ -898,6 +1194,82 @@ catfs_makenode:
 ; ==========================
 ;   Directory operations
 ; ==========================
+
+; Detach an entry from a directory, leaving the child itself alone.
+;
+; This is the scan half of a remove and the whole of the old side of a rename:
+; the two differ only in what happens to the inode afterwards - remove frees it,
+; rename links it in somewhere else - so the scan lives here once instead of in
+; both. Must run inside a transaction; the caller commits.
+; r1 - directory inode number, r2 - name
+; -> r0 = the child's inode number, or 0 if the name is not there
+catfs_dir_unlink:
+    push r4                          ; name
+    push r5                          ; entry index
+    push r6                          ; entry count
+    push r7                          ; child inode
+    mov r4, r2
+    call catfs_load_inode            ; r1 = the directory
+    mov r0, [catfs_iptr]
+    vload r6, r0, CI_SIZE
+    shr r6, DE_SHIFT                 ; entry count = size / 32
+    mov r5, 0
+    .scan:
+        cmp r5, r6
+        juge .none
+        mov r0, r5                   ; new block? load it
+        and r0, DE_PERBLK - 1
+        cmp r0, 0
+        jne .haveblk
+        mov r1, [catfs_iptr]
+        mov r2, r5
+        shr r2, DE_PERSHIFT
+        mov r3, 0
+        call catfs_map_block
+        cmp r0, 0
+        je .skip                     ; hole (should not happen in a dir)
+        mov [catfs_dirblk], r0
+        mov r1, r0
+        mov r2, catfs_dbuf
+        call catfs_txn_read
+        .haveblk:
+        mov r0, r5                   ; entry addr = dbuf + (idx & 15) * 32
+        and r0, DE_PERBLK - 1
+        shl r0, DE_SHIFT
+        add r0, catfs_dbuf
+        mov r1, [r0]                 ; DE_INO
+        cmp r1, 0
+        je .next                     ; free slot
+        push r0                      ; save the entry addr across the compare
+        mov r1, r0
+        add r1, DE_NAME
+        mov r2, r4
+        call vfsstreq
+        pop r1                       ; entry addr
+        cmp r0, 0
+        je .next
+        mov r7, [r1]                 ; matched: take the inode, free the slot
+        mov [r1], 0
+        mov r1, [catfs_dirblk]
+        mov r2, catfs_dbuf
+        call catfs_txn_write
+        mov r0, r7
+        jmp .done
+        .next:
+        add r5, 1
+        jmp .scan
+        .skip:
+        add r5, DE_PERBLK            ; hole: skip a whole block of entries
+        jmp .scan
+    .none:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
 
 ; Find a child by name. r1 - dir inode addr, r2 - name
 ; -> r0 = child inode number, 0 if absent
@@ -1071,9 +1443,98 @@ catfs_dir_add:
 ; ==========================
 ;   VFS operations
 ; ==========================
+; The VFS hands an op nothing but a node, so each entry point is a wrapper that
+; makes that node's mount live before running the real body and puts the previous
+; one back afterwards. Restoring rather than parking is what makes nesting work:
+; when a loopback mount's block read re-enters this driver, the outer operation
+; finds its own instance live again the moment the inner one returns.
+;
+; The bodies are the _i routines and assume their instance is already live, which
+; is also true of every internal helper - only these wrappers switch.
+
+; Wrap an op that takes its arguments in registers. $1 = body.
+#macro catfs_wrap3, 1
+    push r4                          ; instance to go back to
+    push r5                          ; the register arguments
+    push r6
+    push r7
+    mov r5, r1
+    mov r6, r2
+    mov r7, r3
+    mov r4, [catfs_cur]
+    vload r1, r5, NODE_FSCTX
+    call catfs_enter
+    mov r1, r5
+    mov r2, r6
+    mov r3, r7
+    call $1
+    push r0                          ; the result has to survive the switch back
+    mov r1, r4                       ; 0 here means "nothing was live": a no-op, so
+    call catfs_enter                 ; a top-level op leaves its instance live
+    pop r0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+#endmacro
+
+; Wrap an op that also takes a length on the stack (read and write). $1 = body.
+#macro catfs_wrap4, 1
+    push r4                          ; instance to go back to
+    push r5                          ; node
+    push r6                          ; offset
+    push r7                          ; buffer
+    mov r5, r1
+    mov r6, r2
+    mov r7, r3
+    mov r0, sp                       ; the length sits above our four pushes
+    add r0, 20
+    mov r0, [r0]
+    push r0                          ; keep it across the switch
+    mov r4, [catfs_cur]
+    vload r1, r5, NODE_FSCTX
+    call catfs_enter
+    mov r0, sp                       ; read it back and pass it on
+    mov r0, [r0]
+    push r0
+    mov r1, r5
+    mov r2, r6
+    mov r3, r7
+    call $1
+    add sp, 8                        ; drop the argument and our copy of it
+    push r0
+    mov r1, r4                       ; as above: a no-op when nothing was live
+    call catfs_enter
+    pop r0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+#endmacro
+
+
+catfs_lookup:
+    catfs_wrap3 catfs_lookup_i
+catfs_readdir:
+    catfs_wrap3 catfs_readdir_i
+catfs_create:
+    catfs_wrap3 catfs_create_i
+catfs_remove:
+    catfs_wrap3 catfs_remove_i
+catfs_truncate:
+    catfs_wrap3 catfs_truncate_i
+catfs_read:
+    catfs_wrap4 catfs_read_i
+catfs_write:
+    catfs_wrap4 catfs_write_i
+catfs_rename:
+    catfs_wrap4 catfs_rename_i       ; four arguments, so the wide wrapper
+
 
 ; lookup(r1=dir, r2=name) -> r0 = child node (ref taken) or 0
-catfs_lookup:
+catfs_lookup_i:
     push r4                          ; dir node
     push r5                          ; name
     push r6                          ; child inode
@@ -1106,7 +1567,7 @@ catfs_lookup:
 
 
 ; readdir(r1=dir, r2=index) -> r0 = child node (ref taken) or 0 past the end
-catfs_readdir:
+catfs_readdir_i:
     push r4                          ; dir node
     push r5                          ; remaining index / entry addr
     push r6                          ; entry index e / child inode
@@ -1177,7 +1638,7 @@ catfs_readdir:
 
 
 ; read(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes read
-catfs_read:
+catfs_read_i:
     push r4                          ; offset
     push r5                          ; destination
     push r6                          ; remaining
@@ -1256,7 +1717,7 @@ catfs_read:
 
 
 ; write(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes written
-catfs_write:
+catfs_write_i:
     push r4                          ; offset
     push r5                          ; source
     push r6                          ; remaining
@@ -1336,7 +1797,7 @@ catfs_write:
 
 
 ; create(r1=dir, r2=name, r3=type) -> r0 = new node (ref taken) or 0
-catfs_create:
+catfs_create_i:
     push r4                          ; dir node
     push r5                          ; name
     push r6                          ; type
@@ -1382,120 +1843,126 @@ catfs_create:
 
 
 ; remove(r1=dir, r2=name) -> r0 = 0 on success, -1 if the name is absent
-catfs_remove:
-    push r4                          ; dir node
-    push r5                          ; name
-    push r6                          ; child inode
-    push r7                          ; entry index e
-    mov r4, r1
-    mov r5, r2
+;
+; Unlink the entry, then free everything the child owned: its data blocks, its
+; indirect block, and finally its inode. The VFS has already refused a non-empty
+; directory and a mount point by the time this runs, so nothing else can still be
+; reachable through the blocks being freed here.
+catfs_remove_i:
+    push r4                          ; the child's inode number
+    push r5                          ; pointer index while freeing
+    push r6                          ; directory inode number
+    push r7                          ; name
+    vload r6, r1, NODE_FSDATA
+    mov r7, r2
     call catfs_txn_begin
-    vload r1, r4, NODE_FSDATA
+    mov r1, r6
+    mov r2, r7
+    call catfs_dir_unlink            ; r0 = the child, or 0 if there is no such name
+    cmp r0, 0
+    je .notfound
+    mov r4, r0
+
+    mov r1, r4                       ; free the child's direct blocks ...
     call catfs_load_inode
-    mov r0, [catfs_iptr]
-    vload r0, r0, CI_SIZE
-    shr r0, DE_SHIFT
-    push r0                           ; [sp] = nument
-    mov r7, 0
-    .scan:
-        mov r0, [sp]
-        cmp r7, r0
-        juge .notfound
-        mov r0, r7
-        and r0, DE_PERBLK - 1
-        cmp r0, 0
-        jne .haveblk
-        mov r1, [catfs_iptr]
-        mov r2, r7
-        shr r2, DE_PERSHIFT
-        mov r3, 0
-        call catfs_map_block
-        cmp r0, 0
-        je .skip
-        mov [catfs_dirblk], r0
-        mov r1, r0
-        mov r2, catfs_dbuf
-        call catfs_txn_read
-        .haveblk:
-        mov r0, r7
-        and r0, DE_PERBLK - 1
-        shl r0, DE_SHIFT
-        add r0, catfs_dbuf
-        mov r1, [r0]                 ; DE_INO
-        cmp r1, 0
-        je .next
-        push r0
-        mov r1, r0
-        add r1, DE_NAME
-        mov r2, r5
-        call vfsstreq
-        pop r1                       ; entry addr
-        cmp r0, 0
-        je .next
-        mov r6, [r1]                 ; matched: child inode
-        mov [r1], 0                  ; clear the dir slot
-        mov r1, [catfs_dirblk]
-        mov r2, catfs_dbuf
-        call catfs_txn_write
-        jmp .freechild
-        .next:
-        add r7, 1
-        jmp .scan
-        .skip:
-        add r7, DE_PERBLK
-        jmp .scan
-    .freechild:
-        mov r1, r6                   ; free the child's data + inode
-        call catfs_load_inode
-        mov r7, 0
-        .dloop:
-            cmp r7, CATFS_DIRECT
-            juge .donedirect
-            mov r0, [catfs_iptr]
-            add r0, CI_DIRECT
-            mov r1, r7
-            shl r1, 2
-            add r0, r1
-            mov r1, [r0]
-            call catfs_free_block
-            add r7, 1
-            jmp .dloop
-        .donedirect:
+    mov r5, 0
+    .dloop:
+        cmp r5, CATFS_DIRECT
+        juge .donedirect
         mov r0, [catfs_iptr]
-        vload r1, r0, CI_INDIRECT
-        cmp r1, 0
-        je .noind
-        push r1                      ; indirect block
-        mov r2, catfs_blk
-        call catfs_txn_read
-        mov r7, 0
-        .iloop:
-            cmp r7, CATFS_PTRS
-            juge .doneind
-            mov r0, r7
-            shl r0, 2
-            add r0, catfs_blk
-            mov r1, [r0]
-            call catfs_free_block
-            add r7, 1
-            jmp .iloop
-        .doneind:
-        pop r1
+        add r0, CI_DIRECT
+        mov r1, r5
+        shl r1, 2
+        add r0, r1
+        mov r1, [r0]
         call catfs_free_block
-        .noind:
-        mov r0, [catfs_iptr]         ; mark the inode free
-        vstore r0, CI_TYPE, 0, r1
-        call catfs_store_inode
-        mov r1, r6
-        call catfs_free_inode
-        call catfs_txn_commit
-        mov r0, 0
-        jmp .done
+        add r5, 1
+        jmp .dloop
+    .donedirect:
+    mov r0, [catfs_iptr]             ; ... everything the indirect block names,
+    vload r1, r0, CI_INDIRECT        ; and the indirect block itself ...
+    cmp r1, 0
+    je .noind
+    push r1
+    mov r2, catfs_blk
+    call catfs_txn_read
+    mov r5, 0
+    .iloop:
+        cmp r5, CATFS_PTRS
+        juge .doneind
+        mov r0, r5
+        shl r0, 2
+        add r0, catfs_blk
+        mov r1, [r0]
+        call catfs_free_block
+        add r5, 1
+        jmp .iloop
+    .doneind:
+    pop r1
+    call catfs_free_block
+    .noind:
+    mov r0, [catfs_iptr]             ; ... and last the inode
+    vstore r0, CI_TYPE, 0, r1
+    call catfs_store_inode
+    mov r1, r4
+    call catfs_free_inode
+    call catfs_txn_commit
+    mov r0, 0
+    jmp .done
     .notfound:
     call catfs_txn_commit
     mov r0, -1
     .done:
-    add sp, 4                        ; drop nument
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; rename(r1=olddir, r2=oldname, r3=newdir, [sp]=newname) -> r0 = 0 / -1
+;
+; Nothing is copied and no block moves: the entry is taken out of one directory
+; and put into another under a new name, and the inode it points at never learns
+; that any of this happened. Directories move as cheaply as files because a CatFS
+; directory stores no ".." on disk - the parent link lives in the VFS node, which
+; the rename invalidates - so there is no back-pointer to fix up.
+;
+; Both directories are in this instance (the VFS checked the mount matches), and
+; the destination name is already known to be free, so the only failure left is a
+; source that is not there. One transaction covers the unlink and the link, so a
+; crash in between cannot lose the entry: recovery either replays both or neither.
+catfs_rename_i:
+    push r4                          ; old directory inode number
+    push r5                          ; old name
+    push r6                          ; new directory inode number
+    push r7                          ; new name, then the moved inode
+    mov r7, sp
+    add r7, 20
+    mov r7, [r7]                     ; newname
+    vload r4, r1, NODE_FSDATA
+    mov r5, r2
+    vload r6, r3, NODE_FSDATA
+    push r7                          ; r7 is about to hold the inode instead
+    call catfs_txn_begin
+    mov r1, r4
+    mov r2, r5
+    call catfs_dir_unlink            ; r0 = the moved inode, 0 if the name is absent
+    cmp r0, 0
+    je .fail
+    mov r7, r0
+    mov r1, r6                       ; link it in under the new name; when the two
+    mov r2, [sp]                     ; directories are the same this reuses the
+    mov r3, r7                       ; slot just cleared, since a transaction reads
+    call catfs_dir_add               ; back its own staged writes
+    call catfs_txn_commit
+    mov r0, 0
+    jmp .done
+    .fail:
+    call catfs_txn_commit
+    mov r0, -1
+    .done:
+    add sp, 4                        ; drop the new name
     pop r7
     pop r6
     pop r5
@@ -1504,7 +1971,7 @@ catfs_remove:
 
 
 ; truncate(r1=node, r2=newlen) -> r0 = 0
-catfs_truncate:
+catfs_truncate_i:
     push r4                          ; node
     push r5                          ; new length
     push r6                          ; last file-block index
@@ -1586,11 +2053,16 @@ catfs_sbfield:
 ; mountfn(r1=block-backed-file descriptor) -> r0 = root directory node
 catfs_mount:
     push r4                          ; BF descriptor
+    push r5                          ; instance that was live before us
+    push r6                          ; the instance we are building
     mov r4, r1
-    vload r0, r4, BF_PORT
-    mov [catfs_port], r0
-    vload r0, r4, BF_BASE
-    mov [catfs_base], r0
+    mov r5, [catfs_cur]
+
+    call catfs_instance_new          ; a clean region of our own, now live
+    cmp r0, 0
+    je .nomem
+    mov r6, r0
+    mov [catfs_dev], r4
 
     mov r1, catfs_zeros              ; make sure the zero block really is zero
     mov r2, BLOCK_SIZE
@@ -1600,11 +2072,15 @@ catfs_mount:
     mov r1, 0                        ; read + validate the superblock
     mov r2, catfs_sb
     call catfs_diskread
+    cmp r0, 0
+    jne .fail                        ; the backing store would not give us block 0
     mov r0, [catfs_sb]
     cmp r0, CATFS_MAGIC
-    je .magicok
-    kpanic CATFS_PANIC_MAGIC
-    .magicok:
+    jne .fail                        ; not a CatFS. A mount of the wrong partition
+                                     ; is an ordinary user mistake now that mounting
+                                     ; is a syscall, so this fails the mount instead
+                                     ; of panicking the kernel; boot still turns a
+                                     ; zero return into PANIC_ROOT_FAILED.
 
     mov r1, SB_TOTAL
     call catfs_sbfield
@@ -1658,14 +2134,50 @@ catfs_mount:
     vstore r0, NODE_OPS, catfs_ops, r1
     mov r1, [catfs_rootino]
     vstore r0, NODE_FSDATA, r1, r2
+    mov r1, [catfs_cur]              ; this mount, for every op on the root
+    vstore r0, NODE_FSCTX, r1, r2
     mov r1, [catfs_rootino]
     call catfs_load_inode
     vload r1, r0, CI_SIZE
     pop r0
     vstore r0, NODE_SIZE, r1, r2
-    jmp .done
+
+    push r0                          ; a nested mount gives the outer mount its
+    mov r1, r5                       ; instance back; for a top-level one this is a
+    call catfs_enter                 ; no-op and ours simply stays live
+    pop r0
+    jmp .out
+
     .fail:
+    mov r1, r5                       ; restore the caller's instance, bin ours
+    call catfs_enter
+    mov r1, r6
+    call catfs_instance_free
+    .nomem:
     mov r0, 0
+    .out:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Release the instance a mount was using. Called once the mount is gone, so
+; nothing can reach the instance any more. If it happens to be the live one it is
+; parked first, because catfs_instance_free refuses to free live state.
+; r1 - instance (a node's NODE_FSCTX)
+catfs_release:
+    push r4
+    mov r4, r1
+    cmp r4, 0
+    je .done
+    mov r0, [catfs_cur]
+    cmp r0, r4
+    jne .free
+    call catfs_park
+    .free:
+    mov r1, r4
+    call catfs_instance_free
     .done:
     pop r4
     ret
@@ -1681,6 +2193,7 @@ catfs_ops:
     d32 catfs_truncate               ; OP_TRUNCATE
     d32 0                            ; OP_STAT
     d32 0                            ; OP_SYNC (writes are already durable)
+    d32 catfs_rename                 ; OP_RENAME
 
 catfs_name:
     dstr "catfs\0"

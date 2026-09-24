@@ -1,0 +1,71 @@
+; drvlist - list the loaded drivers.
+;
+; One row per driver: how many devices it drives, whether it is running or was
+; stopped after a fault ("dead"), and its name. A driver the kernel loaded at
+; boot and one loaded with drvload look the same. The name is last because it is
+; the only column whose width varies.
+#include "lib/sys.cat"
+
+#define UNITCOL, 7                   ; the devices column, right-aligned
+
+main:
+    sys_drvlist drvbuf, DRV_MAX
+    cmp r0, -1
+    je .fail
+    mov r5, r0                       ; record count (r5-r7 survive syscalls)
+    mov r6, drvbuf                   ; record cursor
+    mov r7, 0                        ; record index
+
+    mov r1, header
+    call emit_str
+    call flush
+
+    .row:
+        cmp r7, r5
+        juge .done
+        mov r1, r6
+        add r1, DRVREC_UNITS
+        mov r1, [r1]
+        mov r2, UNITCOL
+        call emit_dec
+        mov r1, 32                   ; ' '
+        call emit_char
+        mov r1, live                 ; both state words are padded to the width of
+        mov r0, [r6]                 ; STATE, so the name column lines up
+        cmp r0, DRVSTATE_DEAD        ; (DRVREC_STATE is at offset 0)
+        jne .state
+        mov r1, dead
+        .state:
+        call emit_str
+        mov r1, 32
+        call emit_char
+        mov r1, r6                   ; the name, which the kernel terminated
+        add r1, DRVREC_NAME
+        call emit_str
+        mov r1, 10                   ; '\n'
+        call emit_char
+        call flush
+        add r6, DRVREC_BYTES
+        add r7, 1
+        jmp .row
+    .done:
+    sys_exit 0
+
+.fail:
+    sys_write 1, errmsg, errmsg_end - errmsg
+    sys_exit 1
+
+
+header:
+    dstr "DEVICES STATE NAME\n\0"
+live:
+    dstr "live \0"
+dead:
+    dstr "dead \0"
+errmsg:
+    dstr "drvlist: cannot read the driver list\n"
+errmsg_end:
+drvbuf:
+    res8 DRV_MAX * DRVREC_BYTES
+
+#include "lib/fmt.cat"

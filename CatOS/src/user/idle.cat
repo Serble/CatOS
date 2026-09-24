@@ -1,7 +1,7 @@
 ; The idle process: always runnable, never blocks or exits. It exists so the
 ; scheduler always has something to run when every real process is blocked.
 ; It simply yields the CPU forever.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 idle_start:
     sys_yield

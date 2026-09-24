@@ -1,0 +1,880 @@
+; catpart - partition and format a disk or an image file, from inside CatOS.
+;
+;   catpart init <dev>                          write a fresh, empty table
+;   catpart add  <dev> <type> <start> <blocks>  append a partition entry
+;   catpart mkfs <dev> <index>                  format a partition as CatFS
+;
+;     type       raw | catfs   (the type recorded in the table)
+;     start      first block of the partition
+;     blocks     its length in blocks
+;
+; `add catfs` records the type but does NOT format - run mkfs afterwards, so that
+; laying out a disk and building a filesystem stay separate steps you can inspect
+; between (parts shows the result of the first).
+;
+; This is the userland counterpart of tools/mkfs_catfs.py, and it has to agree with
+; it exactly: both are implementations of ../../CatFS.md and a disk written by one
+; is mounted by the other. The layout arithmetic below mirrors plan_layout() in
+; tools/catfs.py field for field.
+;
+; Everything here is ordinary file I/O on the device path, so it works on a real
+; disk and on an image file identically, and needs no privilege beyond being able
+; to write the file.
+#include "lib/sys.cat"
+
+#define BLOCK_SIZE, 512
+#define BLOCK_SHIFT, 9
+
+; ---- partition table (../../CatPartitions.md) ----
+#define PT_MAGIC, 51
+#define PT_VERSION_OFF, 0x08
+#define PT_COUNT_OFF, 0x0C
+#define PT_ENTRIES_OFF, 0x20
+#define PT_ENTRY_SIZE, 12
+#define PE_TYPE, 0
+#define PE_START, 4
+#define PE_COUNT, 8
+#define PT_MAXENT, 39
+#define PART_RAW, 0
+#define PART_CATFS, 1
+
+; ---- CatFS (../../CatFS.md) ----
+#define CATFS_MAGIC, 0x46746143      ; "CatF"
+#define CATFS_JMAGIC, 0x316C6E4A     ; "Jnl1"
+#define CATFS_VERSION, 1
+#define CATFS_ROOTINO, 1
+#define CATFS_TDIR, 2
+#define CATFS_IPERBLK, 8             ; inodes per block
+#define CATFS_ISIZE, 64
+#define CATFS_JDEFAULT, 64           ; default journal length, in blocks
+#define CATFS_JMIN, 3
+#define CATFS_MINTOTAL, 16           ; smaller than this cannot hold a filesystem
+#define BITS_PER_BLOCK, 4096         ; 512 * 8
+
+#define SB_MAGIC, 0x00
+#define SB_VERSION, 0x04
+#define SB_BLKSIZE, 0x08
+#define SB_TOTAL, 0x0C
+#define SB_ICOUNT, 0x10
+#define SB_IBM_START, 0x14
+#define SB_IBM_BLOCKS, 0x18
+#define SB_DBM_START, 0x1C
+#define SB_DBM_BLOCKS, 0x20
+#define SB_IT_START, 0x24
+#define SB_IT_BLOCKS, 0x28
+#define SB_DATA_START, 0x2C
+#define SB_DATA_BLOCKS, 0x30
+#define SB_J_START, 0x34
+#define SB_J_BLOCKS, 0x38
+#define SB_ROOT_INO, 0x3C
+#define SB_STATE, 0x40
+
+#define CI_TYPE, 0
+#define CI_SIZE, 4
+#define CI_LINKS, 8
+
+
+main:
+    mov r5, r1                       ; argc
+    mov r6, r2                       ; argv
+    cmp r5, 3
+    jul .usage
+
+    mov r1, r6                       ; argv[2] -> device path, common to all verbs
+    add r1, 8
+    mov r0, [r1]
+    mov [devpath], r0
+
+    mov r1, r6                       ; argv[1] -> verb
+    add r1, 4
+    mov r7, [r1]
+
+    mov r1, r7
+    mov r2, verb_init
+    call streq
+    cmp r0, 1
+    je do_init
+    mov r1, r7
+    mov r2, verb_add
+    call streq
+    cmp r0, 1
+    je do_add
+    mov r1, r7
+    mov r2, verb_mkfs
+    call streq
+    cmp r0, 1
+    je do_mkfs
+    jmp .usage
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+
+
+; ==========================
+;   init
+; ==========================
+; A fresh table: magic, version, zero partitions. The UUID is left zero because
+; there is no entropy source here and nothing reads it yet.
+do_init:
+    call open_dev
+    mov r1, blkbuf                   ; a table with nothing in it
+    mov r2, BLOCK_SIZE
+    call zerobuf
+    mov r0, blkbuf
+    mov [r0], PT_MAGIC               ; low word; the high word stays zero
+    mov r0, blkbuf
+    add r0, PT_VERSION_OFF
+    mov [r0], 1
+    mov r0, blkbuf
+    add r0, PT_COUNT_OFF
+    mov [r0], 0
+
+    mov r1, 0
+    mov r2, blkbuf
+    call wblock
+    cmp r0, 0
+    jne fail_write
+    call close_dev
+    mov r1, msg_init
+    call emit_str
+    call flush
+    sys_exit 0
+
+
+; ==========================
+;   add
+; ==========================
+do_add:
+    cmp r5, 6
+    jul badargs
+
+    mov r1, r6                       ; type name
+    add r1, 12
+    mov r1, [r1]
+    mov r2, tname_raw
+    call streq
+    cmp r0, 1
+    jne .notraw
+    mov r0, PART_RAW
+    mov [newtype], r0
+    jmp .typeok
+    .notraw:
+    mov r1, r6
+    add r1, 12
+    mov r1, [r1]
+    mov r2, tname_catfs
+    call streq
+    cmp r0, 1
+    jne badtype
+    mov r0, PART_CATFS
+    mov [newtype], r0
+    .typeok:
+
+    mov r1, r6                       ; start block
+    add r1, 16
+    mov r1, [r1]
+    call parse_dec
+    cmp r0, -1
+    je badargs
+    mov [newstart], r0
+
+    mov r1, r6                       ; length in blocks
+    add r1, 20
+    mov r1, [r1]
+    call parse_dec
+    cmp r0, -1
+    je badargs
+    cmp r0, 0
+    je badargs
+    mov [newcount], r0
+
+    call open_dev
+    call dev_blocks                  ; the device knows its own size, so a
+    mov r7, r0                       ; partition running off the end is caught here
+    cmp r7, 0
+    je .nosize
+    mov r0, [newstart]
+    mov r1, [newcount]
+    add r0, r1
+    cmp r0, r7
+    jug toobig
+    .nosize:
+
+    mov r1, 0                        ; read the existing table
+    mov r2, blkbuf
+    call rblock
+    cmp r0, 0
+    jne fail_read
+    call check_table
+    cmp r0, 0
+    jne fail_table
+
+    mov r0, blkbuf
+    add r0, PT_COUNT_OFF
+    mov r7, [r0]                     ; current count
+    cmp r7, PT_MAXENT
+    juge fulltable
+
+    mov r0, r7                       ; entry = entries + count * 12
+    mov r1, PT_ENTRY_SIZE
+    umul r0, r1
+    add r0, blkbuf
+    add r0, PT_ENTRIES_OFF
+    mov r1, r0
+    add r1, PE_TYPE
+    mov r2, [newtype]
+    mov [r1], r2
+    mov r1, r0
+    add r1, PE_START
+    mov r2, [newstart]
+    mov [r1], r2
+    mov r1, r0
+    add r1, PE_COUNT
+    mov r2, [newcount]
+    mov [r1], r2
+
+    add r7, 1                        ; and one more partition
+    mov r0, blkbuf
+    add r0, PT_COUNT_OFF
+    mov [r0], r7
+
+    mov r1, 0
+    mov r2, blkbuf
+    call wblock
+    cmp r0, 0
+    jne fail_write
+    call close_dev
+
+    mov r1, msg_added                ; report the index it landed at
+    call emit_str
+    sub r7, 1
+    mov r1, r7
+    mov r2, 1
+    call emit_dec
+    mov r1, 10
+    call emit_char
+    call flush
+    sys_exit 0
+
+
+; ==========================
+;   mkfs
+; ==========================
+do_mkfs:
+    cmp r5, 4
+    jul badargs
+    mov r1, r6                       ; partition index
+    add r1, 12
+    mov r1, [r1]
+    call parse_dec
+    cmp r0, -1
+    je badargs
+    mov [wantidx], r0
+
+    call open_dev
+    mov r1, 0
+    mov r2, blkbuf
+    call rblock
+    cmp r0, 0
+    jne fail_read
+    call check_table
+    cmp r0, 0
+    jne fail_table
+
+    mov r0, blkbuf
+    add r0, PT_COUNT_OFF
+    mov r0, [r0]
+    cmp r0, PT_MAXENT
+    jule .cntok
+    mov r0, PT_MAXENT
+    .cntok:
+    mov r1, [wantidx]
+    cmp r1, r0
+    juge badindex
+
+    mov r0, [wantidx]                ; pull start and length out of the entry
+    mov r1, PT_ENTRY_SIZE
+    umul r0, r1
+    add r0, blkbuf
+    add r0, PT_ENTRIES_OFF
+    mov r1, r0
+    add r1, PE_START
+    mov r1, [r1]
+    mov [partbase], r1
+    mov r1, r0
+    add r1, PE_COUNT
+    mov r1, [r1]
+    mov [parttotal], r1
+
+    mov r0, [wantidx]                ; formatting it makes it a CatFS partition,
+    mov r1, PT_ENTRY_SIZE            ; so record that in the table like mkfs_catfs
+    umul r0, r1                      ; --disk does
+    add r0, blkbuf
+    add r0, PT_ENTRIES_OFF
+    add r0, PE_TYPE
+    mov [r0], PART_CATFS
+    mov r1, 0
+    mov r2, blkbuf
+    call wblock
+    cmp r0, 0
+    jne fail_write
+
+    call plan_layout
+    cmp r0, 0
+    jne toosmall
+    call write_fs
+    cmp r0, 0
+    jne fail_write
+    call close_dev
+
+    mov r1, msg_mkfs                 ; the geometry, so it can be eyeballed against
+    call emit_str                    ; what the host tool prints
+    mov r1, [parttotal]
+    mov r2, 1
+    call emit_dec
+    mov r1, msg_blocks
+    call emit_str
+    mov r1, [f_icount]
+    mov r2, 1
+    call emit_dec
+    mov r1, msg_inodes
+    call emit_str
+    mov r1, [f_datablocks]
+    mov r2, 1
+    call emit_dec
+    mov r1, msg_data
+    call emit_str
+    call flush
+    sys_exit 0
+
+
+; ==========================
+;   CatFS layout
+; ==========================
+; Mirrors plan_layout() in tools/catfs.py. Kept in the same order and with the
+; same clamps so the two cannot drift.
+; returns r0 = 0 on success, -1 if the partition is too small
+plan_layout:
+    push r4
+    push r5
+    push r6
+    mov r4, [parttotal]
+    cmp r4, CATFS_MINTOTAL
+    jul .toosmall
+
+    mov r5, r4                       ; journal = max(3, min(64, total / 4))
+    mov r6, 4
+    udiv r5, r6                       ; r5 = total / 4
+    mov r6, CATFS_JDEFAULT
+    cmp r6, r5
+    jule .jok
+    mov r6, r5
+    .jok:
+    cmp r6, CATFS_JMIN
+    juge .jmin
+    mov r6, CATFS_JMIN
+    .jmin:
+    mov [f_jblocks], r6
+
+    mov r5, r4                       ; inodes = max(64, total / 4), rounded up to a
+    mov r6, 4                        ; whole block of 8
+    udiv r5, r6
+    cmp r5, 64
+    juge .ic
+    mov r5, 64
+    .ic:
+    add r5, CATFS_IPERBLK - 1
+    mov r6, CATFS_IPERBLK
+    udiv r5, r6                       ; r5 = ceil(icount / 8) = itable blocks
+    mov [f_itblocks], r5
+    mov r0, r5
+    mov r1, CATFS_IPERBLK
+    umul r0, r1
+    mov [f_icount], r0
+
+    mov r5, r0                       ; ibitmap = ceil(icount / 4096)
+    add r5, BITS_PER_BLOCK - 1
+    mov r6, BITS_PER_BLOCK
+    udiv r5, r6
+    mov [f_ibmblocks], r5
+
+    mov r0, 1                        ; journal sits straight after the superblock
+    mov [f_jstart], r0
+    mov r1, [f_jblocks]
+    add r0, r1
+    mov [f_ibmstart], r0
+    mov r1, [f_ibmblocks]
+    add r0, r1
+    mov [f_dbmstart], r0             ; = "fixed", the blocks used before the dbitmap
+
+    mov r5, r4                       ; avail = total - fixed - itable
+    sub r5, r0
+    mov r0, [f_itblocks]
+    cmp r5, r0
+    jule .toosmall
+    sub r5, r0
+    cmp r5, 1
+    jule .toosmall
+
+    add r5, BITS_PER_BLOCK           ; dbitmap = ceil(avail / (4096 + 1)), which
+    mov r6, BITS_PER_BLOCK + 1        ; solves bitmap-covers-itself in one step
+    udiv r5, r6
+    mov [f_dbmblocks], r5
+
+    mov r0, [f_dbmstart]
+    add r0, r5
+    mov [f_itstart], r0
+    mov r1, [f_itblocks]
+    add r0, r1
+    mov [f_datastart], r0
+    cmp r0, r4
+    juge .toosmall
+    mov r1, r4
+    sub r1, r0
+    mov [f_datablocks], r1
+
+    mov r0, 0
+    jmp .done
+    .toosmall:
+    mov r0, -1
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Write the whole filesystem out: clear the metadata regions, then the superblock,
+; the empty journal header, the inode bitmap and an empty root directory.
+; returns r0 = 0 on success, -1 on a failed write
+write_fs:
+    push r4
+    push r5
+
+    mov r1, blkbuf                   ; zero every region that must start empty.
+    mov r2, BLOCK_SIZE               ; the data region is left alone - the bitmap
+    call zerobuf                     ; says it is free, which is all that matters
+    mov r4, [f_jstart]
+    mov r5, [f_datastart]
+    .zloop:
+        cmp r4, r5
+        juge .zdone
+        mov r1, r4
+        mov r2, blkbuf
+        call wfsblock
+        cmp r0, 0
+        jne .fail
+        add r4, 1
+        jmp .zloop
+    .zdone:
+
+    mov r1, blkbuf                   ; superblock
+    mov r2, BLOCK_SIZE
+    call zerobuf
+    mov r0, blkbuf
+    mov r1, r0
+    add r1, SB_MAGIC
+    mov [r1], CATFS_MAGIC
+    mov r1, r0
+    add r1, SB_VERSION
+    mov [r1], CATFS_VERSION
+    mov r1, r0
+    add r1, SB_BLKSIZE
+    mov [r1], BLOCK_SIZE
+    mov r1, r0
+    add r1, SB_TOTAL
+    mov r2, [parttotal]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_ICOUNT
+    mov r2, [f_icount]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_IBM_START
+    mov r2, [f_ibmstart]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_IBM_BLOCKS
+    mov r2, [f_ibmblocks]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_DBM_START
+    mov r2, [f_dbmstart]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_DBM_BLOCKS
+    mov r2, [f_dbmblocks]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_IT_START
+    mov r2, [f_itstart]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_IT_BLOCKS
+    mov r2, [f_itblocks]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_DATA_START
+    mov r2, [f_datastart]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_DATA_BLOCKS
+    mov r2, [f_datablocks]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_J_START
+    mov r2, [f_jstart]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_J_BLOCKS
+    mov r2, [f_jblocks]
+    mov [r1], r2
+    mov r1, r0
+    add r1, SB_ROOT_INO
+    mov [r1], CATFS_ROOTINO
+    mov r1, r0
+    add r1, SB_STATE
+    mov [r1], 0
+    mov r1, 0
+    mov r2, blkbuf
+    call wfsblock
+    cmp r0, 0
+    jne .fail
+
+    mov r1, blkbuf                   ; an empty journal: magic, EMPTY, no blocks
+    mov r2, BLOCK_SIZE
+    call zerobuf
+    mov r0, blkbuf
+    mov [r0], CATFS_JMAGIC
+    mov r1, [f_jstart]
+    mov r2, blkbuf
+    call wfsblock
+    cmp r0, 0
+    jne .fail
+
+    mov r1, blkbuf                   ; inode bitmap: inode 0 is the reserved null
+    mov r2, BLOCK_SIZE               ; pointer and inode 1 is the root, so bits 0
+    call zerobuf                     ; and 1 are allocated from the start
+    mov r0, blkbuf
+    mov r1, 3
+    mov8 [r0], r1
+    mov r1, [f_ibmstart]
+    mov r2, blkbuf
+    call wfsblock
+    cmp r0, 0
+    jne .fail
+
+    mov r1, blkbuf                   ; root directory inode: a directory with no
+    mov r2, BLOCK_SIZE               ; entries at all. "." and ".." are synthesised
+    call zerobuf                     ; by the drivers, never stored.
+    mov r0, blkbuf
+    add r0, CATFS_ROOTINO * CATFS_ISIZE   ; inode 1 sits at offset 64 of block 0
+    mov r1, r0
+    add r1, CI_TYPE
+    mov [r1], CATFS_TDIR
+    mov r1, r0
+    add r1, CI_SIZE
+    mov [r1], 0
+    mov r1, r0
+    add r1, CI_LINKS
+    mov [r1], 1
+    mov r1, [f_itstart]
+    mov r2, blkbuf
+    call wfsblock
+    cmp r0, 0
+    jne .fail
+
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, -1
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Device helpers
+; ==========================
+; Block numbers here are partition-relative for the filesystem writes and
+; absolute for the table, so wblock/rblock take an absolute block and the callers
+; that mean "inside the partition" add partbase. partbase is 0 until mkfs sets it.
+
+; open_dev() - open the device read/write, or exit.
+open_dev:
+    mov r1, [devpath]
+    sys_open r1, O_RDWR
+    cmp r0, -1
+    je fail_open
+    mov [devfd], r0
+    ret
+
+close_dev:
+    sys_close [devfd]
+    ret
+
+; dev_blocks() -> r0 = device length in blocks, 0 if it does not report one.
+; Uses SEEK_END, which works on /dev/diskN because the disk driver publishes the
+; device's real size on the node.
+dev_blocks:
+    sys_seek [devfd], 0, SEEK_END
+    cmp r0, 0
+    jile .none
+    shr r0, BLOCK_SHIFT
+    ret
+    .none:
+    mov r0, 0
+    ret
+
+; wblock(r1 = absolute block, r2 = buffer) -> r0 = 0 on success, -1 otherwise
+; The byte offset is held in r5, not r4: sys_seek's macro assigns its whence to r4
+; before reading its offset argument, so an offset passed in r4 would be lost.
+wblock:
+    push r5                          ; byte offset
+    push r6                          ; buffer
+    mov r5, r1
+    mov r6, r2
+    shl r5, BLOCK_SHIFT
+    sys_seek [devfd], r5, SEEK_SET
+    cmp r0, -1
+    je .fail
+    sys_write [devfd], r6, BLOCK_SIZE
+    cmp r0, BLOCK_SIZE
+    jne .fail
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, -1
+    .done:
+    pop r6
+    pop r5
+    ret
+
+
+; wfsblock(r1 = partition-relative block, r2 = buffer) -> r0 = 0/-1
+; Every CatFS block number is partition-relative, so the filesystem writes go
+; through here and only the partition table itself uses wblock directly.
+wfsblock:
+    push r5
+    mov r5, [partbase]
+    add r1, r5
+    call wblock
+    pop r5
+    ret
+
+; rblock(r1 = absolute block, r2 = buffer) -> r0 = 0 on success, -1 otherwise
+rblock:
+    push r5                          ; byte offset (see wblock on why not r4)
+    push r6                          ; buffer
+    mov r5, r1
+    mov r6, r2
+    shl r5, BLOCK_SHIFT
+    sys_seek [devfd], r5, SEEK_SET
+    cmp r0, -1
+    je .fail
+    sys_read [devfd], r6, BLOCK_SIZE
+    cmp r0, BLOCK_SIZE
+    jne .fail
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, -1
+    .done:
+    pop r6
+    pop r5
+    ret
+
+; check_table(blkbuf holds block 0) -> r0 = 0 if it is a valid table, -1 if not
+check_table:
+    mov r0, blkbuf
+    mov r0, [r0]
+    cmp r0, PT_MAGIC
+    jne .bad
+    mov r0, blkbuf
+    add r0, 4
+    mov r0, [r0]
+    cmp r0, 0
+    jne .bad
+    mov r0, 0
+    ret
+    .bad:
+    mov r0, -1
+    ret
+
+; zerobuf(r1 = address, r2 = byte count)
+zerobuf:
+    push r4
+    mov r4, r1
+    .loop:
+        cmp r2, 0
+        je .done
+        mov [r4], 0
+        add r4, 4
+        sub r2, 4
+        jmp .loop
+    .done:
+    pop r4
+    ret
+
+; streq(r1 = a, r2 = b) -> r0 = 1 if equal, 0 otherwise
+streq:
+    push r4
+    push r5
+    mov r4, r1
+    mov r5, r2
+    .loop:
+        mov8 r0, [r4]
+        mov8 r1, [r5]
+        cmp r0, r1
+        jne .no
+        cmp r0, 0
+        je .yes
+        add r4, 1
+        add r5, 1
+        jmp .loop
+    .yes:
+    mov r0, 1
+    jmp .done
+    .no:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Failure exits
+; ==========================
+fail_open:
+    sys_write 1, eopen, eopen_end - eopen
+    sys_exit 1
+fail_read:
+    sys_write 1, eread, eread_end - eread
+    sys_exit 1
+fail_write:
+    sys_write 1, ewrite, ewrite_end - ewrite
+    sys_exit 1
+fail_table:
+    sys_write 1, etable, etable_end - etable
+    sys_exit 1
+badargs:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+badtype:
+    sys_write 1, etype, etype_end - etype
+    sys_exit 1
+badindex:
+    sys_write 1, eindex, eindex_end - eindex
+    sys_exit 1
+fulltable:
+    sys_write 1, efull, efull_end - efull
+    sys_exit 1
+toobig:
+    sys_write 1, etoobig, etoobig_end - etoobig
+    sys_exit 1
+toosmall:
+    sys_write 1, etoosmall, etoosmall_end - etoosmall
+    sys_exit 1
+
+
+usage:
+    dstr "usage: catpart init <dev>\n       catpart add <dev> <raw|catfs> <start> <blocks>\n       catpart mkfs <dev> <index>\n"
+usage_end:
+eopen:
+    dstr "catpart: cannot open device read/write\n"
+eopen_end:
+eread:
+    dstr "catpart: read failed\n"
+eread_end:
+ewrite:
+    dstr "catpart: write failed\n"
+ewrite_end:
+etable:
+    dstr "catpart: no partition table (run init first)\n"
+etable_end:
+etype:
+    dstr "catpart: type must be raw or catfs\n"
+etype_end:
+eindex:
+    dstr "catpart: no such partition\n"
+eindex_end:
+efull:
+    dstr "catpart: partition table is full\n"
+efull_end:
+etoobig:
+    dstr "catpart: partition runs past the end of the device\n"
+etoobig_end:
+etoosmall:
+    dstr "catpart: partition too small for CatFS\n"
+etoosmall_end:
+
+verb_init:
+    dstr "init\0"
+verb_add:
+    dstr "add\0"
+verb_mkfs:
+    dstr "mkfs\0"
+tname_raw:
+    dstr "raw\0"
+tname_catfs:
+    dstr "catfs\0"
+msg_init:
+    dstr "catpart: empty partition table written\n\0"
+msg_added:
+    dstr "catpart: added partition \0"
+msg_mkfs:
+    dstr "catpart: CatFS on \0"
+msg_blocks:
+    dstr " blocks, \0"
+msg_inodes:
+    dstr " inodes, \0"
+msg_data:
+    dstr " data blocks\n\0"
+
+devpath:
+    d32 0
+devfd:
+    d32 0
+newtype:
+    d32 0
+newstart:
+    d32 0
+newcount:
+    d32 0
+wantidx:
+    d32 0
+partbase:
+    d32 0
+parttotal:
+    d32 0
+
+f_jstart:
+    d32 0
+f_jblocks:
+    d32 0
+f_ibmstart:
+    d32 0
+f_ibmblocks:
+    d32 0
+f_dbmstart:
+    d32 0
+f_dbmblocks:
+    d32 0
+f_itstart:
+    d32 0
+f_itblocks:
+    d32 0
+f_datastart:
+    d32 0
+f_datablocks:
+    d32 0
+f_icount:
+    d32 0
+
+blkbuf:
+    res8 BLOCK_SIZE
+
+#include "lib/fmt.cat"

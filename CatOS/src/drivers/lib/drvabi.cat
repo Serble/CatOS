@@ -1,0 +1,108 @@
+; ==========================
+;   CatOS loadable-driver ABI
+; ==========================
+; The contract between the kernel and a driver loaded from /drivers. Both sides
+; include this file - the kernel from drivers/drvhost.cat, a driver through
+; lib/drv.cat - so it is one list rather than two to keep in sync. It holds only
+; #defines, so including it emits nothing.
+;
+;
+; -- What a driver is --------------------------------------------------------
+;
+; A driver is a flat binary assembled at address 0, exactly like a program, and
+; built the same way (catasm drv.cat -o drv). The kernel copies it into a
+; segment of its own and runs it in the CPU's *driver* mode: memory accesses are
+; relocated by MBase and bounds-checked against MLen, just as a process's are,
+; but the privileged instructions - `in` and `out` above all - are allowed. So a
+; driver talks to its hardware directly, sees only its own memory, and a bad
+; pointer faults instead of corrupting the kernel.
+;
+; A driver has no thread. The kernel runs it by calling one of its entry points,
+; and the entry runs to completion: it is never preempted and never re-entered
+; (an interrupt that arrives for a driver that is already running is held until
+; it returns). An entry is an ordinary procedure - arguments in r1-r4, result in
+; r0, finish with `ret` - on a stack the kernel sets up at the top of the
+; driver's memory. It reaches the kernel with `syscall`, using the DRVC_* calls
+; below rather than the program ones.
+;
+;
+; -- The descriptor ----------------------------------------------------------
+;
+; The first DRVD_SIZE bytes of the image. The kernel reads it to decide whether
+; a driver is wanted (DRVD_TYPES) before loading it, and to find everything
+; else. Every address in it is a driver address (0-based, like any label).
+
+#define DRV_MAGIC, 0x56524443        ; "CDRV", as the four bytes read in memory
+#define DRV_ABI_VERSION, 1
+
+#define DRVD_MAGIC, 0                ; DRV_MAGIC
+#define DRVD_ABI, 4                  ; DRV_ABI_VERSION the driver was built for
+#define DRVD_MEM, 8                  ; bytes of memory to run in: the image, then
+                                     ; any buffers, then the stack at the very top.
+                                     ; Only the image is stored in the file - the
+                                     ; rest is zeroed memory - so a driver declares
+                                     ; big buffers here rather than with res8
+#define DRVD_INIT, 12                ; init() -> 0, or negative to refuse to load
+#define DRVD_BIND, 16                ; bind(r1 = port, r2 = unit) -> 0 if it took
+                                     ; the device, negative if not
+#define DRVD_OP, 20                  ; op(r1 = cookie, r2 = DOP_*, r3 = position,
+                                     ; r4 = length) -> bytes, or negative
+#define DRVD_IRQ, 24                 ; irq(r1 = vector) -> ignored
+#define DRVD_XBUF, 28                ; transfer buffer (see below)
+#define DRVD_XLEN, 32                ; its size in bytes
+#define DRVD_NTYPES, 36              ; how many of DRVD_TYPES are used
+#define DRVD_TYPES, 40               ; DRV_MAXTYPES device type ids it binds
+#define DRVD_NAME, 56                ; DRV_NAMELEN bytes: its name, NUL-terminated
+#define DRVD_SIZE, 72
+
+#define DRV_MAXTYPES, 4
+#define DRV_NAMELEN, 16
+#define DRV_MINSTACK, 256            ; DRVD_MEM must leave at least this much above
+                                     ; the image, or the loader refuses the driver
+
+; An entry the driver does not have is 0. With no init it simply loads, with no
+; bind it never takes a device, with no op its nodes fail every read and write,
+; and with no irq its interrupts are dropped.
+
+
+; -- Nodes and the transfer buffer ------------------------------------------
+;
+; A driver publishes a device as /dev/<name> with DRVC_PUBLISH, tagging it with
+; a cookie of its choosing (a unit number, say). A read or write on the node
+; calls the driver's op entry with that cookie. The driver never sees the
+; caller's buffer: the kernel moves the bytes through the driver's transfer
+; buffer, copying them in before a DOP_WRITE and out after a DOP_READ, so the
+; length an op is asked for is never more than DRVD_XLEN. A caller asking for
+; more gets a short count and asks again, as with any read or write.
+;
+; A read with nothing to give yet returns DRV_WOULDBLOCK. The reader then sleeps
+; until the driver calls DRVC_WAKEUP with the node's cookie (from its irq entry,
+; typically), and the read is tried again.
+
+#define DOP_READ, 1                  ; fill the transfer buffer, return the count
+#define DOP_WRITE, 2                 ; consume the transfer buffer, return the count
+
+#define DRV_WOULDBLOCK, -2
+
+
+; -- Driver calls ------------------------------------------------------------
+;
+; `syscall` from a driver, with r1 = the call and r2-r3 its arguments. The result
+; comes back in r0; every other register is returned as it was. Addresses are
+; driver addresses. lib/drv.cat wraps each one in a macro.
+
+#define DRVC_LOG, 0                  ; r2 = string -> 0, or -1 if it runs off the
+                                     ; end of the driver's memory. Printed on the
+                                     ; console exactly as given (add the \n)
+#define DRVC_PUBLISH, 1              ; r2 = name, r3 = cookie -> 0, or -1 if the
+                                     ; name is taken, too long or out of room.
+                                     ; init and bind only
+#define DRVC_WAKEUP, 2               ; r2 = cookie -> 0. Wakes every reader blocked
+                                     ; on a node published with that cookie
+#define DRVC_CLAIMINT, 3             ; r2 = vector -> 0, or -1 if the vector is
+                                     ; taken or reserved. From then on the irq
+                                     ; entry runs whenever it fires. init and bind
+                                     ; only
+#define DRVC_PHYSBASE, 4             ; -> the physical address of driver address 0,
+                                     ; for programming a device that DMAs. The
+                                     ; segment never moves, so it stays valid

@@ -1,0 +1,44 @@
+; Cat Assembly, written in catasm...
+; the final step to a fully self iteratable operating system.
+
+jmp main
+#include "../lib/sys.cat"
+#include "../lib/heap.cat"
+#include "../lib/vector.cat"
+#include "assembly.cat"
+#include "tokeniser.cat"
+
+main:
+    cmp r1, 2                 ; argc
+    jul usage                 ; we need one for file
+
+    add r2, 4                 ; move to argv[1]
+    mov r4, [r2]              ; get it (the file arg)
+
+    sys_stat r4, stat_buffer
+    mov r5, stat_buffer + ST_SIZE
+    mov r5, [r5]
+
+    ; r5 is now the size of the file in bytes
+    mov r1, r5                ; we need somewhere to load the file into
+    call halloc               ; allocate the buffer
+
+    sub sp, ASM_RESULT_STRUCT ; allocate some space for the assemble result
+
+    mov r1, r5                ; buffer size (arg 1)
+    mov r2, r0                ; buffer addr (arg 2)
+    mov r3, sp
+    call assemble
+
+
+usage:
+    sys_print 1, usage_msg, usage_msg_end - usage_msg
+    sys_exit 1
+
+
+stat_buffer:
+    res8 ST_STRUCT
+usage_msg:
+    dstr "usage: asm <file>"
+usage_msg_end:
+

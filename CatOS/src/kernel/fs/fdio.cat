@@ -302,6 +302,97 @@ sys_create_h:
     jmp sysret
 
 
+; SYS_STAT: r2 = path (user), r3 = stat buffer (user, ST_STRUCT bytes). Fills in
+; the node's type, size and flags. Returns 0, or -1 if the path does not resolve.
+;
+; This is what lets userland tell a file from a directory before acting on it -
+; whether cp should copy into a target or over it, whether rm may unlink it - and
+; how a program learns a file's length without seeking to the end of it.
+sys_stat_h:
+    mov r4, r3                   ; user stat buffer (copyinstr clobbers r3)
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, r4                   ; translate the destination before doing the
+    mov r2, ST_STRUCT            ; work, so a bad pointer costs nothing
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r5, r0
+    mov r1, spawn_pathbuf
+    call abspath
+    mov r1, r0
+    mov r2, r5                   ; the VFS writes straight into the caller's
+    call vfsstat                 ; buffer: the kernel is identity-mapped
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_REMOVE: r2 = path (user). Unlinks a file or an empty directory. Returns 0,
+; or -1 if the path is missing, is a non-empty directory, is a mount point, or
+; sits on a filesystem with no remove op (ramfs, devfs).
+sys_remove_h:
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, spawn_pathbuf
+    call abspath
+    mov r1, r0
+    call vfsremove
+    cmp r0, 0
+    jne .fail
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; SYS_RENAME: r2 = old path (user), r3 = new path (user). Moves an entry within
+; one filesystem. Returns 0, or -1 - including for a move that crosses a mount,
+; which userland handles by copying instead.
+;
+; Both paths have to be live at once and abspath has a single buffer, so the
+; rooted old path is copied aside before the new one is rooted over it.
+sys_rename_h:
+    mov r4, r3                   ; the new path, in user space
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, spawn_pathbuf
+    call abspath
+    mov r1, r0
+    mov r2, rename_oldbuf
+    call pathcpy
+
+    mov r1, r4
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, spawn_pathbuf
+    call abspath
+    mov r2, r0                   ; new path
+    mov r1, rename_oldbuf        ; old path
+    call vfsrename
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
 ; ---------------------------------------------------------------------------
 ; Working directory support
 ; ---------------------------------------------------------------------------
@@ -315,6 +406,32 @@ abspathbuf:
     res8 VFS_PATH_MAX
 normbuf:
     res8 VFS_PATH_MAX
+rename_oldbuf:
+    res8 VFS_PATH_MAX            ; rename needs two rooted paths at once
+
+
+; Copy a null-terminated path between kernel buffers, truncating at the buffer
+; size rather than running off the end.
+; r1 - source, r2 - destination (VFS_PATH_MAX bytes)
+; Preserves r4-r7.
+pathcpy:
+    push r4                      ; remaining capacity
+    mov r4, VFS_PATH_MAX - 1
+    .loop:
+        cmp r4, 0
+        je .term
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .term
+        mov8 [r2], r0
+        add r1, 1
+        add r2, 1
+        sub r4, 1
+        jmp .loop
+    .term:
+    mov8 [r2], 0
+    pop r4
+    ret
 
 ; Turn a (possibly relative) path into an absolute one using the caller's cwd.
 ; r1 - path (kernel buffer, null-terminated)
@@ -519,10 +636,303 @@ sys_chdir_h:
     jmp sysret
 
 
+; SYS_SETTTY: r2 = path to a character device. Make it the caller's controlling
+; terminal - which means two things at once, and both are wanted together:
+;
+;   * the caller's own fd 0/1/2 are reopened onto it, so it is talking to that
+;     terminal from now on;
+;   * PCB_TTY records it, so every process the caller spawns from here on opens
+;     the same device for its own stdio, and so does everything *those* spawn.
+;
+; The second is the one that matters, and is why this is a syscall rather than
+; three closes and three opens the caller could do itself: inheritance is a
+; property of the process, not of its descriptors. A terminal emulator claims a
+; pty, calls this, spawns a shell, and that shell - and `ls` run from it, and the
+; editor run from that - all land on the right session with nothing else told
+; anything.
+;
+; Refuses anything that is not a character device, because a controlling terminal
+; is inherited by children that will read from it: pointing it at a regular file
+; would give every descendant a stdin that returns end-of-file for ever.
+; Returns 0, or -1.
+sys_settty_h:
+    push r4                      ; the node being checked
+    push r5                      ; fd index
+    mov r1, r2
+    mov r2, spawn_pathbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+    mov r1, spawn_pathbuf
+    call abspath
+    mov r1, r0
+    call pathnorm                ; canonical, and survives vfsresolve
+    mov r1, normbuf
+    call vfsresolve
+    cmp r0, 0
+    je .fail
+    mov r4, r0
+    vload r1, r4, NODE_TYPE
+    cmp r1, NODE_CHARDEV
+    jne .notchar
+    mov r0, 0                    ; the path must fit the PCB field, or a child
+    mov r1, normbuf              ; would inherit something truncated
+    .len:
+        mov8 r2, [r1]
+        cmp r2, 0
+        je .lendone
+        add r0, 1
+        add r1, 1
+        jmp .len
+    .lendone:
+    cmp r0, PCB_TTY_MAX
+    juge .notchar
+    mov r1, r4
+    call vfsnodeunref
+
+    mov r1, normbuf              ; record it for our children
+    mov r2, [curproc]
+    add r2, PCB_TTY
+    .store:
+        mov8 r0, [r1]
+        mov8 [r2], r0
+        cmp r0, 0
+        je .storedone
+        add r1, 1
+        add r2, 1
+        jmp .store
+    .storedone:
+
+    mov r5, 0                    ; then move our own stdio onto it
+    .reopen:
+        cmp r5, 3
+        juge .ok
+        mov r1, [curproc]
+        mov r2, r5
+        call fd_handle
+        cmp r0, -1
+        je .fresh                ; nothing open there
+        mov r1, r0
+        call vfsclose
+        mov r1, [curproc]
+        mov r2, r5
+        mov r3, -1
+        call fd_set
+        .fresh:
+        mov r1, [curproc]
+        add r1, PCB_TTY
+        mov r2, O_RDWR
+        call vfsopen
+        cmp r0, -1
+        je .next                 ; leave the slot free rather than bound to junk
+        push r0
+        mov r1, [curproc]
+        mov r2, r5
+        mov r3, r0
+        call fd_set
+        pop r0
+        .next:
+        add r5, 1
+        jmp .reopen
+    .ok:
+    mov r0, 0
+    pop r5
+    pop r4
+    jmp sysret
+    .notchar:
+    mov r1, r4
+    call vfsnodeunref
+    .fail:
+    mov r0, -1
+    pop r5
+    pop r4
+    jmp sysret
+
+
 ; SYS_GETCWD: r2 = user buffer, r3 = capacity. Copies the caller's working
 ; directory out to user space. Returns 0 on success, -1 if it did not fit.
 sys_getcwd_h:
     mov r1, [curproc]
     add r1, PCB_CWD
     call copyoutstr              ; r2 = user buffer, r3 = capacity
+    jmp sysret
+
+
+; ==========================
+;   Mounting
+; ==========================
+; Mounting is a userland operation, so the request is a struct in the caller's own
+; memory rather than a pile of registers. The source is resolved as an ordinary
+; path, which is the whole point: /dev/disk1, a partition inside it, and a plain
+; file are all just files with read and write ops, and the block-backed descriptor
+; (BFK_NODE, see disk.cat) hides which one turned up.
+
+#define MNTREQ_SOURCE, 0         ; char* backing file or device
+#define MNTREQ_TARGET, 4         ; char* directory to cover
+#define MNTREQ_FSTYPE, 8         ; char* filesystem name ("catfs", "rawfs", ...)
+#define MNTREQ_START, 12         ; first block of the region within the source
+#define MNTREQ_COUNT, 16         ; region length in blocks, 0 = rest of the source
+#define MNTREQ_STRUCT, 20
+
+mnt_srcbuf:
+    res8 VFS_PATH_MAX
+mnt_tgtbuf:
+    res8 VFS_PATH_MAX
+mnt_typebuf:
+    res8 VFS_PATH_MAX
+
+
+; SYS_MOUNT: r2 = pointer to a mount request (MNTREQ_*).
+; Mounts blocks [start, start+count) of `source` at `target` using `fstype`.
+; Returns 0, or a negated MNTE_* code on failure - a wrong partition or a path
+; that is not a filesystem is an ordinary mistake here, never a panic.
+;
+; Every failure gets its own code because they call for different fixes: a
+; missing source is a typo, an unrecognised region is the wrong partition index,
+; an unknown fstype is a name nothing has registered. Reporting one -1 for all of
+; them makes the user bisect what the kernel already knew.
+sys_mount_h:
+    mov r1, r2                   ; translate and bounds-check the request itself
+    mov r2, MNTREQ_STRUCT
+    call uaddr
+    cmp r0, 0
+    je .badreq
+    mov r4, r0
+
+    vload r1, r4, MNTREQ_SOURCE  ; three separate buffers: all three strings are
+    mov r2, mnt_srcbuf           ; needed at once, and abspath only has one
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .badreq
+    vload r1, r4, MNTREQ_TARGET
+    mov r2, mnt_tgtbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .badreq
+    vload r1, r4, MNTREQ_FSTYPE
+    mov r2, mnt_typebuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .badreq
+
+    vload r6, r4, MNTREQ_START
+    vload r7, r4, MNTREQ_COUNT
+
+    mov r1, mnt_srcbuf           ; resolve the backing object
+    call abspath
+    mov r1, r0
+    call vfsresolve              ; r0 = node, reference taken
+    cmp r0, 0
+    je .nosource
+    mov r5, r0
+
+    cmp r7, 0                    ; count 0 means "the rest of the source", which
+    jne .havecount               ; needs the node to know its own length - which is
+    vload r0, r5, NODE_SIZE      ; why disk_bind now publishes NODE_SIZE
+    shr r0, BLOCK_SHIFT
+    cmp r0, r6
+    jule .badrange               ; start is at or past the end
+    sub r0, r6
+    mov r7, r0
+    .havecount:
+    cmp r7, 0
+    je .badrange
+
+    mov r1, r5                   ; a descriptor over just that region
+    mov r2, r6
+    mov r3, r7
+    call bf_new_node
+    cmp r0, 0
+    je .nomem
+    mov r6, r0                   ; the descriptor holds its own node reference now
+
+    mov r1, r5
+    call vfsnodeunref            ; so drop ours
+
+    mov r1, mnt_tgtbuf
+    call abspath
+    mov r1, r0
+    mov r2, mnt_typebuf
+    mov r3, r6
+    call vfsmount
+    cmp r0, 0
+    je .failbf
+    mov r0, 0
+    jmp sysret
+
+    .failbf:
+    mov r1, r6                   ; unmounted, so the descriptor is ours to release
+    call bf_free
+    mov r0, [vfsmounterr]        ; vfsmount left the reason behind
+    jmp .report
+    .nomem:
+    mov r0, MNTE_NOMEM
+    jmp .failnode
+    .badrange:
+    mov r0, MNTE_RANGE
+    .failnode:
+    push r0
+    mov r1, r5
+    call vfsnodeunref
+    pop r0
+    jmp .report
+    .nosource:
+    mov r0, MNTE_SOURCE
+    jmp .report
+    .badreq:
+    mov r0, MNTE_BADREQ
+    .report:                     ; hand the reason back negated, so that the
+    mov r1, r0                   ; caller's "did it work?" test is still a
+    mov r0, 0                    ; compare against 0
+    sub r0, r1
+    jmp sysret
+
+
+; SYS_UMOUNT: r2 = path of the mount to remove. Returns 0, or -1 if the path is
+; not a mount root or the filesystem is still busy.
+;
+; The descriptor and the driver's mount context were created by the mount syscall,
+; not by the VFS, so they are released here once the mount itself is gone. The
+; driver is identified by its vtable rather than by assuming what NODE_FSCTX means.
+sys_umount_h:
+    mov r1, r2
+    mov r2, mnt_tgtbuf
+    mov r3, VFS_PATH_MAX
+    call copyinstr
+    cmp r0, 0
+    jne .fail
+
+    mov r1, mnt_tgtbuf
+    call abspath
+    mov r1, r0
+    call vfsmountat              ; r0 = mount record, still intact
+    cmp r0, 0
+    je .fail
+    vload r4, r0, MNT_DEV        ; capture what we own before the record is freed
+    vload r5, r0, MNT_ROOT
+    vload r6, r5, NODE_FSCTX
+    vload r7, r5, NODE_OPS
+
+    mov r1, mnt_tgtbuf
+    call abspath
+    mov r1, r0
+    call vfsunmount              ; refuses while anything still holds the root
+    cmp r0, 0
+    jne .fail
+
+    cmp r7, catfs_ops            ; CatFS is the only driver keeping a per-mount
+    jne .nofsctx                 ; instance; anything else leaves FSCTX at 0
+    mov r1, r6
+    call catfs_release
+    .nofsctx:
+    mov r1, r4
+    call bf_free
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
     jmp sysret

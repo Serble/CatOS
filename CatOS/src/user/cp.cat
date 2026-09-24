@@ -1,0 +1,120 @@
+; cp - copy a file.
+;
+;   cp <source> <destination>
+;
+; The destination may be a new name or an existing directory; if it is a
+; directory the copy lands inside it under the source's own name. Copying over an
+; existing file replaces it outright - the destination is truncated first, so no
+; tail of the old contents survives a copy from something shorter.
+;
+; Directories are not copied. A recursive copy has to create directories as it
+; walks, and there is nothing in the kernel to make that atomic or cheap, so it
+; would be a bigger program than this one; rm has -r because the kernel refuses
+; to delete a populated directory at all and there would otherwise be no way to
+; remove a tree, which is not the case here.
+#include "lib/sys.cat"
+
+main:
+    mov r5, r1                       ; argc
+    mov r6, r2                       ; argv
+    cmp r5, 3
+    jne .usage
+
+    mov r1, r6                       ; argv[1] = source
+    add r1, 4
+    mov r7, [r1]
+    mov r1, r6                       ; argv[2] = destination
+    add r1, 8
+    mov r4, [r1]
+
+    sys_stat r7, st                  ; the source has to exist, and has to be
+    cmp r0, 0                        ; something we can copy
+    jne .nosrc
+    mov r0, [st + ST_TYPE]
+    cmp r0, T_DIR
+    je .isdir
+
+    mov r1, r7                       ; "into a directory" or "to a name"
+    mov r2, r4
+    call dstpath
+    cmp r0, -1
+    je .toolong
+    mov r4, r0
+
+    mov r1, r7                       ; refuse the one case that would destroy
+    mov r2, r4                       ; the source: opening it for writing
+    call fstreq                      ; truncates it before a byte is read
+    cmp r0, 0
+    jne .same
+
+    mov r1, r7
+    mov r2, r4
+    call copyfile
+    cmp r0, 0
+    jne .failed
+    sys_exit 0
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+.nosrc:
+    mov r1, enosrc
+    jmp .report
+.isdir:
+    mov r1, eisdir
+    jmp .report
+.toolong:
+    mov r1, elong
+    jmp .report
+.same:
+    mov r1, esame
+    jmp .report
+
+; The copyfile codes say which end went wrong, which is the difference between
+; "you named something that is not there" and "it did not fit".
+.failed:
+    cmp r0, CPE_SRC
+    je .esrc
+    cmp r0, CPE_DST
+    je .edst
+    mov r1, ewrite
+    jmp .report
+    .esrc:
+    mov r1, eopen
+    jmp .report
+    .edst:
+    mov r1, ecreate
+
+.report:
+    call emit_str
+    mov r1, r7
+    call emit_str
+    mov r1, 10                       ; '\n'
+    call emit_char
+    call flush
+    sys_exit 1
+
+
+usage:
+    dstr "usage: cp <source> <destination>\n"
+usage_end:
+enosrc:
+    dstr "cp: no such file: \0"
+eisdir:
+    dstr "cp: omitting directory: \0"
+elong:
+    dstr "cp: path too long: \0"
+esame:
+    dstr "cp: source and destination are the same file: \0"
+eopen:
+    dstr "cp: cannot read \0"
+ecreate:
+    dstr "cp: cannot create the destination for \0"
+ewrite:
+    dstr "cp: write failed (out of space, or past the file size limit): \0"
+
+st:
+    res8 ST_STRUCT
+
+#include "lib/fmt.cat"
+#include "lib/fileutil.cat"

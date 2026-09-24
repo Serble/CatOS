@@ -111,7 +111,32 @@ proc_terminate:
     call proc_wakeup
     vload r1, r4, PCB_PID         ; release any windows the process owned
     call gfx_reap
+    vload r1, r4, PCB_PID         ; ... and any terminal sessions
+    call pty_reap
     pop r4
+    ret
+
+
+; Mark a signal pending on a process, and make a blocked one runnable so it reaches
+; sig_dispatch and takes it. Every source of a signal that is not a CPU fault ends
+; up here - SYS_KILL and the terminal interrupt key - because "pending plus wake" is
+; the whole of sending one; deciding what it means happens on the way back to user
+; mode, in sig_dispatch.
+; r1 - PCB pointer, r2 - signal number (assumed already validated)
+sig_raise:
+    vload r0, r1, PCB_SIGPEND     ; set the pending bit
+    mov r3, 1
+    shl r3, r2
+    or r0, r3
+    vstore r1, PCB_SIGPEND, r0, r3
+    mov r0, [r1]                  ; a blocked target would otherwise sleep through it
+    cmp r0, PROC_BLOCKED
+    jne .done
+    mov r0, PROC_READY
+    mov [r1], r0
+    mov r0, 0
+    vstore r1, PCB_CHAN, r0, r3
+    .done:
     ret
 
 
@@ -294,8 +319,13 @@ sig_dispatch:
 ; the frame marker exactly as it does for the syscall dispatcher.
 
 ; Common tail: raise signal r1 on the process that faulted in user mode. A fault
-; from kernel mode (or with no current process) is unrecoverable and panics.
+; from kernel mode (or with no current process) is unrecoverable and panics. A
+; fault in a loaded driver stops that driver instead (drvhost.cat); it is sent
+; there before the `di`, since the driver's caller goes on running afterwards.
 fault_common:
+    mov8 r0, [sp]
+    cmp r0, FRAME_DRIVER
+    je drv_fault
     di
     mov r5, r1                    ; signal number
     mov8 r0, [sp]
@@ -339,8 +369,14 @@ fault_common:
 
 ; Page fault (0x00). Doubles as the sigreturn trap: a handler unwinding to
 ; SIGRETURN_MAGIC lands here, and we restore the pre-signal frame instead of
-; treating it as a real access violation.
+; treating it as a real access violation. It is also how a loaded driver's entry
+; returns (DRV_RETMAGIC), so a driver-mode fault goes to drvhost.cat first, and
+; before the `di`: an entry returning is the normal case, not an error, and its
+; caller should find interrupts as it left them.
 pagefault_handler:
+    mov8 r0, [sp]
+    cmp r0, FRAME_DRIVER
+    je drv_pagefault
     di
     mov8 r0, [sp]
     cmp r0, FRAME_USER
@@ -466,19 +502,9 @@ sys_kill_h:
     je .fail                      ; it is not anybody's to kill - and now that
                                   ; pkill makes killing by name a one-liner, that
                                   ; has to be enforced rather than assumed
-    vload r0, r4, PCB_SIGPEND     ; set the pending bit
-    mov r1, 1
-    shl r1, r3
-    or r0, r1
-    vstore r4, PCB_SIGPEND, r0, r1
-    mov r0, [r4]                  ; wake a blocked target so it can take the signal
-    cmp r0, PROC_BLOCKED
-    jne .nowake
-    mov r0, PROC_READY
-    mov [r4], r0
-    mov r0, 0
-    vstore r4, PCB_CHAN, r0, r1
-    .nowake:
+    mov r1, r4
+    mov r2, r3
+    call sig_raise
     mov r0, 0
     jmp sysret
     .fail:

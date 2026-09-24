@@ -5,15 +5,27 @@
 ; launches the services listed there. Each line is "<action> <path> [args...]":
 ;
 ;   bg       spawn once and do not wait (long-running background daemons)
-;   respawn  spawn and restart it if it ever exits abnormally (crash / fault /
-;            kill). A clean exit (code 0, e.g. the shell's "exit") is treated as
-;            deliberate and is NOT restarted.
+;   respawn  spawn and restart it every time it exits, however it exited - a
+;            crash, a fault, a kill, or a clean exit are all the same thing here.
 ;
-; Blank lines and '#' comments are ignored. init supervises the respawn services;
-; once they have all exited (or been retired) there is nothing left to run and
-; init idles forever. If the config file is missing (or lists no respawn service)
-; init falls back to respawning /bin/sh so the system is always usable.
-#include "sys.cat"
+; That last point is the whole reason the action exists. A respawn service is one
+; the system is not usable without, and the console is exactly that: nothing else
+; reads the keyboard, so the moment the shell goes away the machine still echoes
+; what you type and does nothing with it. Whether the shell died or left politely
+; via its "exit" builtin makes no difference to the person sitting in front of
+; it, so init does not distinguish - "exit" gets you a fresh prompt, the way
+; leaving a login session does. Something that genuinely should run once and stop
+; is a "bg" service, not a respawn one.
+;
+; Blank lines and '#' comments are ignored. A service is only retired when it can
+; no longer be started at all (SYS_SPAWN fails, e.g. its binary is missing);
+; retiring it rather than retrying is what keeps a bad config line from spinning
+; init in a tight spawn loop, and it also means init never waits on a pid that
+; was never created. Once every service has been retired there is nothing left to
+; supervise and init idles forever. If the config file is missing (or lists no
+; respawn service) init falls back to respawning /bin/sh so the system is always
+; usable.
+#include "lib/sys.cat"
 
 #define CFGBUF, 1024            ; bytes of config file we will read
 #define MAXLINE_ARGS, 8         ; tokens (argv slots) per line
@@ -172,6 +184,11 @@ respawn_add:
     mov r3, r4                       ; argv = row
     mov r1, SYS_SPAWN
     syscall                          ; r0 = pid
+    cmp r0, -1
+    je .ret                          ; never started -> do not register it, or the
+                                     ; supervisor would wait on a pid that will
+                                     ; never exist. nrespawn is untouched, so the
+                                     ; next service simply reuses this row.
 
     mov r1, r6                       ; respawn_pid[n] = pid
     umul r1, 4
@@ -208,24 +225,33 @@ default_config:
     mov [r1], 0
     mov r0, respawn_pool             ; respawn_argvbase[0] = row 0
     mov [respawn_argvbase], r0
-    mov r0, 1                        ; respawn_active[0] = 1
-    mov [respawn_active], r0
     mov r2, sh_path                  ; spawn it
     mov r3, respawn_pool
     mov r1, SYS_SPAWN
     syscall
     mov [respawn_pid], r0
-    mov r0, 1
-    mov [nrespawn], r0
+    mov r1, 1                        ; the slot exists either way, so supervise
+    mov [nrespawn], r1               ; does not call us a second time
+    cmp r0, -1
+    je .nosh
+    mov [respawn_active], r1         ; started -> supervise it
+    mov [nactive], r1
+    ret
+    .nosh:                           ; no shell to be had; idle rather than spin
+    mov r0, 0
+    mov [respawn_active], r0
     mov [nactive], r0
     ret
 
 
-; Supervise the respawn services. A service that exits abnormally (nonzero exit
-; code: a crash, fault, or kill) is relaunched so the system heals itself. A
-; service that exits cleanly (code 0 - e.g. the shell's "exit" builtin) is a
-; deliberate exit and is retired, not restarted. Once every service has been
-; retired there is nothing left to run, so init idles quietly forever.
+; Supervise the respawn services. Whatever a service exits with - a crash, a
+; fault, a kill, or a clean 0 from the shell's "exit" builtin - it is relaunched,
+; so the system always heals back to the state the config asked for. The exit
+; code is therefore read and discarded: it says how the last instance ended, and
+; nothing here has to decide anything from that. A service is retired only when
+; relaunching it fails outright, which cannot fix itself by being retried. Once
+; every service has been retired there is nothing left to run, so init idles
+; quietly forever.
 supervise:
     mov r0, [nrespawn]
     cmp r0, 0
@@ -251,10 +277,9 @@ supervise:
         add r1, respawn_pid
         mov r2, [r1]
         mov r1, SYS_WAIT
-        syscall                      ; blocks until the service exits; r0 = code
-        cmp r0, 0
-        je .retire                   ; clean exit -> stop supervising it
-        mov r1, r6                   ; abnormal exit -> relaunch it
+        syscall                      ; blocks until the service exits (code
+                                     ; ignored: every exit is relaunched)
+        mov r1, r6
         umul r1, 4
         add r1, respawn_argvbase
         mov r7, [r1]
@@ -262,6 +287,8 @@ supervise:
         mov r3, r7                   ; argv
         mov r1, SYS_SPAWN
         syscall                      ; r0 = new pid
+        cmp r0, -1
+        je .retire                   ; cannot be started any more -> give up on it
         mov r1, r6
         umul r1, 4
         add r1, respawn_pid

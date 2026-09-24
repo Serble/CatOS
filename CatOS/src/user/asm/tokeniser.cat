@@ -1,0 +1,69 @@
+; cat asm tokeniser.
+; this takes file content as input and outputs a list of tokens.
+
+; Token types:
+; label       - name (str ptr)
+; directive   - name (str ptr), args (expression[] ptr)
+; instruction - name (str ptr), args (expression[] ptr)
+
+#define TOKEN_TYPE, 0
+#define TOKEN_NAME, 1
+#define TOKEN_ARGS, 5
+#define TOKEN_STRUCT, 9
+
+; r1 - file size
+; r2 - file buffer ptr
+; r3 - vector to output tokens to
+; returns 0 for success, else non zero.
+tokenise:
+    push r4               ; 
+    push r5               ; 
+    push r6               ; 
+    push r7               ; 
+    mov r7, sp
+
+    sub sp, 4
+    mov [sp], r1          ; file size at r7 - 4
+
+    sub sp, 4
+    mov [sp], r2          ; file buff ptr at r7 - 8
+
+    sub sp, 4
+    mov [sp], r3          ; token vector at r7 - 12
+
+    mov r4, r2            ; current line start
+    mov r5, r2
+    add r5, r1            ; last valid address
+    
+    .line_loop:
+    mov r1, r2
+    mov r2, r5
+    call get_eol
+    
+    mov r6, r0            ; end of line
+    
+    sub sp, 4
+    
+    mov r1, r4
+    mov r2, r6
+    mov r3, sp
+    call trim_str_inbuff
+    
+    mov r1, [sp]           ; end pos of trimmed line
+    add sp, 4
+    
+    cmp r0, -1             ; is the line empty?
+    ;je blabla
+    
+    
+
+    .end:
+    mov sp, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+

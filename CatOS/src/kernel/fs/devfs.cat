@@ -158,6 +158,7 @@ devfs_ops:
     d32 0                        ; OP_TRUNCATE
     d32 0                        ; OP_STAT
     d32 0                        ; OP_SYNC
+    d32 0                        ; OP_RENAME
 
 devfs_name:
     dstr "devfs\0"

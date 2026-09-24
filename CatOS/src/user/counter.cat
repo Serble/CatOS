@@ -1,6 +1,6 @@
 ; A cooperative program: prints three markers, yielding between each so other
 ; processes interleave, then exits. Loaded from the filesystem by init.
-#include "sys.cat"
+#include "lib/sys.cat"
 
     sys_print 0xC1
     sys_yield

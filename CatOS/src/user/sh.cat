@@ -6,6 +6,12 @@
 ; for the child before prompting again. The built-in "exit" ends the shell,
 ; "cd" changes the working directory, and "pwd" prints it.
 ;
+; "exit" ends this shell process, which is not the same as ending the session:
+; init lists the shell as a "respawn" service and starts a new one immediately,
+; so what you actually see is a fresh prompt. Nothing else reads the keyboard, so
+; a shell that stayed dead would leave the machine echoing keystrokes into
+; nowhere - see the banner in init.cat.
+;
 ; A final token of "&" (space-separated, like everything else here) runs the
 ; command in the background: the shell spawns it and prompts again immediately
 ; instead of waiting. That is how you start a program that puts up a page on the
@@ -13,7 +19,7 @@
 ;
 ; Commands are resolved as /bin/<name>. Path arguments may be relative; the
 ; kernel roots them against the process working directory (see "cd"/"pwd").
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define MAXARGS, 8                   ; most tokens on one line (argv slots)
 #define LINEBUF, 128                 ; longest input line
@@ -26,7 +32,8 @@ main:
     sys_read 0, linebuf, LINEBUF - 1
     mov r5, r0                       ; bytes read (survives syscalls)
     cmp r5, 0
-    jile .prompt                     ; nothing / error -> prompt again
+    jil .notty                       ; the terminal has gone - see below
+    je .prompt                       ; a short read, but still a terminal
     mov r0, linebuf                  ; null-terminate just past the last byte
     add r0, r5
     mov8 [r0], 0
@@ -85,6 +92,21 @@ main:
     jmp .prompt
 
 .doexit:
+    sys_exit 0
+
+; A read that *fails* rather than blocking means the terminal itself has gone -
+; a pty released because the terminal emulator holding it closed or was killed.
+; Ending the session is the only sane answer: there is nobody left to prompt, and
+; looping would spin on a descriptor that can never produce a byte again.
+;
+; It matters that this is here rather than in term.cat. A window's close button
+; sends SIGTERM, which term could catch and use to kill us tidily - but nothing
+; catches SIGKILL, and nothing catches a crash, and in both of those the pty still
+; goes (the kernel reaps it at teardown) while the shell would be left behind. So
+; the shell notices for itself, and every way of losing a terminal is covered by
+; one branch. On the machine console this never fires: that read blocks or
+; succeeds, it does not fail.
+.notty:
     sys_exit 0
 
 .docd:

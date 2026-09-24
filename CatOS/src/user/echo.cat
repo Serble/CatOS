@@ -2,7 +2,7 @@
 ; The kernel starts us with r1 = argc, r2 = argv (argv[0] is "echo"), so we skip
 ; index 0 and print argv[1..argc-1]. r5-r7 survive syscalls, so argc/argv/index
 ; live there across the sys_write calls.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 main:
     mov r5, r1                       ; argc

@@ -75,10 +75,19 @@
 ; and the kernel assembles the word. So nothing here mentions where a field lives,
 ; and a keyboard on entirely different hardware reimplements only this section.
 ;
-; A control or alt chord deliberately produces no character at all. Ctrl+C is a
-; command, not text, and this driver has no idea which - so the raw keycode and the
-; modifier bits go to whoever grabbed the key and the line discipline is told
-; nothing, rather than being handed a stray 'c'.
+; An ALT chord deliberately produces no character at all: it is a command, and this
+; driver has no idea which - so the raw keycode and the modifier bits go to whoever
+; grabbed the key and the line discipline is told nothing, rather than being handed
+; a stray 'c'.
+;
+; A CTRL chord is different, and only because the US layout says so: CTRL and a
+; letter is that letter's ASCII control code, which is a fact about this keyboard in
+; exactly the way SHIFT+2 being '@' is. So the layout answers it here, once, and
+; Ctrl+C arrives at a line discipline as the character 3 - which is what lets the
+; console and a pty implement the interrupt key without either of them naming a
+; keycode or a modifier bit. Everything else a control chord makes is still a
+; control code, so a program being typed into drops it as unprintable exactly as it
+; drops a stray 0.
 
 #define GFX_TYPE, 0xFF64BEF9     ; PPU graphics device type
 #define KBD_TYPE, 0x2EB3AD76     ; PPU keyboard device type
@@ -435,10 +444,14 @@ rppu_keymap:
     push r5                      ; modifiers
     mov r4, r1
     mov r5, r2
-    mov r0, r5                   ; a control or alt chord is a command, not text:
-    and r0, KMOD_CTRL + KMOD_ALT ; report no character and leave what it means to
-    cmp r0, 0                    ; whoever grabbed the key
+    mov r0, r5                   ; an alt chord is a command, not text: report no
+    and r0, KMOD_ALT             ; character and leave what it means to whoever
+    cmp r0, 0                    ; grabbed the key
     jne .none
+    mov r0, r5
+    and r0, KMOD_CTRL
+    cmp r0, 0
+    jne .ctrl
     cmp r4, 32                   ; Raylib's printable codes are the unshifted
     jul .control                 ; characters of the US layout, upper case for
     cmp r4, 96                   ; letters, so they span ' ' .. '`'
@@ -462,6 +475,14 @@ rppu_keymap:
     sub r0, 32
     add r0, rppu_shift_map
     mov8 r0, [r0]
+    jmp .ret
+    .ctrl:                       ; CTRL + a letter is that letter's control code -
+    cmp r4, 65                   ; 'A' -> 1 .. 'Z' -> 26, the US layout's answer, and
+    jul .none                    ; the only reason a line discipline can recognise
+    cmp r4, 90                   ; the interrupt key without knowing any keycode.
+    jug .none                    ; CTRL with anything else still types nothing.
+    mov r0, r4
+    sub r0, 64
     jmp .ret
     .control:
     cmp r4, RKEY_ENTER

@@ -1,0 +1,2819 @@
+; files - a graphical file manager. An ordinary userland program with a window.
+;
+;   +------------------------------------------------------------+
+;   | /home                        [Up][New][Ren][Del][X]         |
+;   | ..                                                       up |
+;   | docs                                                    dir |
+;   | notes.txt                                              1284 |
+;   | image.bin                                                42 |
+;   |                                                             |
+;   | 4 items   notes.txt  1284 bytes                             |
+;   +------------------------------------------------------------+
+;
+; It creates one surface and draws into it, and knows nothing about which window
+; manager is running: under desktop.cat it is a page, under tile.cat it is a tile
+; that gets resized to fit. It asks the kernel only the three questions a client
+; can ask about itself - wconfig for its size, winput for the pointer in its own
+; coordinates, wkey for what has been typed at it - and everything else it does is
+; ordinary file work that ls, mkdir, mv and rm already do from a shell.
+;
+; That is the point of it. There is no "file manager" anything in the kernel: a
+; directory is a thing you open and readdir, a name is a thing you stat, and the
+; three calls that act on a path rather than an fd (stat, remove, rename) are what
+; turn a list of names into something you can rearrange. This program is a window
+; over those, nothing more.
+;
+;   $ files                          the working directory
+;   $ files /home                    somewhere else
+;   $ bg files                       ... without tying up the shell
+;
+; The argument goes through chdir before getcwd reads it back, so a relative path
+; is normalised by the kernel rather than by a second copy of that logic here; a
+; path that does not exist is not fatal, it just leaves us where we started.
+;
+;
+; -- What a row is ------------------------------------------------------------
+;
+; One table entry per name in the directory, filled by readdir and then stat'd for
+; a type and a size - readdir answers "what is here" and nothing else, so the type
+; that decides a row's colour and what Enter does costs one stat each. A name that
+; stat will not answer for is still listed, as a file of unknown size: a directory
+; entry that cannot be described is exactly the one you want to see.
+;
+; ".." is synthesised rather than read, because CatFS stores no ".." on disk - the
+; parent link lives in the VFS node, so there is nothing in the directory to list.
+; It is given sort rank 0 so it is always the first row, and that rank is also how
+; the rest of the program recognises it: ".." is a direction, not an entry, so it
+; cannot be renamed or deleted.
+;
+; Rows are sorted directories first and then by name, case folded, so "Docs" lands
+; where you would look for it rather than in a separate upper-case section. The
+; sort moves an array of row indices rather than the records themselves, which is
+; four bytes a swap instead of forty-four.
+;
+;
+; -- Moving around ------------------------------------------------------------
+;
+;   arrows         move the selection
+;   PgUp / PgDn    a screenful
+;   Home / End     the first / last row
+;   Enter          enter a directory, or open a file in the editor
+;   Backspace      the parent directory
+;   F2             rename the selected entry
+;   F5             re-read the directory
+;   F7             make a new directory
+;   Delete         remove the selected entry (twice - see below)
+;   ESC            quit
+;
+; The pointer does the same things: a click selects a row, and a click on the row
+; that is *already* selected opens it. There is no double-click timer because
+; there is no clock to run one from - uptms counts executed instructions, not
+; milliseconds, unless the VM was started with --fast, so a "within 300ms" test
+; would mean something different under every window manager. A deliberate second
+; click is easier to aim than a fast one in any case.
+;
+; The title bar carries the same commands as buttons, for the same reason the
+; editor's does: a key is worth exactly as much as the memory of having been told
+; about it, and this program already knows where the pointer is in its own
+; coordinates. A window too narrow for the strip loses it and keeps the keys.
+;
+;
+; -- Deleting takes two presses -----------------------------------------------
+;
+; The first Delete arms the deletion and the status bar says what is about to go;
+; the second does it. Nothing underneath us has an undo, and a file manager where
+; one keystroke loses a directory is one you cannot use quickly. Any other key or
+; button disarms it, so walking away from the question is the default answer.
+;
+; The kernel refuses to remove a directory that still has anything in it, which is
+; deliberate on its side (a driver's remove frees the child outright, so a
+; populated directory would lose its contents while they were still marked in
+; use). Deleting a tree is therefore rm -r's loop, and not something this program
+; pretends is one operation - it reports the refusal and leaves the directory
+; alone.
+;
+;
+; -- The prompt ---------------------------------------------------------------
+;
+; New directory and rename both need a name typed at them, and both use the same
+; one-line prompt in the status bar - where the answer will be reported, so the
+; window does not rearrange itself under you. While it is up it takes every key,
+; because there is nothing else sensible to do with a keystroke aimed at a box you
+; are typing into; a click anywhere is "never mind" and cancels it, doing nothing
+; else, so a click can never half-answer a question.
+;
+; A name with a '/' in it is refused rather than quietly moving the entry
+; somewhere else: rename can cross directories, but a rename box is not where
+; anyone means to.
+#include "lib/sys.cat"
+
+#define WANT_W, 440                  ; the size we would like
+#define WANT_H, 320
+#define MAX_WIN_BYTES, 786432        ; 512 * 384 * 4 - any size we could be granted
+#define MAX_ENTRIES, 256             ; rows in the table; a longer directory is cut
+
+; One entry in the table. res8 is emitted as zeroes and counts against the 69632
+; bytes CatFS allows a single file, so the table lives behind the pixel buffer in
+; one sbrk rather than in the image.
+#define ENT_TYPE, 0                  ; T_FILE / T_DIR / T_CHARDEV / T_BLOCKDEV
+#define ENT_SIZE, 4                  ; bytes, or -1 if stat would not say
+#define ENT_RANK, 8                  ; 0 = "..", 1 = directory, 2 = everything else
+#define ENT_NAME, 12
+#define ENT_NAME_MAX, 32             ; a CatFS name is 27 bytes; this is room to spare
+#define ENT_BYTES, 44
+
+#define ENTS_OFFSET, 786432          ; MAX_WIN_BYTES
+#define ORDER_OFFSET, 797696         ; + MAX_ENTRIES * ENT_BYTES
+#define ARENA_BYTES, 798720          ; + MAX_ENTRIES * 4, in one sbrk
+
+#define CWD_MAX, 256                 ; matches the VFS's own path limit
+#define NAMEBUF_MAX, 128             ; matches VFS_NAME_MAX
+#define STATUS_MAX, 128
+#define PROMPT_MAX, 31               ; characters, terminator not included
+
+#define GW, 8                        ; the console font is 8x16, 1bpp
+#define GH, 16
+#define FONT_GLYPHS, 129
+#define ROW_H, 18                    ; a glyph and a little air
+#define BAR_H, 22                    ; the title and status bars
+#define BAR_TEXT_Y, 3                ; (BAR_H - GH) / 2
+#define PAD, 6
+#define SCROLL_W, 8
+
+; The button strip, laid out left to right from btnstrip. Each width is the label
+; plus BTN_PAD on each side, so the label always starts BTN_PAD in and one routine
+; can answer for both drawing and hit-testing.
+#define NBTN, 5
+#define BTN_UP, 0
+#define BTN_NEW, 1
+#define BTN_REN, 2
+#define BTN_DEL, 3
+#define BTN_QUIT, 4
+#define BTN_PAD, 4
+#define BTN_GAP, 3
+#define BTN_Y, 3
+#define BTN_H, 16
+#define BTN_SPAN, 148                ; 24 + 32 + 32 + 32 + 16, plus four gaps
+#define BTN_MARGIN, 6
+
+#define PM_NONE, 0                   ; what the prompt is asking, if anything
+#define PM_NEWDIR, 1
+#define PM_RENAME, 2
+
+#define BG_COLOUR, 0x001E2A38        ; the list
+#define BAR_BG, 0x000E141B           ; title and status bars
+#define TITLE_TEXT, 0x00FFFFFF
+#define DIR_TEXT, 0x007FC4F5         ; a directory is a different kind of thing ...
+#define FILE_TEXT, 0x00E8F0F5
+#define DEV_TEXT, 0x00C8A0E0         ; ... and so is a device node
+#define SIZE_TEXT, 0x008FA6BC
+#define SEL_BG, 0x003A6EA5
+#define BTN_BG, 0x00243544
+#define BTN_TEXT, 0x00D8E8F4
+#define BTN_WARN, 0x00A5423A         ; [Del] once it is armed
+#define STATUS_TEXT, 0x00C8D8E4
+#define ALERT_TEXT, 0x00E8B45A
+#define TRACK_BG, 0x00172433
+#define THUMB_BG, 0x00445A70
+#define CARET_COLOUR, 0x00FFD479
+
+; Raylib keycodes, as every other program here names them: something has to name
+; the Left arrow, and a driver for different hardware maps into the same space.
+#define KEY_ESCAPE, 256
+#define KEY_ENTER, 257
+#define KEY_BACKSPACE, 259
+#define KEY_DELETE, 261
+#define KEY_DOWN, 264
+#define KEY_UP, 265
+#define KEY_PAGEUP, 266
+#define KEY_PAGEDOWN, 267
+#define KEY_HOME, 268
+#define KEY_END, 269
+#define KEY_F2, 291
+#define KEY_F5, 294
+#define KEY_F7, 296
+#define KEY_KPENTER, 335
+
+
+main:
+    mov [g_argc], r1
+    mov [g_argv], r2
+
+    sys_sbrk ARENA_BYTES             ; pixels first, the table behind them. The
+    cmp r0, -1                       ; window buffer is allocated at the biggest
+    je mem_exit                      ; size we could ever be granted, so a resize
+    mov [winbuf], r0                 ; never has to reallocate anything
+    add r0, ENTS_OFFSET
+    mov [ents], r0
+    mov r0, [winbuf]
+    add r0, ORDER_OFFSET
+    mov [order], r0
+
+    sys_getpid                       ; reap needs to know whose children are whose
+    mov [mypid], r0
+
+    call init_cwd
+    call reload                      ; before the window exists: a directory that
+                                     ; will not open is a status line, not a failure
+
+    sys_wcreate WANT_W, WANT_H
+    cmp r0, -1
+    je win_exit
+    mov [sid], r0
+
+    .loop:
+        call resync                  ; adopt whatever size we have been granted
+        call handle_keys
+        call handle_mouse
+        call reap                    ; an editor we started and that has since quit
+        mov r0, [quitreq]
+        cmp r0, 0
+        jne .quit
+        mov r0, [dirty]
+        cmp r0, 0
+        je .idle
+        call clamp_view
+        call redraw
+        mov r0, 0
+        mov [dirty], r0
+        mov r3, [winbuf]             ; commit(sid, winbuf)
+        mov r2, [sid]
+        mov r1, SYS_WCOMMIT
+        syscall
+        .idle:
+        sys_yield
+        jmp .loop
+
+    .quit:
+        sys_exit 0
+
+mem_exit:
+    sys_write 1, e_mem, e_mem_end - e_mem
+    sys_exit 1
+
+win_exit:
+    sys_write 1, e_win, e_win_end - e_win
+    sys_exit 1
+
+
+; ==========================
+;   Where we are
+; ==========================
+
+; Pick the starting directory. An argument goes through chdir first so that the
+; kernel normalises it - "docs", "../x" and "/home" are all the same question, and
+; getcwd answers all three with an absolute path. A path that does not exist is
+; simply not taken.
+init_cwd:
+    mov r0, [g_argc]
+    cmp r0, 2
+    jul .here
+    mov r1, 1
+    call getarg
+    sys_chdir r0
+    .here:
+    sys_getcwd cwd, CWD_MAX
+    cmp r0, 0
+    je .have
+    mov r1, rootpath                 ; no answer: the root is always somewhere
+    mov r2, cwd
+    call pathset
+    .have:
+    mov r1, cwd
+    call fm_strlen
+    mov [cwdlen], r0
+    ret
+
+
+; Build cwd + "/" + the name at r1 in the buffer at r2. -> r0 = that buffer, or -1
+; if the result would not fit. Two buffers exist because rename needs both halves
+; of the question at once.
+build_path:
+    push r4                          ; the name
+    push r5                          ; the buffer
+    mov r4, r1
+    mov r5, r2
+    mov r1, cwd
+    mov r2, r5
+    call pathset
+    cmp r0, -1
+    je .fail
+    mov r1, r0
+    mov r2, r4
+    mov r3, r5
+    call pathpush
+    cmp r0, -1
+    je .fail
+    mov r0, r5
+    jmp .out
+    .fail:
+    mov r0, -1
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; The common case of the above: a path in path_buf. r1 = the name.
+child_path:
+    mov r2, path_buf
+    jmp build_path
+
+
+; Descend into the directory named at r1.
+descend:
+    mov r2, r1
+    mov r1, [cwdlen]
+    mov r3, cwd
+    call pathpush
+    cmp r0, -1
+    je .toolong
+    mov [cwdlen], r0
+    call reload
+    ret
+    .toolong:
+    call status_toolong
+    ret
+
+
+; Up one level. The parent's name ends at the last '/', except at the root, where
+; there is no level to go up to and the cut would leave an empty string.
+go_parent:
+    push r4                          ; where the last '/' was
+    push r5                          ; scan cursor
+    mov r4, 0
+    mov r5, 0
+    .scan:
+        mov r0, cwd
+        add r0, r5
+        mov8 r0, [r0]
+        cmp r0, 0
+        je .cut
+        cmp r0, 47                   ; '/'
+        jne .step
+        mov r4, r5
+        .step:
+        add r5, 1
+        jmp .scan
+    .cut:
+    cmp r4, 0                        ; "/home" cuts back to "", which is the root
+    jne .trim
+    mov r0, cwd
+    add r0, 1
+    mov8 [r0], 0
+    mov r0, 1
+    mov [cwdlen], r0
+    jmp .go
+    .trim:
+    mov r0, cwd
+    add r0, r4
+    mov8 [r0], 0
+    mov [cwdlen], r4
+    .go:
+    call reload
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   The table
+; ==========================
+
+; ent_rec(r1 = entry index) -> r0 = its record.
+ent_rec:
+    mov r0, r1
+    umul r0, ENT_BYTES
+    mov r1, [ents]
+    add r0, r1
+    ret
+
+
+; order_get(r1 = row) -> r0 = the entry index shown on that row.
+order_get:
+    mov r0, r1
+    umul r0, 4
+    mov r1, [order]
+    add r0, r1
+    mov r0, [r0]
+    ret
+
+
+; order_set(r1 = row, r2 = entry index).
+order_set:
+    mov r0, r1
+    umul r0, 4
+    mov r1, [order]
+    add r0, r1
+    mov [r0], r2
+    ret
+
+
+; row_rec(r1 = row) -> r0 = the record shown there.
+row_rec:
+    call order_get
+    mov r1, r0
+    jmp ent_rec
+
+
+; sel_rec() -> r0 = the selected record, or 0 when the list is empty. Every action
+; starts here, so an empty directory needs no special case anywhere else.
+sel_rec:
+    mov r0, [nents]
+    cmp r0, 0
+    je .none
+    mov r1, [sel]
+    cmp r1, r0
+    juge .none
+    jmp row_rec
+    .none:
+    mov r0, 0
+    ret
+
+
+; Re-read the current directory into the table, sort it, and start at the top.
+reload:
+    push r4                          ; the directory fd
+    mov r0, 0
+    mov [nents], r0
+    mov [armed], r0
+    mov [pmode], r0
+    call add_parent                  ; ".." first, unless we are already at the root
+
+    sys_open cwd, O_READ
+    mov r4, r0
+    cmp r4, -1
+    je .noopen
+    .next:
+        mov r0, [nents]
+        cmp r0, MAX_ENTRIES
+        juge .close                  ; full: the rest of the directory is not listed
+        sys_readdir r4, namebuf, NAMEBUF_MAX
+        cmp r0, 1
+        jne .close                   ; 0 = the end, -1 = it went away under us
+        call add_entry
+        jmp .next
+    .close:
+    sys_close r4
+
+    call sort_entries
+    mov r0, 0
+    mov [sel], r0
+    mov [top], r0
+    call status_summary
+    mov r0, 1
+    mov [dirty], r0
+    pop r4
+    ret
+
+    .noopen:
+    call sort_entries
+    mov r0, 0
+    mov [sel], r0
+    mov [top], r0
+    call st_reset
+    mov r1, s_noopen
+    call st_str
+    mov r1, cwd
+    call st_str
+    mov r0, 1
+    mov [dirty], r0
+    pop r4
+    ret
+
+
+; Re-read but stay roughly where we were. What changed is one entry, not where you
+; are looking; clamp_view pulls the selection back in if it fell off the end.
+reload_keep:
+    push r4
+    push r5
+    mov r4, [sel]
+    mov r5, [top]
+    call reload
+    mov [sel], r4
+    mov [top], r5
+    call clamp_view                  ; the row we were on may have been the one that
+    call status_summary              ; went, so settle first and describe after
+    pop r5
+    pop r4
+    ret
+
+
+; Put ".." at the head of the table. Nothing in the directory says it exists -
+; CatFS stores no ".." on disk, because the parent link lives in the VFS node - so
+; the row is ours to invent, and rank 0 is what everything else recognises it by.
+add_parent:
+    mov r1, cwd
+    mov r2, rootpath
+    call fstreq
+    cmp r0, 1
+    je .done                         ; the root has no parent to offer
+    mov r0, [ents]
+    mov r1, T_DIR
+    mov [r0], r1
+    add r0, ENT_SIZE
+    mov r1, 0
+    mov [r0], r1
+    mov r0, [ents]
+    add r0, ENT_RANK
+    mov r1, 0
+    mov [r0], r1
+    mov r1, dotdot
+    mov r2, [ents]
+    add r2, ENT_NAME
+    call copy_name
+    mov r0, 1
+    mov [nents], r0
+    .done:
+    ret
+
+
+; Append what readdir left in namebuf, stat'd for a type and a size.
+add_entry:
+    push r4                          ; the record
+    mov r4, [nents]
+    umul r4, ENT_BYTES
+    mov r0, [ents]
+    add r4, r0
+
+    mov r1, namebuf
+    mov r2, r4
+    add r2, ENT_NAME
+    call copy_name
+
+    mov r1, namebuf
+    call child_path
+    cmp r0, -1
+    je .unknown
+    sys_stat r0, fm_st
+    cmp r0, 0
+    jne .unknown
+    mov r0, [fm_st + ST_TYPE]
+    mov [r4], r0
+    mov r0, [fm_st + ST_SIZE]
+    mov r1, r4
+    add r1, ENT_SIZE
+    mov [r1], r0
+    jmp .rank
+
+    .unknown:                        ; readdir named it but stat will not describe
+    mov r0, T_FILE                   ; it: list it anyway, with the size unknown.
+    mov [r4], r0                     ; A name you cannot ask about is the one you
+    mov r0, -1                       ; most want to be told is there
+    mov r1, r4
+    add r1, ENT_SIZE
+    mov [r1], r0
+
+    .rank:
+    mov r0, [r4]                     ; directories sort above everything else
+    cmp r0, T_DIR
+    je .isdir
+    mov r0, 2
+    jmp .setrank
+    .isdir:
+    mov r0, 1
+    .setrank:
+    mov r1, r4
+    add r1, ENT_RANK
+    mov [r1], r0
+
+    mov r0, [nents]
+    add r0, 1
+    mov [nents], r0
+    pop r4
+    ret
+
+
+; Copy the name at r1 to r2, cut to what a record holds. A name longer than the
+; field is shown short rather than dropped: it is still the row you clicked, and
+; every path is built from cwd plus what is in the field, so a cut name simply
+; fails to open rather than opening the wrong thing.
+copy_name:
+    push r4                          ; bytes left
+    mov r4, ENT_NAME_MAX - 1
+    .loop:
+        cmp r4, 0
+        je .done
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .done
+        mov8 [r2], r0
+        add r1, 1
+        add r2, 1
+        sub r4, 1
+        jmp .loop
+    .done:
+    mov8 [r2], 0
+    pop r4
+    ret
+
+
+; Sort the rows. The order array holds row -> entry index, so a swap moves four
+; bytes rather than a whole record; insertion sort is O(n^2) but this runs once
+; per directory read, not once per frame.
+sort_entries:
+    push r4                          ; i
+    push r5                          ; j
+    push r6                          ; the entry being placed
+    push r7                          ; how many there are
+    mov r7, [nents]
+    mov r4, 0
+    .fill:
+        cmp r4, r7
+        juge .sort
+        mov r1, r4
+        mov r2, r4
+        call order_set
+        add r4, 1
+        jmp .fill
+    .sort:
+    mov r4, 1
+    .outer:
+        cmp r4, r7
+        juge .done
+        mov r1, r4
+        call order_get
+        mov r6, r0
+        mov r5, r4
+        sub r5, 1
+        .inner:
+            cmp r5, 0
+            jil .place
+            mov r1, r5
+            call order_get
+            mov r1, r0
+            mov r2, r6
+            call ent_cmp             ; does what is at j belong after what we hold?
+            cmp r0, 1
+            jne .place
+            mov r1, r5
+            call order_get
+            mov r2, r0
+            mov r1, r5
+            add r1, 1
+            call order_set
+            sub r5, 1
+            jmp .inner
+        .place:
+        mov r1, r5
+        add r1, 1
+        mov r2, r6
+        call order_set
+        add r4, 1
+        jmp .outer
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ent_cmp(r1, r2 = entry indices) -> r0 = 1 if the first sorts after the second.
+ent_cmp:
+    push r4                          ; record a
+    push r5                          ; record b
+    push r6                          ; index b
+    mov r6, r2
+    call ent_rec
+    mov r4, r0
+    mov r1, r6
+    call ent_rec
+    mov r5, r0
+
+    mov r0, r4
+    add r0, ENT_RANK
+    mov r0, [r0]
+    mov r1, r5
+    add r1, ENT_RANK
+    mov r1, [r1]
+    cmp r0, r1
+    jul .before
+    jug .after
+
+    mov r1, r4                       ; same rank: by name, folded, so "Docs" lands
+    add r1, ENT_NAME                 ; where you would look for it rather than in
+    mov r2, r5                       ; an upper-case section of its own
+    add r2, ENT_NAME
+    call name_cmp
+    cmp r0, 1
+    je .after
+    .before:
+    mov r0, 0
+    jmp .out
+    .after:
+    mov r0, 1
+    .out:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; name_cmp(r1, r2 = strings) -> r0 = -1 / 0 / 1, comparing with case folded away.
+name_cmp:
+    push r4                          ; a character from each side, folded
+    push r5
+    .loop:
+        mov8 r4, [r1]
+        cmp r4, 65                   ; 'A'
+        jul .a_ok
+        cmp r4, 90                   ; 'Z'
+        jug .a_ok
+        add r4, 32
+        .a_ok:
+        mov8 r5, [r2]
+        cmp r5, 65
+        jul .b_ok
+        cmp r5, 90
+        jug .b_ok
+        add r5, 32
+        .b_ok:
+        cmp r4, r5
+        jul .less
+        jug .greater
+        cmp r4, 0
+        je .equal
+        add r1, 1
+        add r2, 1
+        jmp .loop
+    .less:
+    mov r0, -1
+    jmp .out
+    .greater:
+    mov r0, 1
+    jmp .out
+    .equal:
+    mov r0, 0
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; Put the cursor on a named entry if it is still there. After a rename or a new
+; directory, what you just made is what you are looking for.
+select_by_name:
+    push r4                          ; the name
+    push r5                          ; row
+    push r6                          ; how many rows there are
+    mov r4, r1
+    mov r6, [nents]
+    mov r5, 0
+    .each:
+        cmp r5, r6
+        juge .done
+        mov r1, r5
+        call row_rec
+        mov r1, r0
+        add r1, ENT_NAME
+        mov r2, r4
+        call fstreq
+        cmp r0, 1
+        je .found
+        add r5, 1
+        jmp .each
+    .found:
+    mov [sel], r5
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Acting on a row
+; ==========================
+
+; Enter: a directory is entered, ".." goes up, anything else goes to the editor.
+activate:
+    push r4                          ; the record
+    call sel_rec
+    cmp r0, 0
+    je .done
+    mov r4, r0
+    mov r0, r4
+    add r0, ENT_RANK
+    mov r0, [r0]
+    cmp r0, 0                        ; rank 0 is "..", and nothing else ever is
+    je .up
+    mov r0, r4
+    add r0, ENT_TYPE
+    mov r0, [r0]
+    cmp r0, T_DIR
+    je .down
+    call open_in_editor
+    jmp .done
+    .up:
+    call go_parent
+    jmp .done
+    .down:
+    mov r1, r4
+    add r1, ENT_NAME
+    call descend
+    .done:
+    pop r4
+    ret
+
+
+; Hand the selected file to the editor. There is no "open with" table here: the
+; editor is the one program on this machine that will show you an arbitrary file,
+; so it is what opening one means. A device node is not offered - the editor reads
+; its file in whole, and a character device has no end to read to.
+open_in_editor:
+    push r4                          ; the record
+    call sel_rec
+    cmp r0, 0
+    je .done
+    mov r4, r0
+    mov r0, r4
+    add r0, ENT_TYPE
+    mov r0, [r0]
+    cmp r0, T_FILE
+    jne .notfile
+
+    mov r1, r4
+    add r1, ENT_NAME
+    call child_path
+    cmp r0, -1
+    je .toolong
+    mov [fm_argv1], r0               ; argv[1]; argv[0] is the editor's own name
+    mov r3, fm_argv
+    mov r2, editorpath
+    mov r1, SYS_SPAWN
+    syscall                          ; and no wait: it is a window of its own, and
+    cmp r0, -1                       ; reap collects it when it is done
+    je .nostart
+
+    call st_reset
+    mov r1, s_editing
+    call st_str
+    mov r1, r4
+    add r1, ENT_NAME
+    call st_str
+    jmp .touch
+
+    .notfile:
+    call st_reset
+    mov r1, s_notfile
+    call st_str
+    jmp .touch
+    .nostart:
+    call st_reset
+    mov r1, s_noeditor
+    call st_str
+    jmp .touch
+    .toolong:
+    call status_toolong
+    .touch:
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    pop r4
+    ret
+
+
+; Delete, in two presses. The first arms and names what is at stake; the second
+; does it. See the banner for why.
+do_delete:
+    push r4                          ; the record
+    call sel_rec
+    cmp r0, 0
+    je .done
+    mov r4, r0
+    mov r0, r4
+    add r0, ENT_RANK
+    mov r0, [r0]
+    cmp r0, 0
+    je .noparent                     ; ".." is a direction, not something to remove
+
+    mov r0, [armed]
+    cmp r0, 0
+    jne .go
+    mov r0, 1
+    mov [armed], r0
+    call st_reset
+    mov r1, s_arm
+    call st_str
+    mov r1, r4
+    add r1, ENT_NAME
+    call st_str
+    jmp .touch
+
+    .go:
+    mov r0, 0
+    mov [armed], r0
+    mov r1, r4                       ; the name, before the table it lives in is
+    mov r2, namesave                 ; rebuilt underneath us
+    add r1, ENT_NAME
+    call copy_name
+    mov r1, namesave
+    call child_path
+    cmp r0, -1
+    je .toolong
+    sys_remove r0
+    cmp r0, 0
+    jne .refused
+    call reload_keep                 ; which resets the status, so say it after
+    call st_reset
+    mov r1, s_removed
+    call st_str
+    mov r1, namesave
+    call st_str
+    jmp .touch
+
+    .refused:                        ; the kernel refuses a populated directory and
+    call st_reset                    ; a mount point, and both are worth saying:
+    mov r1, s_refused                ; neither is a typo, and neither is our call
+    call st_str
+    jmp .touch
+    .noparent:
+    call st_reset
+    mov r1, s_noparent
+    call st_str
+    jmp .touch
+    .toolong:
+    call status_toolong
+    .touch:
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    pop r4
+    ret
+
+
+; ==========================
+;   The prompt
+; ==========================
+
+; Open it. r1 = PM_*, r2 = what to prefill it with, or 0 for empty.
+prompt_open:
+    push r4                          ; the prefill
+    mov [pmode], r1
+    mov r4, r2
+    mov r0, 0
+    mov [promptlen], r0
+    mov8 [promptbuf], 0
+    cmp r4, 0
+    je .done
+    .copy:
+        mov r0, [promptlen]
+        cmp r0, PROMPT_MAX
+        juge .done
+        mov8 r1, [r4]
+        cmp r1, 0
+        je .done
+        mov r2, promptbuf
+        add r2, r0
+        mov8 [r2], r1
+        add r2, 1
+        mov8 [r2], 0
+        add r0, 1
+        mov [promptlen], r0
+        add r4, 1
+        jmp .copy
+    .done:
+    mov r0, 1
+    mov [dirty], r0
+    pop r4
+    ret
+
+
+prompt_cancel:
+    mov r0, PM_NONE
+    mov [pmode], r0
+    call status_summary
+    mov r0, 1
+    mov [dirty], r0
+    ret
+
+
+; A key aimed at the box. r1 = the event.
+prompt_key:
+    push r4                          ; the keycode
+    push r5                          ; the event
+    mov r5, r1
+    mov r4, r1
+    kev_code r4
+    cmp r4, KEY_ESCAPE
+    je .cancel
+    cmp r4, KEY_ENTER
+    je .commit
+    cmp r4, KEY_KPENTER
+    je .commit
+    cmp r4, KEY_BACKSPACE
+    je .back
+
+    mov r0, r5                       ; anything that types a printable character
+    kev_char r0                      ; adds it; anything else is not for us
+    cmp r0, 32
+    jul .out
+    cmp r0, 126
+    jug .out
+    mov r1, [promptlen]
+    cmp r1, PROMPT_MAX
+    juge .out
+    mov r2, promptbuf
+    add r2, r1
+    mov8 [r2], r0
+    add r2, 1
+    mov8 [r2], 0
+    add r1, 1
+    mov [promptlen], r1
+    jmp .touch
+
+    .back:
+    mov r0, [promptlen]
+    cmp r0, 0
+    je .out
+    sub r0, 1
+    mov [promptlen], r0
+    mov r1, promptbuf
+    add r1, r0
+    mov8 [r1], 0
+    jmp .touch
+
+    .cancel:
+    call prompt_cancel
+    jmp .out
+    .commit:
+    call prompt_commit
+    jmp .out
+    .touch:
+    mov r0, 1
+    mov [dirty], r0
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; Answer the question. An empty line is the same as giving up; a name with a '/'
+; in it is refused, because rename can cross directories but a rename box is not
+; where anyone means to.
+prompt_commit:
+    push r4                          ; the mode, before we clear it
+    mov r4, [pmode]
+    mov r0, [promptlen]
+    cmp r0, 0
+    je .cancel
+    mov r1, promptbuf
+    call has_slash
+    cmp r0, 1
+    je .slash
+
+    mov r0, PM_NONE
+    mov [pmode], r0
+    cmp r4, PM_NEWDIR
+    je .newdir
+    call do_rename
+    jmp .touch
+    .newdir:
+    call do_newdir
+    jmp .touch
+
+    .slash:
+    call st_reset
+    mov r1, s_slash
+    call st_str
+    jmp .touch
+    .cancel:
+    call prompt_cancel
+    jmp .done
+    .touch:
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    pop r4
+    ret
+
+
+do_newdir:
+    mov r1, promptbuf
+    call child_path
+    cmp r0, -1
+    je .toolong
+    sys_create r0, T_DIR
+    cmp r0, 0
+    jne .failed
+    call reload                      ; a new name changes the order, so start over
+    mov r1, promptbuf                ; ... and then go and stand on it
+    call select_by_name
+    call st_reset
+    mov r1, s_created
+    call st_str
+    mov r1, promptbuf
+    call st_str
+    ret
+    .failed:
+    call st_reset
+    mov r1, s_nocreate
+    call st_str
+    mov r1, promptbuf
+    call st_str
+    ret
+    .toolong:
+    jmp status_toolong
+
+
+; Rename the selected entry to what was typed. Both halves have to exist at once,
+; so the old path goes in path_alt and the new one in path_buf.
+do_rename:
+    push r4                          ; the record
+    call sel_rec
+    cmp r0, 0
+    je .done
+    mov r4, r0
+    mov r0, r4
+    add r0, ENT_RANK
+    mov r0, [r0]
+    cmp r0, 0
+    je .noparent
+
+    mov r1, r4
+    add r1, ENT_NAME
+    mov r2, path_alt
+    call build_path
+    cmp r0, -1
+    je .toolong
+    mov r1, promptbuf
+    mov r2, path_buf
+    call build_path
+    cmp r0, -1
+    je .toolong
+
+    sys_rename path_alt, path_buf
+    cmp r0, 0
+    jne .failed
+    call reload
+    mov r1, promptbuf
+    call select_by_name
+    call st_reset
+    mov r1, s_renamed
+    call st_str
+    mov r1, promptbuf
+    call st_str
+    jmp .done
+
+    .failed:                         ; the VFS refuses to clobber an existing name,
+    call st_reset                    ; which is the answer this almost always is
+    mov r1, s_norename
+    call st_str
+    mov r1, promptbuf
+    call st_str
+    jmp .done
+    .noparent:
+    call st_reset
+    mov r1, s_noparent
+    call st_str
+    jmp .done
+    .toolong:
+    call status_toolong
+    .done:
+    pop r4
+    ret
+
+
+; has_slash(r1) -> r0 = 1 if the string contains a '/'.
+has_slash:
+    .loop:
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .no
+        cmp r0, 47
+        je .yes
+        add r1, 1
+        jmp .loop
+    .yes:
+    mov r0, 1
+    ret
+    .no:
+    mov r0, 0
+    ret
+
+
+; ==========================
+;   Size and input
+; ==========================
+
+; Adopt the size the window manager has granted us. Only the config counter moving
+; means anything changed, so this is a compare in the common case.
+resync:
+    sys_wconfig [sid], cfgbuf
+    cmp r0, -1
+    je .done                         ; surface gone; the next commit will fail too
+    mov r0, [cfgbuf + 8]             ; the config counter
+    mov r1, [lastcfg]
+    cmp r0, r1
+    je .done
+    mov [lastcfg], r0
+    mov r0, [cfgbuf]
+    mov [winw], r0
+    mov r0, [cfgbuf + 4]
+    mov [winh], r0
+    call layout
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    ret
+
+
+; Everything that depends on the window size and nothing else.
+layout:
+    mov r0, [winh]                   ; the list is what the two bars leave
+    sub r0, BAR_H * 2
+    cmp r0, ROW_H
+    jige .listok
+    mov r0, ROW_H                    ; too short for even one row: draw one anyway,
+    .listok:                         ; clipped, rather than an empty window
+    mov [listh], r0
+    mov r1, ROW_H
+    udiv r0, r1
+    cmp r0, 1
+    juge .rowsok
+    mov r0, 1
+    .rowsok:
+    mov [visrows], r0
+
+    mov r0, [winh]
+    sub r0, BAR_H
+    cmp r0, BAR_H
+    jige .statok
+    mov r0, BAR_H
+    .statok:
+    mov [statusy], r0
+
+    mov r0, [winw]                   ; the button strip, right-aligned. A window too
+    sub r0, BTN_SPAN + BTN_MARGIN    ; narrow for it loses it and keeps the keys,
+    cmp r0, PAD * 2                  ; which is the same rule the editor follows
+    jil .nobuttons
+    mov [btnstrip], r0
+    mov r0, 1
+    mov [btnshow], r0
+    ret
+    .nobuttons:
+    mov r0, 0
+    mov [btnshow], r0
+    ret
+
+
+; Where the list stops. The scrollbar takes a strip on the right, but only when
+; there is more list than window - an exactly-fitting directory gets the width.
+list_right:
+    mov r0, [winw]
+    mov r1, [nents]
+    mov r2, [visrows]
+    cmp r1, r2
+    jule .none
+    sub r0, SCROLL_W
+    .none:
+    ret
+
+
+; Keep the selection on a real row and on screen, scrolling the least that does it.
+clamp_view:
+    mov r0, [nents]
+    cmp r0, 0
+    je .empty
+    mov r1, [sel]                    ; the row it was on may have gone away
+    cmp r1, r0
+    jul .selok
+    sub r0, 1
+    mov [sel], r0
+    .selok:
+    mov r1, [sel]
+    mov r2, [top]
+    cmp r1, r2
+    juge .below
+    mov [top], r1                    ; above the window: bring it to the top row
+    jmp .cap
+    .below:
+    mov r0, [visrows]
+    add r2, r0
+    cmp r1, r2
+    jul .cap
+    mov r0, [sel]                    ; below it: bring it to the bottom row
+    mov r1, [visrows]
+    sub r0, r1
+    add r0, 1
+    mov [top], r0
+    .cap:
+    mov r0, [nents]                  ; and never scroll past the last screenful
+    mov r1, [visrows]
+    sub r0, r1
+    cmp r0, 0
+    jige .maxok
+    mov r0, 0
+    .maxok:
+    mov r1, [top]
+    cmp r1, r0
+    jule .done
+    mov [top], r0
+    .done:
+    ret
+    .empty:
+    mov r0, 0
+    mov [sel], r0
+    mov [top], r0
+    ret
+
+
+; Move the selection by r1 rows, clamped to the list. The arrows, the page keys
+; and the scrollbar track all come through here, so they cannot disagree about
+; where the ends are.
+page_move:
+    push r4                          ; the last row
+    mov r4, [nents]
+    cmp r4, 0
+    je .done
+    sub r4, 1
+    mov r0, [sel]
+    add r0, r1
+    cmp r0, 0
+    jige .lo
+    mov r0, 0
+    .lo:
+    cmp r0, r4
+    jile .hi
+    mov r0, r4
+    .hi:
+    mov [sel], r0
+    call status_summary
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    pop r4
+    ret
+
+
+; Forget an armed deletion, and put the ordinary summary back so the status bar
+; stops asking a question nobody is going to answer.
+disarm:
+    mov r0, [armed]
+    cmp r0, 0
+    je .done
+    mov r0, 0
+    mov [armed], r0
+    call status_summary
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    ret
+
+
+; Drain the keys the window manager has posted to us.
+handle_keys:
+    push r4                          ; the event
+    .drain:
+        sys_wkey [sid]
+        cmp r0, -1
+        je .done
+        mov r4, r0
+        mov r0, r4
+        and r0, KEV_UP               ; a release says nothing here
+        cmp r0, 0
+        jne .drain
+        mov r0, r4
+        and r0, KEV_MODKEY           ; nor does the modifier itself going down
+        cmp r0, 0
+        jne .drain
+        mov r0, [pmode]              ; a box you are typing into takes every key
+        cmp r0, PM_NONE
+        jne .prompt
+        mov r1, r4
+        call command_key
+        jmp .drain
+        .prompt:
+        mov r1, r4
+        call prompt_key
+        jmp .drain
+    .done:
+    pop r4
+    ret
+
+
+command_key:
+    push r4                          ; the keycode
+    mov r4, r1
+    kev_code r4
+
+    cmp r4, KEY_DELETE               ; every key but Delete is second thoughts about
+    je .armed_ok                     ; a deletion that was armed
+    call disarm
+    .armed_ok:
+
+    cmp r4, KEY_UP
+    je .up
+    cmp r4, KEY_DOWN
+    je .down
+    cmp r4, KEY_PAGEUP
+    je .pgup
+    cmp r4, KEY_PAGEDOWN
+    je .pgdn
+    cmp r4, KEY_HOME
+    je .home
+    cmp r4, KEY_END
+    je .end
+    cmp r4, KEY_ENTER
+    je .enter
+    cmp r4, KEY_KPENTER
+    je .enter
+    cmp r4, KEY_BACKSPACE
+    je .parent
+    cmp r4, KEY_DELETE
+    je .del
+    cmp r4, KEY_F2
+    je .rename
+    cmp r4, KEY_F5
+    je .refresh
+    cmp r4, KEY_F7
+    je .newdir
+    cmp r4, KEY_ESCAPE
+    je .quit
+    jmp .out
+
+    .up:
+    mov r1, -1
+    jmp .move
+    .down:
+    mov r1, 1
+    jmp .move
+    .pgup:
+    mov r1, [visrows]
+    mov r0, 0
+    sub r0, r1
+    mov r1, r0
+    jmp .move
+    .pgdn:
+    mov r1, [visrows]
+    jmp .move
+    .home:
+    mov r1, [nents]                  ; page_move clamps, so "further than the list
+    mov r0, 0                        ; is long" is exactly Home and End
+    sub r0, r1
+    mov r1, r0
+    jmp .move
+    .end:
+    mov r1, [nents]
+    .move:
+    call page_move
+    jmp .out
+
+    .enter:
+    call activate
+    jmp .out
+    .parent:
+    mov r0, [cwdlen]                 ; at the root there is nowhere to go
+    cmp r0, 1
+    jule .out
+    call go_parent
+    jmp .out
+    .del:
+    call do_delete
+    jmp .out
+    .refresh:
+    call reload_keep
+    jmp .out
+    .newdir:
+    mov r1, PM_NEWDIR
+    mov r2, 0
+    call prompt_open
+    jmp .out
+    .rename:
+    call sel_rec
+    cmp r0, 0
+    je .out
+    mov r1, r0
+    add r1, ENT_RANK
+    mov r1, [r1]
+    cmp r1, 0
+    je .out                          ; ".." is not a name we own
+    mov r2, r0                       ; prefilled with the name it has, since the
+    add r2, ENT_NAME                 ; new one is usually a version of the old
+    mov r1, PM_RENAME
+    call prompt_open
+    jmp .out
+    .quit:
+    mov r0, 1
+    mov [quitreq], r0
+    .out:
+    pop r4
+    ret
+
+
+; The pointer, in our own coordinates because the window manager translated it -
+; a client never sees screen geometry and never needs to know where it was put.
+handle_mouse:
+    push r4                          ; the buttons this frame
+    sys_winput [sid], inbuf
+    cmp r0, -1
+    je .done
+    mov r4, [inbuf + 8]
+    mov r0, r4                       ; only the press edge counts, so holding the
+    and r0, 1                        ; button down does not retrigger
+    cmp r0, 0
+    je .store
+    mov r0, [prevbtn]
+    and r0, 1
+    cmp r0, 0
+    jne .store
+    mov r1, [inbuf]
+    mov r2, [inbuf + 4]
+    call click
+    .store:
+    mov [prevbtn], r4
+    .done:
+    pop r4
+    ret
+
+
+; A press at (r1, r2).
+click:
+    push r4                          ; x
+    push r5                          ; y
+    mov r4, r1
+    mov r5, r2
+
+    mov r0, [pmode]                  ; a click while the prompt is up is "never
+    cmp r0, PM_NONE                  ; mind": it closes the box and does nothing
+    je .live                         ; else, so a click cannot half-answer it
+    call prompt_cancel
+    jmp .out
+    .live:
+
+    cmp r5, BAR_H
+    jige .list
+    mov r0, [btnshow]
+    cmp r0, 0
+    je .out
+    mov r1, r4
+    call btn_hit
+    cmp r0, -1
+    je .out
+    mov r1, r0
+    call btn_action
+    jmp .out
+
+    .list:
+    mov r0, [statusy]
+    cmp r5, r0
+    jige .out                        ; the status bar is a report, not a control
+    call list_right
+    cmp r4, r0
+    jige .track
+    mov r1, r5
+    call list_click
+    jmp .out
+    .track:
+    mov r1, r5
+    call track_click
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; A click in the list, at row height r1. Selects, and opens the row that was
+; already selected - see the banner for why there is no double-click timer.
+list_click:
+    push r4                          ; the row
+    mov r0, r1
+    sub r0, BAR_H
+    mov r1, ROW_H
+    udiv r0, r1
+    mov r4, [top]
+    add r4, r0
+    mov r0, [nents]
+    cmp r4, r0
+    juge .done                       ; past the last entry: empty space, not a row
+    mov r0, [sel]
+    cmp r0, r4
+    je .open
+    mov [sel], r4
+    call status_summary
+    mov r0, 1
+    mov [dirty], r0
+    jmp .done
+    .open:
+    call activate
+    .done:
+    pop r4
+    ret
+
+
+; A click on the scrollbar, at height r1. Above the thumb is a page back, below it
+; a page on - the same movement PgUp and PgDn make, so there is one notion of a
+; page. The thumb is not dragged: this is a bar you page with, and it says so by
+; doing nothing when you click the thumb itself.
+track_click:
+    push r4                          ; where the click was
+    mov r4, r1
+    mov r0, [nents]
+    mov r1, [visrows]
+    cmp r0, r1
+    jule .done                       ; no bar there to click
+    call thumb_geom
+    cmp r4, r0
+    jil .back
+    add r0, r1
+    cmp r4, r0
+    jul .done
+    mov r1, [visrows]
+    call page_move
+    jmp .done
+    .back:
+    mov r1, [visrows]
+    mov r0, 0
+    sub r0, r1
+    mov r1, r0
+    call page_move
+    .done:
+    pop r4
+    ret
+
+
+; btn_x(r1 = index) -> r0 = its left edge, r1 = its width. One routine for drawing
+; and for hit-testing, so the two cannot drift apart.
+btn_x:
+    push r4                          ; the index we want
+    push r5                          ; running left edge
+    push r6                          ; the one being measured
+    mov r4, r1
+    mov r5, [btnstrip]
+    mov r6, 0
+    .each:
+        cmp r6, r4
+        juge .done
+        mov r0, r6
+        umul r0, 4
+        add r0, btnwidths
+        mov r0, [r0]
+        add r5, r0
+        add r5, BTN_GAP
+        add r6, 1
+        jmp .each
+    .done:
+    mov r0, r4
+    umul r0, 4
+    add r0, btnwidths
+    mov r1, [r0]
+    mov r0, r5
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; btn_hit(r1 = x) -> r0 = the button there, or -1.
+btn_hit:
+    push r4                          ; x
+    push r5                          ; index
+    mov r4, r1
+    mov r5, 0
+    .each:
+        cmp r5, NBTN
+        juge .none
+        mov r1, r5
+        call btn_x
+        cmp r4, r0
+        jil .next
+        add r0, r1
+        cmp r4, r0
+        jil .found
+        .next:
+        add r5, 1
+        jmp .each
+    .found:
+    mov r0, r5
+    jmp .out
+    .none:
+    mov r0, -1
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; A button is the visible half of a key, never a second implementation of one, so
+; both ends call the same routine and the two can never disagree.
+btn_action:
+    push r4                          ; the button
+    mov r4, r1
+    cmp r4, BTN_DEL                  ; the same second-thoughts rule the keys follow
+    je .armed_ok
+    call disarm
+    .armed_ok:
+    cmp r4, BTN_UP
+    je .up
+    cmp r4, BTN_NEW
+    je .new
+    cmp r4, BTN_REN
+    je .ren
+    cmp r4, BTN_DEL
+    je .del
+    mov r0, 1                        ; [X]
+    mov [quitreq], r0
+    jmp .out
+    .up:
+    mov r0, [cwdlen]
+    cmp r0, 1
+    jule .out
+    call go_parent
+    jmp .out
+    .new:
+    mov r1, PM_NEWDIR
+    mov r2, 0
+    call prompt_open
+    jmp .out
+    .ren:
+    call sel_rec
+    cmp r0, 0
+    je .out
+    mov r1, r0
+    add r1, ENT_RANK
+    mov r1, [r1]
+    cmp r1, 0
+    je .out
+    mov r2, r0
+    add r2, ENT_NAME
+    mov r1, PM_RENAME
+    call prompt_open
+    jmp .out
+    .del:
+    call do_delete
+    .out:
+    pop r4
+    ret
+
+
+; SYS_WAIT is the only thing that frees a ZOMBIE, and nothing in the kernel reaps
+; orphans, so an editor we started and never waited for would hold a PCB slot for
+; good. pslist says which of our children have already exited, so the wait below
+; can never block us. One a frame is plenty.
+reap:
+    push r4                          ; the record being examined
+    push r5                          ; index
+    push r6                          ; how many came back
+    sys_pslist fm_ps, PS_MAX
+    cmp r0, 0
+    jile .done
+    mov r6, r0
+    mov r5, 0
+    .each:
+        cmp r5, r6
+        juge .done
+        mov r4, r5
+        umul r4, PSREC_BYTES
+        add r4, fm_ps
+        mov r0, r4
+        add r0, PSREC_STATE
+        mov r0, [r0]
+        cmp r0, PS_ZOMBIE
+        jne .next
+        mov r0, r4
+        add r0, PSREC_PPID
+        mov r0, [r0]
+        mov r1, [mypid]
+        cmp r0, r1
+        jne .next                    ; somebody else's problem
+        mov r0, [r4]
+        sys_wait r0
+        jmp .done
+        .next:
+        add r5, 1
+        jmp .each
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   The status line
+; ==========================
+
+st_reset:
+    mov r0, 0
+    mov [statuslen], r0
+    mov8 [statusbuf], 0
+    ret
+
+
+; Append the null-terminated string at r1, stopping at the end of the buffer: a
+; message that will not fit is a truncated message, never a scribble past it.
+st_str:
+    push r4                          ; write cursor
+    push r5                          ; length so far
+    mov r5, [statuslen]
+    mov r4, statusbuf
+    add r4, r5
+    .loop:
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .done
+        cmp r5, STATUS_MAX - 1
+        juge .done
+        mov8 [r4], r0
+        add r4, 1
+        add r5, 1
+        add r1, 1
+        jmp .loop
+    .done:
+    mov8 [r4], 0
+    mov [statuslen], r5
+    pop r5
+    pop r4
+    ret
+
+
+; Append r1 in decimal.
+st_num:
+    mov r2, numbuf
+    call itoa
+    mov r1, numbuf
+    jmp st_str
+
+
+; What the bar says when nothing else is going on: what is here, and what the
+; cursor is on.
+status_summary:
+    push r4                          ; the selected record
+    call st_reset
+    mov r1, [nents]
+    call st_num
+    mov r1, s_items
+    call st_str
+    call sel_rec
+    cmp r0, 0
+    je .done
+    mov r4, r0
+    mov r1, s_gap
+    call st_str
+    mov r1, r4
+    add r1, ENT_NAME
+    call st_str
+    mov r0, r4
+    add r0, ENT_TYPE
+    mov r0, [r0]
+    cmp r0, T_FILE
+    jne .done                        ; a directory's own size means nothing here
+    mov r0, r4
+    add r0, ENT_SIZE
+    mov r0, [r0]
+    cmp r0, 0
+    jil .done
+    push r0                          ; the size, across the separator
+    mov r1, s_gap2
+    call st_str
+    pop r1
+    call st_num
+    mov r1, s_bytes
+    call st_str
+    .done:
+    pop r4
+    ret
+
+
+status_toolong:
+    call st_reset
+    mov r1, s_toolong
+    call st_str
+    mov r0, 1
+    mov [dirty], r0
+    ret
+
+
+; ==========================
+;   Drawing
+; ==========================
+
+redraw:
+    call clear_win
+    call draw_list                   ; the bars paint over it, so a row clipped by
+    call draw_scrollbar              ; a very short window is covered rather than
+    call draw_titlebar               ; left half-drawn across one of them
+    call draw_statusbar
+    ret
+
+
+draw_titlebar:
+    mov [fx], 0
+    mov [fy], 0
+    mov r0, [winw]
+    mov [fw], r0
+    mov [fh], BAR_H
+    mov [fc], BAR_BG
+    call fill_rect
+
+    mov r0, [winw]                   ; the path gets whatever the buttons leave
+    mov r1, [btnshow]
+    cmp r1, 0
+    je .space
+    mov r0, [btnstrip]
+    .space:
+    sub r0, PAD * 2
+    cmp r0, GW
+    jil .buttons                     ; no room for even one character
+    mov r1, GW
+    udiv r0, r1
+    mov [gmax], r0
+    mov [gy], BAR_TEXT_Y
+    mov [gc], TITLE_TEXT
+    mov [gscale], 1
+    call fit_path
+    mov r1, r0
+    mov r2, PAD
+    call draw_text
+
+    .buttons:
+    mov r0, [btnshow]
+    cmp r0, 0
+    je .done
+    call draw_buttons
+    .done:
+    ret
+
+
+; The path, in gmax columns. One that does not fit is shown from its tail behind a
+; ".." marker, because the end of a path is the part you are standing in.
+fit_path:
+    push r4                          ; its length
+    push r5                          ; the columns we have
+    push r6                          ; write cursor
+    mov r1, cwd
+    call fm_strlen
+    mov r4, r0
+    mov r5, [gmax]
+    cmp r4, r5
+    jule .whole
+    cmp r5, 4
+    jil .whole                       ; too narrow for a marker and anything after it
+    mov r6, pathshown
+    mov8 [r6], 46                    ; '.'
+    add r6, 1
+    mov8 [r6], 46
+    add r6, 1
+    mov r0, r5                       ; the last (gmax - 2) characters
+    sub r0, 2
+    mov r1, cwd
+    add r1, r4
+    sub r1, r0
+    .copy:
+        mov8 r2, [r1]
+        cmp r2, 0
+        je .term
+        mov8 [r6], r2
+        add r6, 1
+        add r1, 1
+        jmp .copy
+    .term:
+    mov8 [r6], 0
+    mov r0, pathshown
+    jmp .out
+    .whole:
+    mov r0, cwd
+    .out:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+draw_buttons:
+    push r4                          ; the button
+    push r5                          ; its left edge
+    push r6                          ; its width
+    mov r4, 0
+    .each:
+        cmp r4, NBTN
+        juge .done
+        mov r1, r4
+        call btn_x
+        mov r5, r0
+        mov r6, r1
+        mov [fx], r5
+        mov [fy], BTN_Y
+        mov [fw], r6
+        mov [fh], BTN_H
+        mov [fc], BTN_BG
+        mov r0, [armed]              ; the armed [Del] says so, because the next
+        cmp r0, 0                    ; press of it is the one that does it
+        je .paint
+        cmp r4, BTN_DEL
+        jne .paint
+        mov [fc], BTN_WARN
+        .paint:
+        call fill_rect
+        mov r0, r4                   ; the width is the label plus BTN_PAD each
+        umul r0, 4                   ; side, so the label starts BTN_PAD in
+        add r0, btnlabels
+        mov r1, [r0]
+        mov r2, r5
+        add r2, BTN_PAD
+        mov [gy], BTN_Y
+        mov [gc], BTN_TEXT
+        mov [gscale], 1
+        mov [gmax], 0
+        call draw_text
+        add r4, 1
+        jmp .each
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+draw_list:
+    push r4                          ; the row on screen
+    push r5                          ; the row in the list
+    push r6                          ; its y
+    mov r4, 0
+    .each:
+        mov r0, [visrows]
+        cmp r4, r0
+        juge .done
+        mov r5, [top]
+        add r5, r4
+        mov r0, [nents]
+        cmp r5, r0
+        juge .done
+        mov r6, r4
+        umul r6, ROW_H
+        add r6, BAR_H
+
+        mov r0, [sel]                ; the selected row gets a bar behind it
+        cmp r0, r5
+        jne .row
+        mov [fx], 0
+        mov [fy], r6
+        call list_right
+        mov [fw], r0
+        mov [fh], ROW_H
+        mov [fc], SEL_BG
+        call fill_rect
+        .row:
+        mov r1, r5
+        call row_rec
+        mov r1, r0
+        mov r2, r6
+        call draw_row
+        add r4, 1
+        jmp .each
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; One row: the name on the left, and on the right either its size or the tag that
+; says it is not a file. The name is cut to the columns left over rather than
+; allowed to run underneath the size.
+draw_row:
+    push r4                          ; the record
+    push r5                          ; the right-hand text
+    push r6                          ; where the name has to stop
+    push r7                          ; the right edge of the list
+    mov r4, r1
+    mov r0, r2
+    add r0, 1                        ; (ROW_H - GH) / 2
+    mov [gy], r0
+    mov [gscale], 1
+    call list_right
+    mov r7, r0
+
+    mov r1, r4
+    call row_meta
+    mov r5, r0
+    mov r1, r5
+    call fm_strlen
+    umul r0, GW
+    mov r6, r7                       ; right-aligned against the list edge
+    sub r6, PAD
+    sub r6, r0
+    mov [gc], SIZE_TEXT
+    mov [gmax], 0
+    mov r1, r5
+    mov r2, r6
+    call draw_text
+
+    mov r0, r6                       ; the name, in the columns that are left
+    sub r0, PAD                      ; (one blank column before the size)
+    sub r0, PAD
+    cmp r0, GW
+    jil .done
+    mov r1, GW
+    udiv r0, r1
+    mov [gmax], r0
+
+    mov r0, r4                       ; a directory is a different kind of thing, so
+    add r0, ENT_TYPE                 ; it reads as one
+    mov r0, [r0]
+    cmp r0, T_DIR
+    je .dir
+    cmp r0, T_FILE
+    jne .dev
+    mov [gc], FILE_TEXT
+    jmp .paint
+    .dir:
+    mov [gc], DIR_TEXT
+    jmp .paint
+    .dev:
+    mov [gc], DEV_TEXT
+    .paint:
+    mov r1, r4
+    add r1, ENT_NAME
+    mov r2, PAD
+    call draw_text
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; row_meta(r1 = record) -> r0 = the right-hand string, in metabuf or a literal.
+row_meta:
+    push r4                          ; the record
+    mov r4, r1
+    mov r0, r4
+    add r0, ENT_RANK
+    mov r0, [r0]
+    cmp r0, 0
+    je .up
+    mov r0, r4
+    add r0, ENT_TYPE
+    mov r0, [r0]
+    cmp r0, T_DIR
+    je .dir
+    cmp r0, T_CHARDEV
+    je .chr
+    cmp r0, T_BLOCKDEV
+    je .blk
+    mov r0, r4
+    add r0, ENT_SIZE
+    mov r0, [r0]
+    cmp r0, 0
+    jil .unknown
+    mov r1, r0
+    mov r2, metabuf
+    call itoa
+    mov r0, metabuf
+    jmp .out
+    .up:
+    mov r0, s_up
+    jmp .out
+    .dir:
+    mov r0, s_dir
+    jmp .out
+    .chr:
+    mov r0, s_chr
+    jmp .out
+    .blk:
+    mov r0, s_blk
+    jmp .out
+    .unknown:
+    mov r0, s_unknown
+    .out:
+    pop r4
+    ret
+
+
+; Drawn only when there is more list than window, because a bar that always spans
+; its track tells you nothing.
+draw_scrollbar:
+    mov r0, [nents]
+    mov r1, [visrows]
+    cmp r0, r1
+    jule .done
+    mov r0, [winw]
+    sub r0, SCROLL_W
+    mov [fx], r0
+    mov [fy], BAR_H
+    mov [fw], SCROLL_W
+    mov r0, [listh]
+    mov [fh], r0
+    mov [fc], TRACK_BG
+    call fill_rect
+    call thumb_geom
+    mov [fy], r0
+    mov [fh], r1
+    mov r0, [winw]
+    sub r0, SCROLL_W
+    mov [fx], r0
+    mov [fw], SCROLL_W
+    mov [fc], THUMB_BG
+    call fill_rect
+    .done:
+    ret
+
+
+; thumb_geom() -> r0 = its top, r1 = its height. The height is the fraction of the
+; list that is on screen and the offset the fraction scrolled past, both in pixels.
+; Only called when nents > visrows, so neither division is by zero.
+thumb_geom:
+    push r4                          ; the track height
+    push r5                          ; the thumb height
+    mov r4, [listh]
+    mov r0, r4
+    mov r1, [visrows]
+    umul r0, r1
+    mov r1, [nents]
+    udiv r0, r1
+    cmp r0, 8
+    juge .hok
+    mov r0, 8                        ; never smaller than something you can see
+    .hok:
+    cmp r0, r4
+    jule .hcap
+    mov r0, r4
+    .hcap:
+    mov r5, r0
+    mov r0, r4
+    sub r0, r5
+    mov r1, [top]
+    umul r0, r1
+    mov r1, [nents]
+    mov r2, [visrows]
+    sub r1, r2
+    udiv r0, r1                      ; the remainder lands in r1, so set it after
+    add r0, BAR_H
+    mov r1, r5
+    pop r5
+    pop r4
+    ret
+
+
+draw_statusbar:
+    mov r0, [statusy]
+    mov [fx], 0
+    mov [fy], r0
+    mov r0, [winw]
+    mov [fw], r0
+    mov [fh], BAR_H
+    mov [fc], BAR_BG
+    call fill_rect
+    mov r0, [statusy]
+    add r0, BAR_TEXT_Y
+    mov [gy], r0
+    mov [gscale], 1
+    mov r0, [pmode]
+    cmp r0, PM_NONE
+    jne .prompt
+    mov r0, [winw]                   ; a report is cut to the bar; the prompt below
+    sub r0, PAD * 2                  ; is not, because what you have typed is the
+    cmp r0, GW                       ; one thing that must not vanish
+    jil .done
+    mov r1, GW
+    udiv r0, r1
+    mov [gmax], r0
+    mov r0, [armed]                  ; an armed deletion is a warning and reads like
+    cmp r0, 0                        ; one
+    je .plain
+    mov [gc], ALERT_TEXT
+    jmp .paint
+    .plain:
+    mov [gc], STATUS_TEXT
+    .paint:
+    mov r1, statusbuf
+    mov r2, PAD
+    call draw_text
+    .done:
+    ret
+    .prompt:
+    jmp draw_prompt
+
+
+; The prompt lives in the status bar rather than in a box of its own: it is one
+; short line, and putting it where the answer will be reported keeps the window
+; from rearranging itself under you.
+draw_prompt:
+    push r4                          ; where the typed name starts
+    push r5                          ; the label
+    mov r5, s_newdir
+    mov r0, [pmode]
+    cmp r0, PM_NEWDIR
+    je .have
+    mov r5, s_rename
+    .have:
+    mov [gmax], 0                    ; fill_rect clips, so an overlong prompt in a
+    mov [gc], ALERT_TEXT             ; narrow window is cut by the window edge
+    mov r1, r5
+    mov r2, PAD
+    call draw_text
+
+    mov r1, r5
+    call fm_strlen
+    umul r0, GW
+    add r0, PAD
+    mov r4, r0
+    mov [gc], TITLE_TEXT
+    mov r1, promptbuf
+    mov r2, r4
+    call draw_text
+
+    mov r0, [promptlen]              ; the caret, where the next character lands
+    umul r0, GW
+    add r0, r4
+    mov [fx], r0
+    mov r0, [statusy]
+    add r0, BAR_TEXT_Y
+    mov [fy], r0
+    mov [fw], 2
+    mov [fh], GH
+    mov [fc], CARET_COLOUR
+    call fill_rect
+    pop r5
+    pop r4
+    ret
+
+
+; Draw a null-terminated string. r1 = the string, r2 = pen x. Uses gy, gc, gscale
+; and gmax - the number of characters to draw, or 0 for all of them.
+draw_text:
+    push r4                          ; cursor
+    push r5                          ; pen x
+    push r6                          ; advance
+    push r7                          ; characters left
+    mov r4, r1
+    mov r5, r2
+    mov r6, [gscale]
+    umul r6, GW
+    mov r7, [gmax]
+    cmp r7, 0
+    jne .each
+    mov r7, -1                       ; 0 means "as many as there are"
+    .each:
+        cmp r7, 0
+        je .done
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .done
+        mov [gch], r0
+        mov [gx], r5
+        call draw_glyph
+        add r5, r6
+        add r4, 1
+        sub r7, 1
+        jmp .each
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; One glyph, scaled by gscale. Inputs (globals): gx, gy, gch, gc, gscale.
+draw_glyph:
+    push r4                          ; glyph row
+    push r5                          ; that row's font byte
+    push r6                          ; bit index
+    push r7                          ; scale
+    mov r0, [gch]
+    cmp r0, FONT_GLYPHS
+    juge .done
+    umul r0, GH
+    add r0, font
+    mov [gsrc], r0
+    mov r7, [gscale]
+    mov r4, 0
+    .rows:
+        cmp r4, GH
+        juge .done
+        mov r5, [gsrc]
+        add r5, r4
+        mov8 r5, [r5]
+        cmp r5, 0
+        je .nextrow                  ; blank row
+        mov r6, 0
+        .bits:
+            cmp r6, GW
+            juge .nextrow
+            mov r0, 7                ; leftmost pixel is bit 7
+            sub r0, r6
+            mov r1, r5
+            shr r1, r0
+            and r1, 1
+            cmp r1, 0
+            je .nextbit
+            mov r0, r6               ; one scale x scale block per set pixel
+            umul r0, r7
+            mov r1, [gx]
+            add r0, r1
+            mov [fx], r0
+            mov r0, r4
+            umul r0, r7
+            mov r1, [gy]
+            add r0, r1
+            mov [fy], r0
+            mov [fw], r7
+            mov [fh], r7
+            mov r0, [gc]
+            mov [fc], r0
+            call fill_rect
+            .nextbit:
+            add r6, 1
+            jmp .bits
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Solid rectangle, clipped to the window. Inputs (globals): fx, fy, fw, fh, fc.
+fill_rect:
+    push r4                          ; row
+    push r5                          ; py
+    push r6                          ; clipped width
+    push r7                          ; column counter
+    mov r4, 0
+    .rows:
+        mov r0, [fh]
+        cmp r4, r0
+        juge .done
+        mov r5, [fy]
+        add r5, r4
+        cmp r5, 0
+        jil .next
+        mov r0, [winh]
+        cmp r5, r0
+        juge .done
+        mov r6, [fw]
+        mov r0, [fx]
+        add r0, r6
+        mov r1, [winw]
+        cmp r0, r1
+        jule .wok
+        mov r6, [winw]
+        mov r0, [fx]
+        sub r6, r0
+        .wok:
+        cmp r6, 0
+        jile .next
+        mov r0, r5                   ; dst = winbuf + (py*w + x)*4
+        mov r1, [winw]
+        umul r0, r1
+        mov r1, [fx]
+        add r0, r1
+        umul r0, 4
+        mov r2, [winbuf]
+        add r0, r2
+        mov r1, [fc]
+        mov r7, r6
+        .cols:
+            mov [r0], r1
+            add r0, 4
+            sub r7, 1
+            cmp r7, 0
+            jne .cols
+        .next:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Fill the whole window with the background, by the doubling copy trick.
+clear_win:
+    push r4                          ; span filled
+    push r5                          ; remaining
+    push r6                          ; total bytes
+    mov r6, [winw]
+    mov r0, [winh]
+    umul r6, r0
+    umul r6, 4
+    cmp r6, 0
+    je .done
+    mov r0, [winbuf]
+    mov [r0], BG_COLOUR
+    mov r4, 4
+    .fill:
+        cmp r4, r6
+        juge .done
+        mov r5, r6
+        sub r5, r4
+        cmp r4, r5
+        jule .use
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r5
+        jmp .done
+        .use:
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r4
+        add r4, r4
+        jmp .fill
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Odds and ends
+; ==========================
+
+; getarg(r1 = index) -> r0 = the argument pointer.
+getarg:
+    shl r1, 2
+    mov r0, [g_argv]
+    add r1, r0
+    mov r0, [r1]
+    ret
+
+
+; fm_strlen(r1) -> r0 = the length, terminator excluded. Leaves r1 alone.
+fm_strlen:
+    push r4
+    mov r0, 0
+    mov r4, r1
+    .loop:
+        mov8 r2, [r4]
+        cmp r2, 0
+        je .done
+        add r0, 1
+        add r4, 1
+        jmp .loop
+    .done:
+    pop r4
+    ret
+
+
+; itoa(r1 = value, r2 = buffer): unsigned decimal, null-terminated. The digits come
+; out of the division least-significant-first, so they go on the stack and come
+; back off in order.
+itoa:
+    push r4                          ; value
+    push r5                          ; buffer
+    push r6                          ; digit count
+    push r7                          ; write index
+    mov r4, r1
+    mov r5, r2
+    mov r6, 0
+    cmp r4, 0
+    jne .gen
+    mov8 [r5], 48                    ; "0"
+    mov r6, 1
+    jmp .term
+    .gen:
+    .gl:
+        cmp r4, 0
+        je .emit
+        mov r0, r4
+        mov r1, 10
+        udiv r0, r1                  ; r0 = quotient, r1 = remainder
+        add r1, 48
+        push r1
+        add r6, 1
+        mov r4, r0
+        jmp .gl
+    .emit:
+    mov r7, 0
+    .ol:
+        cmp r7, r6
+        juge .term
+        pop r1
+        mov r0, r5
+        add r0, r7
+        mov8 [r0], r1
+        add r7, 1
+        jmp .ol
+    .term:
+    mov r0, r5
+    add r0, r6
+    mov8 [r0], 0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ---- strings ----
+rootpath:
+    dstr "/\0"
+dotdot:
+    dstr "..\0"
+editorpath:
+    dstr "/bin/editor\0"
+
+s_up:
+    dstr "up\0"
+s_dir:
+    dstr "dir\0"
+s_chr:
+    dstr "chr\0"
+s_blk:
+    dstr "blk\0"
+s_unknown:
+    dstr "?\0"
+s_items:
+    dstr " items\0"
+s_gap:
+    dstr "   \0"
+s_gap2:
+    dstr "  \0"
+s_bytes:
+    dstr " bytes\0"
+s_newdir:
+    dstr "new folder: \0"
+s_rename:
+    dstr "rename to: \0"
+s_arm:
+    dstr "press Delete again to remove \0"
+s_removed:
+    dstr "removed \0"
+s_refused:
+    dstr "cannot remove that (a directory must be empty, and a mount point cannot go)\0"
+s_noparent:
+    dstr "that row is the way out, not an entry\0"
+s_editing:
+    dstr "editing \0"
+s_notfile:
+    dstr "only a plain file can be opened in the editor\0"
+s_noeditor:
+    dstr "cannot start /bin/editor\0"
+s_created:
+    dstr "created \0"
+s_nocreate:
+    dstr "cannot create \0"
+s_renamed:
+    dstr "renamed to \0"
+s_norename:
+    dstr "cannot rename to \0"
+s_slash:
+    dstr "a name cannot contain '/'\0"
+s_toolong:
+    dstr "that path is too long\0"
+s_noopen:
+    dstr "cannot open \0"
+
+s_btn_up:
+    dstr "Up\0"
+s_btn_new:
+    dstr "New\0"
+s_btn_ren:
+    dstr "Ren\0"
+s_btn_del:
+    dstr "Del\0"
+s_btn_quit:
+    dstr "X\0"
+
+e_mem:
+    dstr "files: out of memory\n"
+e_mem_end:
+e_win:
+    dstr "files: cannot create a window (is a window manager running?)\n"
+e_win_end:
+
+; The strip, in BTN_* order. A width is the label plus BTN_PAD on each side.
+btnlabels:
+    d32 s_btn_up
+    d32 s_btn_new
+    d32 s_btn_ren
+    d32 s_btn_del
+    d32 s_btn_quit
+btnwidths:
+    d32 24
+    d32 32
+    d32 32
+    d32 32
+    d32 16
+
+; The editor's argv. argv[1] is patched to the path just before the spawn.
+fm_argv:
+    d32 editorpath
+fm_argv1:
+    d32 0
+    d32 0
+
+font:
+    dfile "../../build/font.bin"
+
+
+; ---- state ----
+g_argc:
+    d32 0
+g_argv:
+    d32 0
+mypid:
+    d32 0
+sid:
+    d32 0
+winbuf:
+    d32 0                            ; the sbrk'd arena: pixels, then the table
+ents:
+    d32 0
+order:
+    d32 0
+winw:
+    d32 WANT_W                       ; the size we are currently drawing at
+winh:
+    d32 WANT_H
+lastcfg:
+    d32 -1                           ; a fresh surface's counter is 0, so -1 is what
+                                     ; makes the first resync a change and lays the
+                                     ; window out even under a manager that never
+                                     ; resizes anything
+listh:
+    d32 0
+visrows:
+    d32 1
+statusy:
+    d32 0
+btnstrip:
+    d32 0
+btnshow:
+    d32 0
+nents:
+    d32 0
+sel:
+    d32 0
+top:
+    d32 0
+cwdlen:
+    d32 1
+armed:
+    d32 0
+pmode:
+    d32 PM_NONE
+promptlen:
+    d32 0
+statuslen:
+    d32 0
+prevbtn:
+    d32 0
+dirty:
+    d32 1                            ; force the first frame
+quitreq:
+    d32 0
+
+fx:
+    d32 0
+fy:
+    d32 0
+fw:
+    d32 0
+fh:
+    d32 0
+fc:
+    d32 0
+gx:
+    d32 0
+gy:
+    d32 0
+gch:
+    d32 0
+gc:
+    d32 0
+gscale:
+    d32 1
+gmax:
+    d32 0
+gsrc:
+    d32 0
+
+cwd:
+    res8 CWD_MAX
+pathshown:
+    res8 CWD_MAX
+namebuf:
+    res8 NAMEBUF_MAX
+statusbuf:
+    res8 STATUS_MAX
+promptbuf:
+    res8 PROMPT_MAX + 1
+namesave:
+    res8 ENT_NAME_MAX
+metabuf:
+    res8 24
+numbuf:
+    res8 16
+cfgbuf:
+    res8 12                          ; wconfig: width, height, config counter
+inbuf:
+    res8 12                          ; winput: x, y, buttons
+fm_st:
+    res8 ST_STRUCT
+fm_ps:
+    res8 PS_MAX * PSREC_BYTES
+
+#include "lib/fileutil.cat"

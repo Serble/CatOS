@@ -13,29 +13,65 @@
 ; that flag with interrupts enabled (exactly like the firmware does).
 ;
 ; Requires: ints.cat (int_prologue/epilogue, intregister), vfs.cat, heapalloc.
-; The whole-disk extent used for /dev/diskN comes from bootdev.cat
-; (disk_extent_blocks), which parses the partition table.
+;
+; Every /dev/diskN spans its own device end to end. disk_bind asks the hardware
+; for its real size with DISK_GETSIZE rather than inferring one from a partition
+; table, so a second disk is sized correctly, and the space past the last
+; partition - which is exactly where a new partition has to go - is reachable.
 
 #define DISK_TYPE, 0x96818B9A    ; disk device type
 #define DISK_READ, 1             ; read command
 #define DISK_WRITE, 2            ; write command
+#define DISK_GETSIZE, 3          ; report the device size, in blocks
 #define INT_DISK, 0x72           ; disk-operation-finished interrupt
 #define BLOCK_SIZE, 512
 #define BLOCK_SHIFT, 9           ; log2(BLOCK_SIZE)
 
-; block-backed file descriptor (stored in a node's NODE_FSDATA)
-#define BF_PORT, 0               ; disk serial port
-#define BF_BASE, 4               ; first block of the region
-#define BF_COUNT, 8              ; region length in blocks
-#define BF_STRUCT, 12
+#define DISK_PREFIXLEN, 4        ; the "disk" in "diskN"
+#define DISK_DIGITS, 10          ; enough digits for any 32-bit unit index
+
+; ==========================
+;   Block-backed files
+; ==========================
+; A descriptor names a range of blocks inside some backing object; BF_KIND says
+; how to reach it. BFK_DISK talks to a disk device over its serial port. BFK_NODE
+; goes through any VFS node's own read/write ops, which is the whole point: a
+; regular file and /dev/diskN are both just files with a read op, so a filesystem
+; that sits on a descriptor can be mounted on either without knowing which it got.
+; Mounting a file is therefore not a special "loopback" feature - it is the same
+; code path with a different backing node.
+;
+; Stored in a node's NODE_FSDATA.
+#define BF_KIND, 0               ; BFK_*
+#define BF_PORT, 4               ; disk serial port  (BFK_DISK)
+#define BF_NODE, 4               ; backing VFS node  (BFK_NODE) - shares the slot
+#define BF_BASE, 8               ; first block of the region
+#define BF_COUNT, 12             ; region length in blocks
+#define BF_STRUCT, 16
+
+#define BFK_DISK, 0              ; a region of a raw disk
+#define BFK_NODE, 1              ; a region of any VFS file
+
+; A BFK_NODE descriptor whose backing node is itself block-backed nests one
+; blkfile_read inside another, and each level needs its own bounce block. The
+; depth is bounded so a silly stack of mounts fails cleanly instead of scribbling
+; over an outer level's scratch. The kernel is not preemptible, so a plain
+; counter is enough to hand out a private slot per level.
+#define BF_MAXDEPTH, 4
 
 
 disk_ready:
     d32 0                        ; set by the ISR when an op completes
+disk_bouncedepth:
+    d32 0                        ; nesting level; indexes disk_bounce
 disk_bounce:
-    res8 BLOCK_SIZE              ; scratch block for partial read/modify/write
+    res8 BLOCK_SIZE * BF_MAXDEPTH ; per-level scratch for partial read/modify/write
+disk_nameprefix:
+    dstr "disk\0"
 disk_namebuf:
-    dstr "disk0\0"               ; /dev name; the final digit is patched per unit
+    res8 DISK_PREFIXLEN + DISK_DIGITS + 1   ; "diskN", built per unit
+disk_digitbuf:
+    res8 DISK_DIGITS             ; scratch for the decimal unit index
 
 
 ; Interrupt 0x72 handler: mark the pending disk op complete.
@@ -96,7 +132,23 @@ disk_writeblock:
     ret
 
 
-; Allocate a block-backed-file descriptor.
+; Ask a disk how many 512-byte blocks it holds.
+;
+; Unlike a read or a write this is answered synchronously - the device replies on
+; the serial port and raises no completion interrupt - so it must NOT go through
+; disk_wait, which would spin forever waiting for 0x72. Nothing else leaves a
+; word in the device's reply queue (the hardware manager enumerates over its own
+; port and deliberately avoids the write-0 auto-probe), so the reply we read back
+; here is always our own.
+; r1 - disk port
+; returns r0 = size in blocks
+disk_getsize:
+    out r1, DISK_GETSIZE
+    in r0, r1
+    ret
+
+
+; Allocate a descriptor over a range of a raw disk.
 ; r1 - port, r2 - base block, r3 - block count
 ; returns r0 = descriptor, or 0 on OOM
 bf_new:
@@ -110,10 +162,346 @@ bf_new:
     call heapalloc
     cmp r0, 0
     je .done
+    vstore r0, BF_KIND, BFK_DISK, r1
     vstore r0, BF_PORT, r4, r1
     vstore r0, BF_BASE, r5, r1
     vstore r0, BF_COUNT, r6, r1
     .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Allocate a descriptor over a range of an arbitrary VFS file. A reference on the
+; node is taken and held by the descriptor, so the file cannot be freed while a
+; filesystem is mounted on it; bf_free drops it again.
+; r1 - node, r2 - base block, r3 - block count
+; returns r0 = descriptor, or 0 on OOM
+bf_new_node:
+    push r4
+    push r5
+    push r6
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    mov r1, BF_STRUCT
+    call heapalloc
+    cmp r0, 0
+    je .done
+    vstore r0, BF_KIND, BFK_NODE, r1
+    vstore r0, BF_NODE, r4, r1
+    vstore r0, BF_BASE, r5, r1
+    vstore r0, BF_COUNT, r6, r1
+    push r0
+    mov r1, r4                   ; the descriptor owns a reference now
+    call vfsnoderef
+    pop r0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Release a descriptor and whatever it was holding.
+; r1 - descriptor
+bf_free:
+    push r4
+    mov r4, r1
+    cmp r4, 0
+    je .done
+    vload r0, r4, BF_KIND
+    cmp r0, BFK_NODE
+    jne .justfree
+    vload r1, r4, BF_NODE
+    call vfsnodeunref
+    .justfree:
+    mov r1, r4
+    call heapfree
+    .done:
+    pop r4
+    ret
+
+
+; Read one block of a descriptor's region.
+; r1 - descriptor, r2 - destination address, r3 - region-relative block
+; returns r0 = 0 on success, -1 on failure
+bf_readblock:
+    push r4                      ; descriptor
+    push r5                      ; destination
+    push r6                      ; absolute block in the backing object
+    mov r4, r1
+    mov r5, r2
+
+    vload r0, r4, BF_COUNT       ; never touch a block outside the region: a
+    cmp r3, r0                   ; corrupt superblock must not let a filesystem
+    juge .fail                   ; read or write past its own partition
+    vload r0, r4, BF_BASE
+    mov r6, r3
+    add r6, r0
+
+    vload r0, r4, BF_KIND
+    cmp r0, BFK_NODE
+    je .node
+    vload r1, r4, BF_PORT        ; raw disk: straight at the device
+    mov r2, r5
+    mov r3, r6
+    call disk_readblock
+    mov r0, 0
+    jmp .done
+    .node:
+    vload r1, r4, BF_NODE        ; any other file: through its own read op
+    vload r0, r1, NODE_OPS
+    cmp r0, 0
+    je .fail
+    vload r0, r0, OP_READ
+    cmp r0, 0
+    je .fail
+    mov r2, r6
+    shl r2, BLOCK_SHIFT          ; byte offset of the block
+    mov r3, r5
+    push BLOCK_SIZE
+    call r0
+    add sp, 4
+    cmp r0, BLOCK_SIZE
+    jne .fail                    ; a short read means the region is truncated
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, -1
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Write one block of a descriptor's region.
+; r1 - descriptor, r2 - source address, r3 - region-relative block
+; returns r0 = 0 on success, -1 on failure
+bf_writeblock:
+    push r4                      ; descriptor
+    push r5                      ; source
+    push r6                      ; absolute block in the backing object
+    mov r4, r1
+    mov r5, r2
+
+    vload r0, r4, BF_COUNT
+    cmp r3, r0
+    juge .fail
+    vload r0, r4, BF_BASE
+    mov r6, r3
+    add r6, r0
+
+    vload r0, r4, BF_KIND
+    cmp r0, BFK_NODE
+    je .node
+    vload r1, r4, BF_PORT
+    mov r2, r5
+    mov r3, r6
+    call disk_writeblock
+    mov r0, 0
+    jmp .done
+    .node:
+    vload r1, r4, BF_NODE
+    vload r0, r1, NODE_OPS
+    cmp r0, 0
+    je .fail
+    vload r0, r0, OP_WRITE
+    cmp r0, 0
+    je .fail
+    mov r2, r6
+    shl r2, BLOCK_SHIFT
+    mov r3, r5
+    push BLOCK_SIZE
+    call r0
+    add sp, 4
+    cmp r0, BLOCK_SIZE
+    jne .fail
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, -1
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Claim a private bounce block for one level of block-backed access.
+; returns r0 = buffer address, or 0 if nested too deep
+bf_bounce_take:
+    mov r0, [disk_bouncedepth]
+    cmp r0, BF_MAXDEPTH
+    juge .toodeep
+    mov r1, r0
+    add r1, 1
+    mov [disk_bouncedepth], r1
+    shl r0, BLOCK_SHIFT
+    add r0, disk_bounce
+    ret
+    .toodeep:
+    mov r0, 0
+    ret
+
+
+; Give back the bounce block claimed by the matching bf_bounce_take.
+bf_bounce_drop:
+    mov r0, [disk_bouncedepth]
+    cmp r0, 0
+    je .done
+    sub r0, 1
+    mov [disk_bouncedepth], r0
+    .done:
+    ret
+
+
+; Copy bytes out of a descriptor's region. The range must lie inside one block.
+; A whole aligned block is read straight into the caller's buffer; anything else
+; is read into a bounce block and sliced out of it.
+; r1 - descriptor, r2 - region-relative byte offset, r3 - destination
+; [sp] - length (1..512, not crossing a block boundary)
+; returns r0 = bytes copied, or -1 on failure
+bf_readpart:
+    push r4                      ; descriptor
+    push r5                      ; destination
+    push r6                      ; length
+    push r7                      ; byte offset
+    mov r4, r1
+    mov r5, r3
+    mov r7, r2
+    mov r6, sp
+    add r6, 20
+    mov r6, [r6]
+
+    mov r0, r7                   ; whole aligned block -> no bounce needed
+    and r0, BLOCK_SIZE - 1
+    cmp r0, 0
+    jne .partial
+    cmp r6, BLOCK_SIZE
+    jne .partial
+    mov r1, r4
+    mov r2, r5
+    mov r3, r7
+    shr r3, BLOCK_SHIFT
+    call bf_readblock
+    cmp r0, 0
+    jne .fail
+    mov r0, BLOCK_SIZE
+    jmp .done
+
+    .partial:
+    call bf_bounce_take
+    cmp r0, 0
+    je .fail                     ; nested deeper than BF_MAXDEPTH
+    push r0                      ; our bounce block
+    mov r1, r4
+    mov r2, r0
+    mov r3, r7
+    shr r3, BLOCK_SHIFT
+    call bf_readblock
+    mov r1, sp                   ; recover the bounce address
+    mov r1, [r1]
+    cmp r0, 0
+    jne .failbounce
+    mov r0, r7                   ; copy bounce + blkoff -> destination
+    and r0, BLOCK_SIZE - 1
+    add r1, r0
+    mov r0, r5
+    mov r2, r6
+    cpy r1, r2
+    call bf_bounce_drop
+    add sp, 4
+    mov r0, r6
+    jmp .done
+    .failbounce:
+    call bf_bounce_drop
+    add sp, 4
+    .fail:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Copy bytes into a descriptor's region, read-modify-write so the rest of the
+; touched block survives. Same single-block constraint as bf_readpart.
+; r1 - descriptor, r2 - region-relative byte offset, r3 - source
+; [sp] - length (1..512, not crossing a block boundary)
+; returns r0 = bytes written, or -1 on failure
+bf_writepart:
+    push r4                      ; descriptor
+    push r5                      ; source
+    push r6                      ; length
+    push r7                      ; byte offset
+    mov r4, r1
+    mov r5, r3
+    mov r7, r2
+    mov r6, sp
+    add r6, 20
+    mov r6, [r6]
+
+    mov r0, r7                   ; a whole aligned block replaces the block
+    and r0, BLOCK_SIZE - 1       ; outright, so there is nothing to preserve
+    cmp r0, 0
+    jne .partial
+    cmp r6, BLOCK_SIZE
+    jne .partial
+    mov r1, r4
+    mov r2, r5
+    mov r3, r7
+    shr r3, BLOCK_SHIFT
+    call bf_writeblock
+    cmp r0, 0
+    jne .fail
+    mov r0, BLOCK_SIZE
+    jmp .done
+
+    .partial:
+    call bf_bounce_take
+    cmp r0, 0
+    je .fail
+    push r0
+    mov r1, r4                   ; pull the block in so the untouched bytes stay
+    mov r2, r0
+    mov r3, r7
+    shr r3, BLOCK_SHIFT
+    call bf_readblock
+    mov r1, sp
+    mov r1, [r1]
+    cmp r0, 0
+    jne .failbounce
+    mov r0, r7                   ; overlay source -> bounce + blkoff
+    and r0, BLOCK_SIZE - 1
+    add r0, r1
+    mov r1, r5
+    mov r2, r6
+    cpy r1, r2
+    mov r1, sp                   ; then push the whole block back out
+    mov r1, [r1]
+    mov r2, r1
+    mov r1, r4
+    mov r3, r7
+    shr r3, BLOCK_SHIFT
+    call bf_writeblock
+    cmp r0, 0
+    jne .failbounce
+    call bf_bounce_drop
+    add sp, 4
+    mov r0, r6
+    jmp .done
+    .failbounce:
+    call bf_bounce_drop
+    add sp, 4
+    .fail:
+    mov r0, -1
+    .done:
+    pop r7
     pop r6
     pop r5
     pop r4
@@ -150,13 +538,6 @@ blkfile_read:
     .cploop:
         cmp r7, 0
         je .doneloop
-        vload r1, r4, BF_PORT     ; read the block containing the cursor
-        mov r2, disk_bounce
-        mov r3, r5
-        shr r3, BLOCK_SHIFT
-        vload r0, r4, BF_BASE
-        add r3, r0
-        call disk_readblock
         mov r2, r5               ; blkoff = off & 511
         and r2, BLOCK_SIZE - 1
         mov r3, BLOCK_SIZE       ; n = min(remaining, 512 - blkoff)
@@ -165,16 +546,26 @@ blkfile_read:
         jule .nok
         mov r3, r7
         .nok:
-        mov r0, r6               ; copy bounce+blkoff -> buf
-        mov r1, disk_bounce
-        add r1, r2
-        cpy r1, r3
+        push r3                  ; keep n across the call
+        push r3                  ; length argument
+        mov r1, r4
+        mov r2, r5
+        mov r3, r6
+        call bf_readpart
+        add sp, 4
+        pop r3
+        cmp r0, -1
+        je .short                ; backing store failed: return a short read
         add r5, r3
         add r6, r3
         sub r7, r3
         jmp .cploop
     .doneloop:
     pop r0                       ; total copied
+    jmp .done
+    .short:
+    pop r0                       ; total asked for, less what is still pending
+    sub r0, r7
     jmp .done
     .zero:
     mov r0, 0
@@ -216,13 +607,6 @@ blkfile_write:
     .cploop:
         cmp r7, 0
         je .doneloop
-        vload r1, r4, BF_PORT     ; read current block (read-modify-write)
-        mov r2, disk_bounce
-        mov r3, r5
-        shr r3, BLOCK_SHIFT
-        vload r0, r4, BF_BASE
-        add r3, r0
-        call disk_readblock
         mov r2, r5               ; blkoff, n
         and r2, BLOCK_SIZE - 1
         mov r3, BLOCK_SIZE
@@ -231,25 +615,26 @@ blkfile_write:
         jule .nok
         mov r3, r7
         .nok:
-        mov r0, disk_bounce      ; overlay buf -> bounce+blkoff
-        add r0, r2
-        mov r1, r6
-        cpy r1, r3
-        vload r1, r4, BF_PORT     ; write the block back
-        mov r2, disk_bounce
-        push r3                  ; keep n across the write
-        mov r3, r5
-        shr r3, BLOCK_SHIFT
-        vload r0, r4, BF_BASE
-        add r3, r0
-        call disk_writeblock
+        push r3                  ; keep n across the call
+        push r3                  ; length argument
+        mov r1, r4
+        mov r2, r5
+        mov r3, r6
+        call bf_writepart
+        add sp, 4
         pop r3
+        cmp r0, -1
+        je .short                ; backing store failed: report a short write
         add r5, r3
         add r6, r3
         sub r7, r3
         jmp .cploop
     .doneloop:
     pop r0
+    jmp .done
+    .short:
+    pop r0
+    sub r0, r7
     jmp .done
     .zero:
     mov r0, 0
@@ -267,24 +652,83 @@ blkfile_trunc:
     ret
 
 
-; Driver bind routine for disks: publish the whole disk as /dev/diskN.
+; Build "diskN" for a unit index in disk_namebuf. devscan hands out one unit per
+; disk it enumerates, and there can be more than ten, so the index is formatted
+; rather than poked in as a single digit.
+; r1 - unit index
+disk_setname:
+    push r4                      ; name cursor
+    push r5                      ; digit cursor
+    push r6                      ; remaining value
+    push r7                      ; digits produced
+    mov r6, r1
+
+    mov r0, disk_namebuf         ; the fixed "disk" prefix
+    mov r1, disk_nameprefix
+    mov r2, DISK_PREFIXLEN
+    cpy r1, r2
+
+    mov r5, disk_digitbuf        ; digits come out least-significant first, so
+    add r5, DISK_DIGITS          ; lay them down backwards from the end
+    mov r7, 0
+    .digits:
+        mov r1, r6
+        mov r2, 10
+        udiv r1, r2              ; r1 = quotient, r2 = remainder
+        add r2, 48               ; '0'
+        sub r5, 1
+        mov8 [r5], r2
+        add r7, 1
+        mov r6, r1
+        cmp r6, 0
+        jne .digits
+
+    mov r0, disk_namebuf         ; then append them in reading order
+    add r0, DISK_PREFIXLEN
+    mov r1, r5
+    mov r2, r7
+    cpy r1, r2
+    mov r4, disk_namebuf
+    add r4, DISK_PREFIXLEN
+    add r4, r7
+    mov8 [r4], 0                 ; terminate
+
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Driver bind routine for disks: publish the whole disk as /dev/diskN. devscan
+; calls this once per enumerated disk, so every attached disk gets a node.
 ; r1 - port, r2 - unit index
 disk_bind:
     push r4                      ; port
     push r5                      ; unit
     push r6                      ; descriptor
+    push r7                      ; device size in blocks
     mov r4, r1
     mov r5, r2
 
-    mov r0, r5                   ; patch the trailing digit of "disk0"
-    add r0, 48                   ; '0' + unit (unit assumed < 10)
-    mov r1, disk_namebuf
-    add r1, 4
-    mov8 [r1], r0
+    mov r1, r5                   ; "disk0", "disk1", ...
+    call disk_setname
+
+    mov r1, r4                   ; the device knows its own size; asking it means
+    call disk_getsize            ; each disk is sized independently and the space
+    mov r7, r0                   ; past the last partition stays addressable
+    cmp r7, -1                   ; a VM without DISK_GETSIZE ignores the command
+    jne .sized                   ; and leaves an empty reply queue (0xFFFFFFFF),
+    mov r1, r4                   ; so fall back to what the partition table says
+    call disk_probe_extent
+    mov r7, r0
+    .sized:
+    cmp r7, 0
+    je .done                     ; an empty device has nothing worth publishing
 
     mov r1, r4                   ; whole-disk descriptor (base 0, full extent)
     mov r2, 0
-    mov r3, [disk_extent_blocks]
+    mov r3, r7
     call bf_new
     cmp r0, 0
     je .done
@@ -296,7 +740,14 @@ disk_bind:
     push r6                      ; fsdata = descriptor
     call devfs_add
     add sp, 4
+    cmp r0, 0
+    je .done
+
+    mov r1, r7                   ; publish the length so stat and SEEK_END work
+    shl r1, BLOCK_SHIFT          ; on the node like they do on any other file
+    vstore r0, NODE_SIZE, r1, r2
     .done:
+    pop r7
     pop r6
     pop r5
     pop r4
@@ -313,3 +764,4 @@ blkfile_ops:
     d32 blkfile_trunc            ; OP_TRUNCATE
     d32 0                        ; OP_STAT
     d32 0                        ; OP_SYNC
+    d32 0                        ; OP_RENAME

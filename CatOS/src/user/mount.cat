@@ -1,0 +1,365 @@
+; mount - attach a filesystem to a directory.
+;
+;   mount <source> <target> [type] [partition]
+;
+;     source     any path: /dev/diskN, or an image file. There is no difference -
+;                the kernel mounts a block range of a file either way.
+;     target     the directory to cover.
+;     type       filesystem name, default "catfs". "rawfs" exposes the range as
+;                one flat file instead of a filesystem.
+;     partition  index in the source's partition table. Omitted means "the whole
+;                source", which is what an image file usually wants.
+;
+; The partition table is read here rather than in the kernel: picking a partition
+; is a policy decision, and the kernel already takes a plain (start, count) block
+; range, so userland can name the range however it likes. Run parts first to see
+; the indices.
+;
+; Since the table is right here, its type field is checked too. An entry says what
+; its range holds, so asking for catfs on a partition marked raw is answerable
+; before touching the disk - and answerable in terms of the thing the user got
+; wrong (the index) rather than the thing that failed downstream (a superblock
+; that was never there). rawfs is exempt: it imposes no format, so exposing any
+; partition as a flat byte range is always a legitimate thing to ask for.
+#include "lib/sys.cat"
+
+#define BLOCK_SIZE, 512
+#define PT_MAGIC, 51
+#define PT_COUNT_OFF, 0x0C
+#define PT_ENTRIES_OFF, 0x20
+#define PT_ENTRY_SIZE, 12
+#define PE_TYPE, 0
+#define PE_START, 4
+#define PE_COUNT, 8
+#define PT_MAXENT, 39
+#define PT_RAW, 0                ; the range is just application bytes
+#define PT_CATFS, 1              ; the range is a CatFS filesystem
+
+main:
+    mov r5, r1                       ; argc
+    mov r6, r2                       ; argv
+    cmp r5, 3
+    jul .usage
+
+    mov r1, r6                       ; source
+    add r1, 4
+    mov r0, [r1]
+    mov [req_source], r0
+    mov r1, r6                       ; target
+    add r1, 8
+    mov r0, [r1]
+    mov [req_target], r0
+
+    cmp r5, 4                        ; optional type, defaulting to catfs
+    jul .typedone
+    mov r1, r6
+    add r1, 12
+    mov r0, [r1]
+    mov [req_fstype], r0
+    .typedone:
+
+    cmp r5, 5                        ; optional partition index
+    jul .whole
+    mov r1, r6
+    add r1, 16
+    mov r1, [r1]
+    call parse_dec
+    cmp r0, -1
+    je .badindex
+    mov r7, r0                       ; r7 = wanted partition
+
+    mov r1, [req_source]             ; read the table out of the source
+    sys_open r1, O_READ
+    mov r5, r0
+    cmp r5, -1
+    je .noopen
+    sys_read r5, ptbuf, BLOCK_SIZE
+    mov r6, r0
+    sys_close r5
+    cmp r6, BLOCK_SIZE
+    jne .noread
+
+    mov r0, ptbuf
+    mov r0, [r0]
+    cmp r0, PT_MAGIC
+    jne .notable
+    mov r0, ptbuf
+    add r0, 4
+    mov r0, [r0]
+    cmp r0, 0
+    jne .notable
+
+    mov r0, ptbuf
+    add r0, PT_COUNT_OFF
+    mov r0, [r0]
+    cmp r0, PT_MAXENT
+    jule .cntok
+    mov r0, PT_MAXENT
+    .cntok:
+    cmp r7, r0
+    juge .badindex                   ; past the end of the table
+
+    mov r0, r7                       ; entry = entries + index * 12
+    mov r1, PT_ENTRY_SIZE
+    umul r0, r1
+    add r0, ptbuf
+    add r0, PT_ENTRIES_OFF
+    mov r1, r0
+    add r1, PE_START
+    mov r1, [r1]
+    mov [req_start], r1
+    mov r1, r0
+    add r1, PE_COUNT
+    mov r1, [r1]
+    mov [req_count], r1
+    mov r1, r0
+    add r1, PE_TYPE
+    mov r1, [r1]
+    mov [parttype], r1
+
+    mov r1, [req_fstype]         ; does the requested filesystem care what the
+    mov r2, name_catfs           ; entry says it is?
+    call streq
+    cmp r0, 0
+    je .go
+    mov r0, [parttype]
+    cmp r0, PT_CATFS
+    jne .wrongtype
+    jmp .go
+
+; The index is what the user typed, so name it, and say what is actually there.
+.wrongtype:
+    mov r1, e_pt_a
+    call emit_str
+    mov r1, r7                   ; the index they asked for
+    mov r2, 0
+    call emit_dec
+    mov r1, e_pt_b
+    call emit_str
+    mov r1, [req_source]
+    call emit_str
+    mov r1, e_pt_c
+    call emit_str
+    mov r0, [parttype]
+    cmp r0, PT_RAW
+    jne .pt_num
+    mov r1, e_pt_raw
+    call emit_str
+    jmp .pt_tail
+    .pt_num:
+    mov r1, e_pt_type
+    call emit_str
+    mov r1, [parttype]
+    mov r2, 0
+    call emit_dec
+    .pt_tail:
+    mov r1, e_pt_end
+    call emit_str
+    mov r1, 10                   ; '\n'
+    call emit_char
+    call flush
+    sys_exit 1
+
+    .whole:                          ; start 0, count 0 = the whole source, which
+    mov r0, 0                        ; the kernel works out from the node's size
+    mov [req_start], r0
+    mov [req_count], r0
+
+    .go:
+    sys_mount req
+    cmp r0, 0
+    jne .failed
+    sys_exit 0
+
+; The kernel says which step failed, so say that rather than listing everything
+; it might have been. Each message names the thing the user has to go and change.
+.failed:
+    mov r1, r0                   ; the reason, back from its negated form, and
+    mov r0, 0                    ; into r4 because emit_str clobbers r0-r3
+    sub r0, r1
+    mov r4, r0
+    cmp r4, MNTE_SOURCE
+    je .e_source
+    cmp r4, MNTE_RANGE
+    je .e_range
+    cmp r4, MNTE_NOMEM
+    je .e_nomem
+    cmp r4, MNTE_FSTYPE
+    je .e_fstype
+    cmp r4, MNTE_TARGET
+    je .e_target
+    cmp r4, MNTE_FORMAT
+    je .e_format
+    mov r1, e_badreq             ; MNTE_BADREQ, or a code this build predates
+    mov r2, 0
+    jmp .say
+    .e_source:
+    mov r1, e_source
+    mov r2, [req_source]
+    jmp .say
+    .e_range:
+    mov r1, e_range
+    mov r2, [req_source]
+    jmp .say
+    .e_nomem:
+    mov r1, e_nomem
+    mov r2, 0
+    jmp .say
+    .e_fstype:
+    mov r1, e_fstype
+    mov r2, [req_fstype]
+    jmp .say
+    .e_target:
+    mov r1, e_target
+    mov r2, [req_target]
+    jmp .say
+    .e_format:
+    mov r1, e_format
+    mov r2, [req_source]
+
+; say(r1 = message, r2 = the name it is about, or 0). A range or format failure
+; also gets the block range printed, since with a partition index those are the
+; numbers that were actually wrong and the user never typed them.
+.say:
+    push r2
+    call emit_str
+    pop r1
+    cmp r1, 0
+    je .nonames
+    call emit_str
+    .nonames:
+    cmp r4, MNTE_RANGE
+    je .withrange
+    cmp r4, MNTE_FORMAT
+    jne .norange
+    .withrange:
+    mov r1, e_atblock
+    call emit_str
+    mov r1, [req_start]
+    mov r2, 0
+    call emit_dec
+    mov r1, e_pluscount
+    call emit_str
+    mov r1, [req_count]
+    mov r2, 0
+    call emit_dec
+    mov r0, [req_count]          ; the note only means anything when the count
+    cmp r0, 0                    ; really is the "rest of the source" form
+    jne .norange
+    mov r1, e_blocks
+    call emit_str
+    .norange:
+    mov r1, 10                   ; '\n'
+    call emit_char
+    call flush
+    sys_exit 1
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+.badindex:
+    sys_write 1, ebad, ebad_end - ebad
+    sys_exit 1
+.noopen:
+    sys_write 1, eopen, eopen_end - eopen
+    sys_exit 1
+.noread:
+    sys_write 1, eread, eread_end - eread
+    sys_exit 1
+.notable:
+    sys_write 1, etable, etable_end - etable
+    sys_exit 1
+
+usage:
+    dstr "usage: mount <source> <target> [type] [partition]\n"
+usage_end:
+ebad:
+    dstr "mount: bad partition index\n"
+ebad_end:
+eopen:
+    dstr "mount: cannot open source\n"
+eopen_end:
+eread:
+    dstr "mount: cannot read source\n"
+eread_end:
+etable:
+    dstr "mount: source has no partition table\n"
+etable_end:
+e_badreq:
+    dstr "mount: bad request (a path was unreadable)\0"
+e_source:
+    dstr "mount: no such source: \0"
+e_range:
+    dstr "mount: empty block range, or it starts past the end of \0"
+e_nomem:
+    dstr "mount: out of kernel memory\0"
+e_fstype:
+    dstr "mount: no filesystem driver named \0"
+e_target:
+    dstr "mount: target is missing or is not a directory: \0"
+e_format:
+    dstr "mount: no filesystem of that type found in \0"
+e_atblock:
+    dstr " at block \0"
+e_pluscount:
+    dstr " + \0"
+e_blocks:
+    dstr " blocks (0 = to the end of the source)\0"
+
+e_pt_a:
+    dstr "mount: partition \0"
+e_pt_b:
+    dstr " of \0"
+e_pt_c:
+    dstr " is \0"
+e_pt_raw:
+    dstr "a raw application partition\0"
+e_pt_type:
+    dstr "type \0"
+e_pt_end:
+    dstr ", not a CatFS one - run parts to see the table\0"
+
+parttype:
+    d32 0
+
+name_catfs:
+defaulttype:
+    dstr "catfs\0"
+
+; The request the kernel reads, laid out per MNTREQ_* in sys.cat.
+req:
+req_source:
+    d32 0
+req_target:
+    d32 0
+req_fstype:
+    d32 defaulttype
+req_start:
+    d32 0
+req_count:
+    d32 0
+
+ptbuf:
+    res8 BLOCK_SIZE
+
+
+; streq(r1, r2 = strings) -> r0 = 1 if identical, else 0.
+streq:
+    .loop:
+        mov8 r0, [r1]
+        mov8 r3, [r2]
+        cmp r0, r3
+        jne .differ
+        cmp r0, 0
+        je .same
+        add r1, 1
+        add r2, 1
+        jmp .loop
+    .same:
+    mov r0, 1
+    ret
+    .differ:
+    mov r0, 0
+    ret
+
+#include "lib/fmt.cat"

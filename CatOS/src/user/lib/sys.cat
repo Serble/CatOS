@@ -50,6 +50,20 @@
 #define SYS_PSLIST, 38
 #define SYS_WKEYPOST, 39
 #define SYS_WKEY, 40
+#define SYS_MOUNT, 41
+#define SYS_UMOUNT, 42
+#define SYS_STAT, 43
+#define SYS_REMOVE, 44
+#define SYS_RENAME, 45
+#define SYS_CONKEY, 46
+#define SYS_PTYNEW, 47
+#define SYS_PTYGRID, 48
+#define SYS_PTYKEY, 49
+#define SYS_PTYCLOSE, 50
+#define SYS_SETTTY, 51
+#define SYS_REBOOT, 52
+#define SYS_DRVLOAD, 53
+#define SYS_DRVLIST, 54
 
 ; open() modes (bitfield) and seek() whence, matching the kernel VFS
 #define O_READ, 1
@@ -140,7 +154,19 @@
     syscall
 #endmacro
 
-; ---- file I/O (return value in r0; r5-r7 survive a syscall, r1-r4 do not) ----
+; ---- file I/O (return value in r0; r1-r3 are clobbered, r4-r7 survive) ----
+;
+; A macro here follows the same contract a procedure does: r4-r7 come back
+; untouched. That is not free for the three-argument calls, because the kernel
+; reads their third argument out of r4 - which is callee-saved - so those macros
+; save it and put it back.
+;
+; They also fill the argument registers in order - r2, then r3, then r4 - rather
+; than the other way round, so that each argument is read before its own
+; destination is written. That is what makes `sys_read r4, buf, n` work: r4 is
+; still the caller's descriptor when it is copied into r2. (Passing something held
+; in r2 or r3 is still not safe, but the convention already calls those two
+; volatile, so nothing can be holding a value there across a call anyway.)
 
 ; open(path, mode) -> fd (or -1). $1 = path, $2 = O_* mode bits.
 #macro sys_open, 2
@@ -159,38 +185,46 @@
 
 ; read(fd, buf, len) -> bytes read. $1 = fd, $2 = buffer, $3 = length.
 #macro sys_read, 3
-    mov r4, $3
-    mov r3, $2
+    push r4                  ; r4 carries the third argument and is callee-saved
     mov r2, $1
+    mov r3, $2
+    mov r4, $3
     mov r1, SYS_READ
     syscall
+    pop r4
 #endmacro
 
 ; write(fd, buf, len) -> bytes written. $1 = fd, $2 = buffer, $3 = length.
 #macro sys_write, 3
-    mov r4, $3
-    mov r3, $2
+    push r4                  ; r4 carries the third argument and is callee-saved
     mov r2, $1
+    mov r3, $2
+    mov r4, $3
     mov r1, SYS_WRITE
     syscall
+    pop r4
 #endmacro
 
 ; seek(fd, offset, whence) -> new cursor. $1 = fd, $2 = offset, $3 = SEEK_*.
 #macro sys_seek, 3
-    mov r4, $3
-    mov r3, $2
+    push r4                  ; r4 carries the third argument and is callee-saved
     mov r2, $1
+    mov r3, $2
+    mov r4, $3
     mov r1, SYS_SEEK
     syscall
+    pop r4
 #endmacro
 
 ; readdir(fd, buf, buflen) -> 1 entry / 0 end / -1. $1 = fd, $2 = name buffer.
 #macro sys_readdir, 3
-    mov r4, $3
-    mov r3, $2
+    push r4                  ; r4 carries the third argument and is callee-saved
     mov r2, $1
+    mov r3, $2
+    mov r4, $3
     mov r1, SYS_READDIR
     syscall
+    pop r4
 #endmacro
 
 ; create(path, type) -> 0/-1. $1 = path, $2 = T_FILE or T_DIR.
@@ -198,6 +232,56 @@
     mov r3, $2
     mov r2, $1
     mov r1, SYS_CREATE
+    syscall
+#endmacro
+
+; ---- names on disk ----
+; The three calls that act on a path rather than on an open file. A program needs
+; stat before it can decide anything: whether a name exists at all, whether it is
+; a directory (so `cp f d` means "into d" rather than "over d"), and how big a
+; file is without opening and seeking it.
+;
+; The stat buffer the kernel fills, matching ST_* in the VFS. ST_TYPE is one of
+; the T_* / node types below - T_FILE and T_DIR are the two an ordinary program
+; sees, but /dev entries come back as T_CHARDEV or T_BLOCKDEV, which is exactly
+; the case where "do not try to copy this" is worth knowing.
+#define ST_TYPE, 0
+#define ST_SIZE, 4
+#define ST_FLAGS, 8
+#define ST_STRUCT, 12
+#define T_CHARDEV, 3
+#define T_BLOCKDEV, 4
+
+; stat(path, buf) -> 0/-1. Fill a 12-byte ST_STRUCT with the path's type, size
+; and flags. -1 simply means the name is not there, which is how a program asks
+; "does this exist?". $1 = path, $2 = buffer.
+#macro sys_stat, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_STAT
+    syscall
+#endmacro
+
+; remove(path) -> 0/-1. Unlink a file, or a directory that is already empty -
+; the kernel refuses a populated one rather than orphaning what is inside it, so
+; deleting a tree is a loop out here (that is what rm -r is). Also refuses a
+; mount point. $1 = path.
+#macro sys_remove, 1
+    mov r2, $1
+    mov r1, SYS_REMOVE
+    syscall
+#endmacro
+
+; rename(old, new) -> 0/-1. Move an entry to another name and/or directory
+; *within one filesystem*: no data moves, so a directory costs the same as a
+; file. It fails rather than clobbering an existing destination, and fails when
+; the two paths land on different mounts - there is no way to link an inode into
+; a filesystem that has never heard of it, so crossing one means copying, which
+; mv does for itself. $1 = old path, $2 = new path.
+#macro sys_rename, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_RENAME
     syscall
 #endmacro
 
@@ -297,6 +381,13 @@
 ; asks the hardware manager to shut down.
 #macro sys_poweroff, 0
     mov r1, SYS_POWEROFF
+    syscall
+#endmacro
+
+; reboot() -> does not return. Resets the machine; the firmware then loads the
+; kernel off the disk again, exactly as at power-on.
+#macro sys_reboot, 0
+    mov r1, SYS_REBOOT
     syscall
 #endmacro
 
@@ -567,5 +658,170 @@
     mov r3, $2
     mov r2, $1
     mov r1, SYS_CONREAD
+    syscall
+#endmacro
+
+; conkey(event) -> 0. Type a key event into the console session, as if it had been
+; pressed with nothing grabbing the keyboard. This is the way back in that conread
+; alone does not give you: a window manager holding the keyboard is exactly what
+; stops the shell hearing anything, so a program that draws the console (see
+; conread) forwards the keys posted to its window here and becomes a terminal
+; rather than a display. Pass the event from wkey whole - a release, a modifier or
+; anything else that types nothing is dropped for you, and Ctrl+C (which types the
+; character 3) interrupts the session, exactly as it does at the machine's own
+; keyboard. $1 = a key event.
+#macro sys_conkey, 1
+    mov r2, $1
+    mov r1, SYS_CONKEY
+    syscall
+#endmacro
+
+; ---- pseudo-terminals ----
+; A pty is a text session with nothing at either end: a character grid, a cursor
+; and a line discipline, exactly like the console but with no screen behind it and
+; no keyboard in front. It is what makes a terminal *emulator* more than a second
+; view of the one console - claim a session, point your stdio at it with settty,
+; spawn a shell, and that shell reads your ring and writes your grid while every
+; other terminal does the same in its own. Two of them can then be busy with
+; different things at once.
+;
+; The grid comes back in exactly the layout conread produces, so the same code
+; rasterises a pty and the console; only the calls that fetch and feed differ.
+
+; ptynew(cols, rows) -> a session index, or -1 if the size is out of range or every
+; session is taken. You own it: only you can read its grid or type into it, and it
+; is released when you exit even if you never say so. $1 = columns, $2 = rows.
+#macro sys_ptynew, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_PTYNEW
+    syscall
+#endmacro
+
+; ptygrid(idx, dst, cap) -> bytes written, or -1. Snapshot your session's grid: a
+; 20-byte header (columns, rows, cursor column, cursor row, change counter) then
+; columns*rows characters, row-major - the same thing conread hands back, so a
+; terminal draws either with one routine. $1 = index, $2 = buffer, $3 = capacity.
+#macro sys_ptygrid, 3
+    push r4                  ; r4 carries the third argument and is callee-saved
+    mov r2, $1
+    mov r3, $2
+    mov r4, $3
+    mov r1, SYS_PTYGRID
+    syscall
+    pop r4
+#endmacro
+
+; ptykey(idx, event) -> 0/-1. Type a key event into your session's line discipline.
+; Pass the event from wkey whole: a release, a modifier or anything else that types
+; nothing is dropped, and Ctrl+C interrupts this session and nobody else's.
+; $1 = index, $2 = a key event.
+#macro sys_ptykey, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_PTYKEY
+    syscall
+#endmacro
+
+; ptyclose(idx) -> 0/-1. Release a session. Anything still reading it gets -1,
+; which is how a shell finds out its terminal has gone. $1 = index.
+#macro sys_ptyclose, 1
+    mov r2, $1
+    mov r1, SYS_PTYCLOSE
+    syscall
+#endmacro
+
+; settty(path) -> 0/-1. Make a character device your controlling terminal: your
+; own fd 0/1/2 are reopened onto it, and - the part that matters - every process
+; you spawn from now on opens the same device for its stdio, as does everything
+; they spawn. That is the whole mechanism behind a terminal window having its own
+; shell: claim a pty, settty("/dev/ptyN"), spawn /bin/sh, and the shell and
+; everything it runs are on your session without being told. $1 = path.
+#macro sys_settty, 1
+    mov r2, $1
+    mov r1, SYS_SETTTY
+    syscall
+#endmacro
+
+; ---- mount request ----
+; Laid out in the caller's own memory and passed to mount() by address. These
+; offsets must match MNTREQ_* in fs/fdio.cat, the same way the syscall numbers
+; above must match syscall.cat.
+#define MNTREQ_SOURCE, 0         ; char* backing file or device
+#define MNTREQ_TARGET, 4         ; char* directory to cover
+#define MNTREQ_FSTYPE, 8         ; char* "catfs" / "rawfs" / ...
+#define MNTREQ_START, 12         ; first block of the region within the source
+#define MNTREQ_COUNT, 16         ; region length in blocks, 0 = rest of the source
+#define MNTREQ_STRUCT, 20
+
+; Why a mount failed. The kernel returns one of these negated, rather than a bare
+; -1, because the fixes are completely different: a missing source is a typo, an
+; unrecognised region is usually the wrong partition index, and an unknown fstype
+; is a name nothing has registered. Keep in sync with the MNTE_* in fs/vfs.cat.
+#define MNTE_BADREQ, 1           ; the request or one of its paths is unreadable
+#define MNTE_SOURCE, 2           ; the source path does not exist
+#define MNTE_RANGE, 3            ; the block range is empty, or starts past the end
+#define MNTE_NOMEM, 4            ; out of kernel memory
+#define MNTE_FSTYPE, 5           ; no filesystem driver by that name
+#define MNTE_TARGET, 6           ; the target is missing, or is not a directory
+#define MNTE_FORMAT, 7           ; that region does not hold such a filesystem
+
+; mount(req) -> 0, or a negated MNTE_* on failure. Mount blocks
+; [start, start+count) of the request's source at its target. The source is an
+; ordinary path, so a whole disk, a partition inside one and a plain file are all
+; mounted the same way - there is nothing special about a /dev node.
+; $1 = address of a MNTREQ_STRUCT.
+#macro sys_mount, 1
+    mov r2, $1
+    mov r1, SYS_MOUNT
+    syscall
+#endmacro
+
+; umount(path) -> 0/-1. Fails if anything is still using the filesystem, so close
+; your files (and leave the directory) first. $1 = mount path.
+#macro sys_umount, 1
+    mov r2, $1
+    mov r1, SYS_UMOUNT
+    syscall
+#endmacro
+
+; ---- loadable drivers ----
+; A driver is a file in /drivers (see src/drivers/lib/drvabi.cat). The kernel
+; loads the ones it has a device for at boot; these load one by hand and list
+; what is loaded.
+
+; drvload errors (keep in sync with DRVE_* in the kernel's drivers/drvhost.cat)
+#define DRVE_NOFILE, -1          ; the file could not be opened or read
+#define DRVE_FORMAT, -2          ; not a driver, or built for another ABI
+#define DRVE_NOMEM, -3           ; no memory for it
+#define DRVE_FULL, -4            ; the driver table is full
+#define DRVE_INIT, -5            ; its init refused, or it faulted there
+#define DRVE_LOADED, -6          ; a driver of that name is already loaded
+
+; One SYS_DRVLIST record (must match the kernel's DRVREC_*).
+#define DRVREC_STATE, 0          ; DRVSTATE_*
+#define DRVREC_UNITS, 4          ; how many devices it drives
+#define DRVREC_NAME, 8           ; its name, NUL-terminated, DRVREC_NAMELEN bytes
+#define DRVREC_NAMELEN, 16
+#define DRVREC_BYTES, 24
+#define DRV_MAX, 8               ; records the kernel can ever return
+#define DRVSTATE_LIVE, 1
+#define DRVSTATE_DEAD, 2         ; it faulted, and runs no more
+
+; drvload(path) -> the driver's index (>= 0), or a DRVE_* error. Loads the driver
+; in that file, runs its init and binds it to every device it drives that has no
+; driver yet. There is no unloading. $1 = path.
+#macro sys_drvload, 1
+    mov r2, $1
+    mov r1, SYS_DRVLOAD
+    syscall
+#endmacro
+
+; drvlist(buf, max) -> count, or -1. Fills buf with up to max DRVREC_BYTES
+; records, one per loaded driver. $1 = buffer, $2 = max.
+#macro sys_drvlist, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, SYS_DRVLIST
     syscall
 #endmacro

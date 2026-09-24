@@ -1,0 +1,161 @@
+; parts - list the partition table of a disk or an image file.
+;
+; Takes a path, not a disk number, because it does not need to be a disk: the
+; table lives in block 0 of whatever it is handed, and reading a /dev/diskN node
+; and reading an ordinary file are the same operation. That is also how you check
+; an image before mounting a partition out of it.
+;
+; Nothing here is privileged - it is an ordinary read of the first 512 bytes,
+; parsed in user mode. See ../../CatPartitions.md for the layout.
+#include "lib/sys.cat"
+
+#define BLOCK_SIZE, 512
+#define PT_MAGIC, 51                 ; low word of the 64-bit magic; high word is 0
+#define PT_COUNT_OFF, 0x0C
+#define PT_ENTRIES_OFF, 0x20
+#define PT_ENTRY_SIZE, 12
+#define PE_TYPE, 0
+#define PE_START, 4
+#define PE_COUNT, 8
+#define PT_MAXENT, 39                ; (0x1FC - 0x20) / 12, all that block 0 holds
+
+#define PART_RAW, 0
+#define PART_CATFS, 1
+
+main:
+    cmp r1, 2
+    jul .usage
+    mov r1, r2                       ; argv[1] -> path
+    add r1, 4
+    mov r1, [r1]
+    sys_open r1, O_READ
+    mov r5, r0
+    cmp r5, -1
+    je .noopen
+
+    sys_read r5, ptbuf, BLOCK_SIZE
+    mov r6, r0
+    sys_close r5
+    cmp r6, BLOCK_SIZE
+    jne .noread
+
+    mov r0, ptbuf                    ; the magic is a 64-bit 51
+    mov r0, [r0]
+    cmp r0, PT_MAGIC
+    jne .notable
+    mov r0, ptbuf
+    add r0, 4
+    mov r0, [r0]
+    cmp r0, 0
+    jne .notable
+
+    mov r0, ptbuf
+    add r0, PT_COUNT_OFF
+    mov r5, [r0]                     ; r5 = partition count
+    cmp r5, PT_MAXENT
+    jule .countok
+    mov r5, PT_MAXENT                ; a table claiming more than fits is truncated
+    .countok:
+
+    mov r1, header
+    call emit_str
+    call flush
+
+    mov r6, 0                        ; r6 = index
+    mov r7, ptbuf
+    add r7, PT_ENTRIES_OFF           ; r7 = entry cursor
+    .loop:
+        cmp r6, r5
+        juge .done
+
+        mov r1, r6                   ; index
+        mov r2, 3
+        call emit_dec
+
+        mov r1, 32
+        call emit_char
+        mov r0, r7                   ; type, named where we know the name
+        add r0, PE_TYPE
+        mov r0, [r0]
+        cmp r0, PART_RAW
+        jne .notraw
+        mov r1, tname_raw
+        call emit_str
+        jmp .typedone
+        .notraw:
+        cmp r0, PART_CATFS
+        jne .typenum
+        mov r1, tname_catfs
+        call emit_str
+        jmp .typedone
+        .typenum:
+        mov r1, r0                   ; an unknown type is still worth showing
+        mov r2, 5
+        call emit_dec
+        .typedone:
+
+        mov r0, r7                   ; start block
+        add r0, PE_START
+        mov r1, [r0]
+        mov r2, 11
+        call emit_dec
+
+        mov r0, r7                   ; length in blocks
+        add r0, PE_COUNT
+        mov r1, [r0]
+        mov r2, 11
+        call emit_dec
+
+        mov r0, r7                   ; and in bytes, which is what you actually
+        add r0, PE_COUNT             ; want when deciding if something fits
+        mov r1, [r0]
+        shl r1, 9
+        mov r2, 12
+        call emit_dec
+
+        mov r1, 10                   ; '\n'
+        call emit_char
+        call flush
+
+        add r7, PT_ENTRY_SIZE
+        add r6, 1
+        jmp .loop
+    .done:
+    sys_exit 0
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+.noopen:
+    sys_write 1, eopen, eopen_end - eopen
+    sys_exit 1
+.noread:
+    sys_write 1, eread, eread_end - eread
+    sys_exit 1
+.notable:
+    sys_write 1, etable, etable_end - etable
+    sys_exit 1
+
+usage:
+    dstr "usage: parts <disk-or-image>\n"
+usage_end:
+eopen:
+    dstr "parts: cannot open\n"
+eopen_end:
+eread:
+    dstr "parts: cannot read block 0\n"
+eread_end:
+etable:
+    dstr "parts: no partition table\n"
+etable_end:
+header:
+    dstr "  # TYPE       START     BLOCKS       BYTES\n\0"
+tname_raw:
+    dstr "raw  \0"
+tname_catfs:
+    dstr "catfs\0"
+
+ptbuf:
+    res8 BLOCK_SIZE
+
+#include "lib/fmt.cat"

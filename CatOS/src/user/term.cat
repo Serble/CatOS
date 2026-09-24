@@ -1,0 +1,1092 @@
+; term - a graphical terminal emulator.
+;
+;   +------------------------------------------+
+;   | / $ ls /bin                              |
+;   | cat  cp  echo  editor  ls  sh  term      |
+;   | / $ _                                    |
+;   +------------------------------------------+
+;
+; A window with a shell in it. It draws a text session's character grid with its own
+; copy of the console font, and feeds the keys the window manager posts to it back
+; down into that session's line discipline, so the shell reads them exactly as it
+; would from a keyboard.
+;
+; Both halves are needed and neither is useful alone. A snapshot call has always let
+; a graphical program *see* a session - that is all desktop.cat's old page 0 ever did,
+; and why it is gone - but a window manager takes the whole keyboard (keygrab(-1)) so that it
+; can route keys to the window it considers focused, and a focused window had no way
+; to pass one on. The key calls are that way back: hand one an event from wkey and
+; the session sees the character, as though nothing had grabbed the key at all. So
+; drawing the grid makes a display, and forwarding the keys makes a terminal.
+;
+; That also means term is an ordinary client and knows nothing about which manager
+; is running - a page under desktop.cat, a tile under tile.cat - the same way
+; stopwatch.cat and gdemo.cat do not.
+;
+;
+; -- Its own shell, in its own session ----------------------------------------
+;
+; By default a term claims a *pty* - a text session with no screen behind it and no
+; keyboard in front (kernel/io/pty.cat) - points its own stdio at it with settty,
+; and spawns /bin/sh into it. Because the controlling terminal is inherited, that
+; shell and everything the shell runs land on the same session without being told
+; anything, and every other term is doing the same in a session of its own. So two
+; terminals can be busy with two different things at once, which is the point.
+;
+; A shell of one's own is the whole difference between a terminal emulator and a
+; second view of the console. The console is a *machine* resource: one screen, one
+; keyboard, therefore one line discipline and one shell reading it. A pty is a
+; process resource, and there can be as many as there are windows.
+;
+; The grids are the same shape - a pty snapshot is byte-for-byte the layout conread
+; produces - so everything below the fetch draws either one, and `term console`
+; still opens the older kind: a view of the machine console, sharing that one
+; session with whoever else is looking at it. That is the way to see the boot shell
+; from under tile.cat, which never draws the console itself.
+;
+; The window closes when its shell exits, and the shell exits when its terminal
+; goes: a read from a released pty fails rather than blocking, and sh treats that
+; as end of session. That second half is what makes killing a term safe from any
+; direction - a handler here could only cover being asked politely.
+;
+;
+; -- Sizing --------------------------------------------------------------------
+;
+; A pty's geometry is fixed when it is created, so we want the window manager to
+; have had its say about our size before we choose it - tile.cat resizes every
+; window it is given, and a grid chosen before that would be the wrong shape for
+; the rest of the session. So a term puts its window up, spends SETTLE_MS letting
+; the layout settle, and only then sizes the session to the window and starts the
+; shell. Nothing has been printed yet at that point, so there is nothing to reflow.
+;
+; A resize *after* that is not reflowed - there is no pty resize call and adding one
+; means rewriting a packed grid at a new stride. The window instead becomes a
+; viewport: a grid that fits is centred, and one that does not shows the last rows
+; that fit, flush with the bottom, because the prompt is the half you cannot afford
+; to clip. In console mode that is the normal case, since the console's geometry
+; was never ours to choose.
+;
+; Redrawing is only done when something moved: the session's change counter, our own
+; config counter, or the cursor blink. A terminal nobody is typing at therefore costs
+; the compositor a wlist compare per frame and nothing else.
+#include "lib/sys.cat"
+
+#define GW, 8                        ; the console font is 8x16, 1bpp
+#define GH, 16
+#define GH_SHIFT, 4                  ; ... so dividing by a row is a shift
+#define FONT_GLYPHS, 129             ; glyphs the converted font provides
+
+#define PAD, 4                       ; margin between the grid and the window edge
+#define MAX_W, 512                   ; the screen, which wcreate refuses to exceed
+#define MAX_H, 384                   ; (it rejects an oversized request, not clamps)
+#define MAX_BYTES, 786432            ; MAX_W * MAX_H * 4 - any size we can be granted
+
+#define CON_MAX_COLS, 64             ; the console mirror's capacity, from console.cat
+#define CON_MAX_ROWS, 24
+#define CON_HDR, 20                  ; conread header: cols, rows, cursor col/row, seq
+#define CON_COL_OFF, 8               ; the cursor's column within that header
+#define CON_ROW_OFF, 12
+#define CON_SEQ_OFF, 16              ; the change counter within it
+#define CONBUF_BYTES, 1556           ; CON_HDR + CON_MAX_COLS * CON_MAX_ROWS
+
+#define GW_SHIFT, 3                  ; ... and by a column, for window -> grid
+#define BLINK_SHIFT, 9               ; cursor half-period: 512ms, a shift not a divide
+
+#define MODE_PTY, 0                  ; our own session, with our own shell in it
+#define MODE_CONSOLE, 1              ; a view of the machine console (`term console`)
+#define WANT_COLS, 63                ; the window we ask for: 63*8 + 2*PAD = 512, and
+#define WANT_ROWS, 23                ; 23*16 + 2*PAD = 376, both inside the screen
+#define SETTLE_MS, 300               ; how long the layout gets before we fix the grid
+#define PS_REC_MAX, 16               ; PS_MAX, for the "is our shell still there" scan
+
+#define BG_COLOUR, 0x00101519
+#define FG_COLOUR, 0x00CFE3D8
+#define CURSOR_COLOUR, 0x0058C888
+#define FRAME_COLOUR, 0x002C3740
+
+main:
+    mov [argcount], r1               ; the kernel starts us with r1 = argc, r2 = argv
+    mov [argvec], r2
+
+    sys_sbrk MAX_BYTES               ; the pixel buffer, far past what an image holds
+    cmp r0, -1
+    je .nomem
+    mov [winbuf], r0
+
+    call pick_mode                   ; `term console` views the machine console;
+    call want_size                   ; anything else gets a session of its own
+    sys_wcreate [wantw], [wanth]
+    cmp r0, -1
+    je .nowin
+    mov r7, r0                       ; our surface id (survives syscalls)
+
+    mov r0, [mode]
+    cmp r0, MODE_CONSOLE
+    je .running
+    mov r1, r7                       ; let the layout settle, then size the session
+    call settle                      ; to the window and start the shell in it
+    mov r0, [ptyidx]                 ; (start_session leaves -1 if it could not)
+    cmp r0, -1
+    je .nosession
+
+    .running:
+    .loop:
+        mov r1, r7
+        call pump_keys               ; everything typed at us goes to our session
+        mov r1, r7
+        call resync                  ; adopt whatever size we have been granted
+        call check_grid              ; has anything been printed or echoed?
+        call check_blink
+        mov r0, [dirty]
+        cmp r0, 0
+        je .idle
+        mov r0, 0
+        mov [dirty], r0
+        call redraw
+        mov r3, [winbuf]
+        mov r2, r7
+        mov r1, SYS_WCOMMIT
+        syscall
+        .idle:
+        call shell_gone              ; our shell exiting closes the window, exactly
+        cmp r0, 0                    ; as leaving a terminal anywhere else does
+        jne .bye
+        sys_yield
+        jmp .loop
+
+    .bye:
+        call drop_session
+        sys_exit 0
+    .nosession:
+        sys_write 1, ptyerr, ptyerr_end - ptyerr
+        sys_exit 1
+    .nomem:
+        sys_write 1, memerr, memerr_end - memerr
+        sys_exit 1
+    .nowin:
+        sys_write 1, winerr, winerr_end - winerr
+        sys_exit 1
+
+
+; ==========================
+;   The session
+; ==========================
+
+; Which kind of terminal we are. `term console` is a view of the machine console -
+; one session, shared with anything else looking at it, and the only way to see the
+; boot shell from under a window manager that never draws the console. Anything else
+; means a session of our own, decided here but not created until settle has let the
+; window manager choose our size.
+pick_mode:
+    mov r0, [argcount]
+    cmp r0, 2
+    jil .own
+    mov r0, [argvec]
+    add r0, 4
+    mov r1, [r0]                     ; argv[1]
+    mov r2, consolearg
+    call streq
+    cmp r0, 1
+    jne .own
+    mov [mode], MODE_CONSOLE
+    call read_grid                   ; its geometry is already fixed; ask to fit it
+    ret
+    .own:
+    mov [mode], MODE_PTY
+    ret
+
+
+; Spin until the window manager has stopped moving us about, so the grid we are
+; about to fix matches the window we actually have. A fixed wait rather than a
+; "unchanged for N frames" test, because a client's frames are paced by nothing but
+; yield: N of those can pass before the compositor has drawn once. r1 = sid
+settle:
+    push r4                          ; sid
+    push r5                          ; when we started
+    mov r4, r1
+    uptms
+    mov r5, r0
+    .wait:
+        mov r1, r4
+        call resync
+        uptms
+        sub r0, r5
+        cmp r0, SETTLE_MS
+        juge .done
+        sys_yield
+        jmp .wait
+    .done:
+    mov r1, r4
+    call start_session
+    pop r5
+    pop r4
+    ret
+
+
+; Claim a session the size of the window we ended up with, make it our controlling
+; terminal, and start a shell in it. Leaves ptyidx at -1 if any of that fails.
+; r1 = sid
+start_session:
+    push r4                          ; columns
+    push r5                          ; rows
+    mov r4, [winw]                   ; the whole window, less the margin, in cells
+    sub r4, PAD
+    sub r4, PAD
+    shr r4, GW_SHIFT
+    cmp r4, 1
+    jug .colsok
+    mov r4, 1
+    .colsok:
+    cmp r4, CON_MAX_COLS
+    jule .colsdone
+    mov r4, CON_MAX_COLS
+    .colsdone:
+    mov r5, [winh]
+    sub r5, PAD
+    sub r5, PAD
+    shr r5, GH_SHIFT
+    cmp r5, 1
+    jug .rowsok
+    mov r5, 1
+    .rowsok:
+    cmp r5, CON_MAX_ROWS
+    jule .rowsdone
+    mov r5, CON_MAX_ROWS
+    .rowsdone:
+
+    sys_ptynew r4, r5
+    cmp r0, -1
+    je .fail
+    mov [ptyidx], r0
+    call build_ptypath               ; "/dev/pty" + the index
+    sys_settty ptypath               ; ours, and every child's, from here on
+    cmp r0, -1
+    je .release
+    sys_spawn shpath                 ; the shell inherits all of that
+    cmp r0, -1
+    je .release
+    mov [shellpid], r0
+    pop r5
+    pop r4
+    ret
+    .release:
+    sys_ptyclose [ptyidx]
+    .fail:
+    mov [ptyidx], -1
+    pop r5
+    pop r4
+    ret
+
+
+; ptypath = "/dev/pty" + one digit. PTY_MAX is small enough that a single digit is
+; the whole of it, and the kernel names the nodes the same way.
+build_ptypath:
+    mov r0, ptypath
+    add r0, 8                        ; past "/dev/pty"
+    mov r1, [ptyidx]
+    add r1, 48
+    mov8 [r0], r1
+    add r0, 1
+    mov8 [r0], 0
+    ret
+
+
+; Has the shell we started gone? -> r0 = 1 if it has (or was never started, in the
+; case a spawn failed after we had a window). Console mode has no shell of its own
+; and never closes on its own account.
+;
+; pslist rather than wait, because wait would block us: a compositor is holding a
+; frame of ours and a terminal that stopped drawing would freeze on screen. A pid
+; that is absent or a zombie is a shell that has exited either way, and the zombie
+; is reaped on the way out so the slot goes back.
+shell_gone:
+    push r4                          ; the pid we are looking for
+    push r5                          ; record
+    push r6                          ; index
+    push r7                          ; records returned
+    mov r0, [mode]
+    cmp r0, MODE_CONSOLE
+    je .no
+    mov r4, [shellpid]
+    cmp r4, 0
+    je .no                           ; not started yet
+    sys_pslist psbuf, PS_REC_MAX
+    cmp r0, 0
+    jile .yes
+    mov r7, r0
+    mov r6, 0
+    .each:
+        cmp r6, r7
+        juge .yes                    ; not in the table at all
+        mov r5, r6
+        umul r5, PSREC_BYTES
+        add r5, psbuf
+        mov r0, [r5]
+        cmp r0, r4
+        jne .next
+        mov r0, r5
+        add r0, PSREC_STATE
+        mov r0, [r0]
+        cmp r0, PS_ZOMBIE
+        je .yes
+        mov r0, 0                    ; alive and well
+        pop r7
+        pop r6
+        pop r5
+        pop r4
+        ret
+        .next:
+        add r6, 1
+        jmp .each
+    .yes:
+    mov r0, 1
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+    .no:
+    mov r0, 0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Give the session back on the way out. The kernel would do it for us (pty_reap
+; runs at teardown, so a term that is killed outright still frees its slot); doing
+; it here as well costs nothing and keeps the ordinary exit honest about what it
+; owns. The dead shell is reaped too, so its process slot goes back with it.
+drop_session:
+    mov r0, [mode]
+    cmp r0, MODE_CONSOLE
+    je .done
+    mov r0, [shellpid]
+    cmp r0, 0
+    je .pty
+    sys_wait [shellpid]              ; already a zombie, so this cannot block
+    .pty:
+    mov r0, [ptyidx]
+    cmp r0, -1
+    je .done
+    sys_ptyclose [ptyidx]
+    .done:
+    ret
+
+
+; streq(r1, r2) -> r0 = 1 if the two null-terminated strings match.
+streq:
+    push r4
+    push r5
+    mov r4, r1
+    mov r5, r2
+    .cmp:
+        mov8 r0, [r4]
+        mov8 r3, [r5]
+        cmp r0, r3
+        jne .ne
+        cmp r0, 0
+        je .yes
+        add r4, 1
+        add r5, 1
+        jmp .cmp
+    .yes:
+    mov r0, 1
+    jmp .done
+    .ne:
+    mov r0, 0
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Input
+; ==========================
+
+; Drain every key the window manager has posted to us into the session's line
+; discipline. The event goes across whole: what a release or a chord means is the
+; kernel's business at the far end - a release types nothing and is dropped there,
+; and Ctrl+C carries the character the layout says it does and interrupts this
+; session's foreground job - and deciding any of it here would be this program
+; inventing a second keyboard layout.
+;
+; Nothing is echoed from here either - the line discipline echoes into the console
+; mirror, which is the very thing we are drawing, so a typed character arrives back
+; the same way the shell's output does.
+; r1 = sid
+pump_keys:
+    push r4                          ; sid
+    push r5                          ; the event
+    mov r4, r1
+    .next:
+        sys_wkey r4
+        cmp r0, -1
+        je .done                     ; ring drained
+        mov r5, r0
+        mov r0, [mode]
+        cmp r0, MODE_CONSOLE
+        je .toconsole
+        mov r0, [ptyidx]
+        cmp r0, -1
+        je .next                     ; no session yet: drop it
+        sys_ptykey [ptyidx], r5
+        jmp .next
+        .toconsole:
+        sys_conkey r5
+        jmp .next
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   State
+; ==========================
+
+; Pick up the window manager's idea of our size. Only the config counter moving
+; means anything changed, and a size change means the grid has to be re-placed, so
+; that is also the one case that forces a redraw. r1 = sid
+resync:
+    sys_wconfig r1, cfgbuf
+    cmp r0, -1
+    je .done                         ; surface gone; the next commit will fail too
+    mov r0, cfgbuf
+    add r0, 8
+    mov r0, [r0]                     ; config counter
+    mov r1, [lastcfg]
+    cmp r0, r1
+    je .done
+    mov [lastcfg], r0
+    mov r0, [cfgbuf]                 ; granted width
+    mov [winw], r0
+    mov r0, cfgbuf
+    add r0, 4
+    mov r0, [r0]                     ; granted height
+    mov [winh], r0
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    ret
+
+
+; Snapshot our session into conbuf. The two kinds hand back the same 20-byte header
+; and the same row-major grid, so this is the only place that knows which one we
+; are; everything that draws is written once.
+;
+; A failure should not leave the last frame's grid to be drawn against this frame's
+; header, so present an empty session instead: zero columns and rows draw nothing,
+; and a zeroed cursor lands somewhere harmless. That is also what is on screen
+; between our window appearing and the shell starting.
+read_grid:
+    mov r0, [mode]
+    cmp r0, MODE_CONSOLE
+    je .console
+    mov r0, [ptyidx]
+    cmp r0, -1
+    je .empty                        ; no session yet, or it has gone
+    sys_ptygrid [ptyidx], conbuf, CONBUF_BYTES
+    jmp .check
+    .console:
+    sys_conread conbuf, CONBUF_BYTES
+    .check:
+    cmp r0, -1
+    jne .done
+    .empty:
+    mov r0, 0
+    mov [conbuf], r0                 ; columns
+    mov r1, conbuf
+    add r1, 4
+    mov [r1], r0                     ; rows
+    mov r1, conbuf
+    add r1, CON_COL_OFF
+    mov [r1], r0                     ; cursor column
+    mov r1, conbuf
+    add r1, CON_ROW_OFF
+    mov [r1], r0                     ; cursor row
+    .done:
+    ret
+
+
+; Fetch the session and note whether it has actually changed. The counter is bumped
+; by every character printed and every cursor move, so an untouched session compares
+; equal here and costs us no drawing at all.
+check_grid:
+    call read_grid
+    mov r0, conbuf
+    add r0, CON_SEQ_OFF
+    mov r0, [r0]
+    mov r1, [lastseq]
+    cmp r0, r1
+    je .done
+    mov [lastseq], r0
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    ret
+
+
+; Flip the cursor block twice a second. uptms is the CPU's own uptime in
+; milliseconds and needs no syscall; the half-period is a power of two so the phase
+; is a shift rather than a divide.
+check_blink:
+    uptms                            ; r1:r0, and only the low word is wanted
+    shr r0, BLINK_SHIFT
+    and r0, 1
+    mov r1, [blink]
+    cmp r0, r1
+    je .done
+    mov [blink], r0
+    mov r0, 1
+    mov [dirty], r0
+    .done:
+    ret
+
+
+; The size of window to ask for, clamped to the screen - wcreate rejects a request
+; bigger than the display rather than trimming it. In console mode that is a window
+; fitting the grid the console already has; for a session of our own there is no
+; grid yet, so we ask for as much as the screen will give and cut the session to
+; whatever we are granted (see settle).
+want_size:
+    mov r0, [mode]
+    cmp r0, MODE_CONSOLE
+    jne .ourown
+    mov r0, [conbuf]                 ; columns
+    cmp r0, 0
+    jne .havecols
+    mov r0, CON_MAX_COLS
+    jmp .havecols
+    .ourown:
+    mov r0, WANT_COLS
+    .havecols:
+    umul r0, GW
+    add r0, PAD
+    add r0, PAD
+    cmp r0, MAX_W
+    jule .wok
+    mov r0, MAX_W
+    .wok:
+    mov [wantw], r0
+
+    mov r0, [mode]
+    cmp r0, MODE_CONSOLE
+    jne .ourrows
+    mov r0, conbuf
+    add r0, 4
+    mov r0, [r0]                     ; rows
+    cmp r0, 0
+    jne .haverows
+    mov r0, CON_MAX_ROWS
+    jmp .haverows
+    .ourrows:
+    mov r0, WANT_ROWS
+    .haverows:
+    umul r0, GH
+    add r0, PAD
+    add r0, PAD
+    cmp r0, MAX_H
+    jule .hok
+    mov r0, MAX_H
+    .hok:
+    mov [wanth], r0
+    ret
+
+
+; ==========================
+;   Drawing
+; ==========================
+
+redraw:
+    call grid_origin
+    call fill_bg
+    call draw_frame
+    call draw_grid
+    call draw_cursor
+    ret
+
+
+; Decide which part of the grid to show and where to put it: ox/oy are its top-left
+; pixel, firstrow the first grid row drawn and grows how many.
+;
+; A grid that fits is centred. One that does not is where the two axes stop being
+; symmetric, because a console is not symmetric: the interesting end is the bottom,
+; where the prompt and the newest output are. So a window too short shows the *last*
+; rows that fit whole, flush with the bottom edge, and scrolls the oldest off the
+; top - dropping the row you are typing on instead would be exactly the wrong half
+; to lose. Sideways there is no such choice to make: text starts at the left, so a
+; window too narrow simply clips the right.
+grid_origin:
+    mov r0, [conbuf]                 ; columns * GW
+    umul r0, GW
+    mov r1, [winw]
+    cmp r1, r0
+    jul .noxroom
+    sub r1, r0
+    shr r1, 1
+    mov [ox], r1
+    jmp .vert
+    .noxroom:
+    mov r0, 0
+    mov [ox], r0
+
+    .vert:
+    mov r0, conbuf
+    add r0, 4
+    mov r0, [r0]                     ; rows in the grid
+    mov r2, [winh]
+    shr r2, GH_SHIFT                 ; whole rows the window can show
+    cmp r0, r2
+    jug .scroll
+    mov [firstrow], 0                ; it all fits, so centre it
+    mov [grows], r0
+    umul r0, GH
+    mov r1, [winh]
+    sub r1, r0
+    shr r1, 1
+    mov [oy], r1
+    ret
+    .scroll:
+    sub r0, r2                       ; the oldest rows go off the top
+    mov [firstrow], r0
+    mov [grows], r2
+    mov r0, r2
+    umul r0, GH
+    mov r1, [winh]
+    sub r1, r0                       ; the leftover sits above, so the last row is
+    mov [oy], r1                     ; flush with the bottom edge
+    ret
+
+
+; Flood the window with the background colour. Seed one pixel and repeatedly copy
+; the filled span onto itself, so a full-screen terminal costs ~log2(N) block copies
+; instead of a quarter of a million stores.
+fill_bg:
+    push r4                          ; span already filled
+    push r5                          ; remaining
+    push r6                          ; total bytes
+    mov r6, [winw]
+    mov r0, [winh]
+    umul r6, r0
+    umul r6, 4
+    cmp r6, 0
+    je .done
+    mov r0, [winbuf]
+    mov [r0], BG_COLOUR              ; seed pixel
+    mov r4, 4
+    .fill:
+        cmp r4, r6
+        juge .done
+        mov r5, r6
+        sub r5, r4                   ; what is still blank
+        cmp r4, r5
+        jule .use
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r5                   ; last, partial doubling
+        jmp .done
+        .use:
+        mov r0, [winbuf]
+        add r0, r4
+        mov r1, [winbuf]
+        cpy r1, r4
+        add r4, r4
+        jmp .fill
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; A one-pixel border, so the terminal reads as a window rather than as a hole in the
+; compositor's background - a tiling manager draws no frame of its own around a
+; window that is not focused.
+draw_frame:
+    mov r0, 0
+    mov [fx], r0
+    mov [fy], r0
+    mov r0, [winw]
+    mov [fw], r0
+    mov [fh], 1
+    mov [fc], FRAME_COLOUR
+    call fill_rect                   ; top
+    mov r0, [winh]
+    sub r0, 1
+    mov [fy], r0
+    mov [fc], FRAME_COLOUR
+    call fill_rect                   ; bottom
+    mov r0, 0
+    mov [fx], r0
+    mov [fy], r0
+    mov [fw], 1
+    mov r0, [winh]
+    mov [fh], r0
+    mov [fc], FRAME_COLOUR
+    call fill_rect                   ; left
+    mov r0, [winw]
+    sub r0, 1
+    mov [fx], r0
+    mov [fc], FRAME_COLOUR
+    call fill_rect                   ; right
+    ret
+
+
+; Rasterise the rows grid_origin selected. Blank cells are skipped - the background
+; is already there - which is most of a console most of the time.
+draw_grid:
+    push r4                          ; row, counted from the first one shown
+    push r5                          ; column
+    push r6                          ; address of this row in the grid
+    push r7                          ; columns
+    mov r7, [conbuf]
+    mov r4, 0
+    .rows:
+        mov r0, [grows]
+        cmp r4, r0
+        juge .done
+        mov r6, r4                   ; grid + (firstrow + row)*cols
+        mov r0, [firstrow]
+        add r6, r0
+        umul r6, r7
+        add r6, conbuf
+        add r6, CON_HDR
+        mov r5, 0
+        .cols:
+            cmp r5, r7
+            juge .nextrow
+            mov r0, r6
+            add r0, r5
+            mov8 r0, [r0]            ; the character in this cell
+            cmp r0, 32
+            jule .nextcol            ; blank / control -> nothing to draw
+            mov [gch], r0
+            mov r0, r5
+            umul r0, GW
+            mov r1, [ox]
+            add r0, r1
+            mov [gx], r0
+            mov r0, r4
+            umul r0, GH
+            mov r1, [oy]
+            add r0, r1
+            mov [gy], r0
+            mov [gc], FG_COLOUR
+            call draw_glyph
+            .nextcol:
+            add r5, 1
+            jmp .cols
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; A blinking block cursor: fill the cell, then redraw whatever character is under it
+; in the background colour, so the block reads as a cursor sitting on the text rather
+; than as a hole punched through it.
+draw_cursor:
+    mov r0, [blink]
+    cmp r0, 0
+    je .done                         ; the dark half of the blink
+    mov r0, conbuf
+    add r0, CON_COL_OFF
+    mov r0, [r0]
+    umul r0, GW
+    mov r1, [ox]
+    add r0, r1
+    mov [fx], r0
+    mov [gx], r0
+    mov r0, conbuf
+    add r0, CON_ROW_OFF
+    mov r0, [r0]
+    mov r1, [firstrow]
+    cmp r0, r1
+    jul .done                        ; scrolled off the top of a too-short window
+    sub r0, r1
+    umul r0, GH
+    mov r1, [oy]
+    add r0, r1
+    mov [fy], r0
+    mov [gy], r0
+    mov [fw], GW
+    mov [fh], GH
+    mov [fc], CURSOR_COLOUR
+    call fill_rect
+    call cursor_char
+    cmp r0, 32
+    jule .done                       ; nothing under it, so the block is the cursor
+    mov [gch], r0
+    mov [gc], BG_COLOUR
+    call draw_glyph
+    .done:
+    ret
+
+
+; The character in the cell the cursor is on, or 0 if the console reports a cursor
+; outside its own grid (which it should not, but the header and the grid are read as
+; one snapshot and indexing on a bad one would read past conbuf).
+cursor_char:
+    push r4                          ; columns
+    mov r4, [conbuf]
+    mov r0, conbuf
+    add r0, CON_COL_OFF
+    mov r0, [r0]
+    cmp r0, r4
+    juge .none
+    mov r1, conbuf
+    add r1, CON_ROW_OFF
+    mov r1, [r1]
+    mov r2, conbuf
+    add r2, 4
+    mov r2, [r2]                     ; rows
+    cmp r1, r2
+    juge .none
+    umul r1, r4                      ; row*cols + col
+    add r0, r1
+    add r0, conbuf
+    add r0, CON_HDR
+    mov8 r0, [r0]
+    pop r4
+    ret
+    .none:
+    mov r0, 0
+    pop r4
+    ret
+
+
+; ==========================
+;   Primitives
+; ==========================
+
+; Draw one 8x16 glyph from the embedded console font, clipped to the window. Inputs
+; (globals): gx, gy (top-left pixel), gch (character), gc (colour). Rows whose font
+; byte is zero are skipped - most of a glyph is empty and a full grid is over a
+; thousand of them, so this is the hot loop.
+draw_glyph:
+    push r4                          ; glyph row
+    push r5                          ; that row's font byte
+    push r6                          ; destination address of the row
+    push r7                          ; bit index within the row
+    mov r0, [gch]
+    cmp r0, FONT_GLYPHS
+    juge .done                       ; unmapped code -> draw nothing
+    umul r0, GH
+    add r0, font                     ; font + ch*16
+    mov [gsrc], r0
+    mov r4, 0
+    .rows:
+        cmp r4, GH
+        juge .done
+        mov r0, [gy]
+        add r0, r4                   ; py
+        mov r1, [winh]
+        cmp r0, r1
+        juge .done                   ; off the bottom of the window
+        mov r5, [gsrc]
+        add r5, r4
+        mov8 r5, [r5]                ; 1bpp row, MSB = leftmost pixel
+        cmp r5, 0
+        je .nextrow                  ; blank row
+        mov r1, [winw]               ; dst = winbuf + (py*winw + gx)*4
+        umul r0, r1
+        mov r1, [gx]
+        add r0, r1
+        umul r0, 4
+        mov r6, [winbuf]
+        add r6, r0
+        mov r7, 0
+        .bits:
+            cmp r7, GW
+            juge .nextrow
+            mov r0, 7                ; leftmost pixel is bit 7
+            sub r0, r7
+            mov r1, r5
+            shr r1, r0
+            and r1, 1
+            cmp r1, 0
+            je .nextbit
+            mov r0, [gx]
+            add r0, r7
+            mov r1, [winw]
+            cmp r0, r1
+            juge .nextrow            ; ran off the right edge
+            mov r0, r7
+            umul r0, 4
+            add r0, r6
+            mov r1, [gc]
+            mov [r0], r1
+            .nextbit:
+            add r7, 1
+            jmp .bits
+        .nextrow:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Fill a rectangle with a solid colour, clipped to the window. Inputs (globals):
+; fx, fy, fw, fh, fc. Assumes x, y >= 0.
+fill_rect:
+    push r4                          ; row
+    push r5                          ; py
+    push r6                          ; clipped width
+    push r7                          ; column counter
+    mov r4, 0
+    .rows:
+        mov r0, [fh]
+        cmp r4, r0
+        juge .done
+        mov r5, [fy]
+        add r5, r4                   ; py
+        mov r0, [winh]
+        cmp r5, r0
+        juge .done
+        mov r6, [fw]
+        mov r0, [fx]
+        add r0, r6
+        mov r1, [winw]
+        cmp r0, r1
+        jule .wok
+        mov r6, [winw]
+        mov r0, [fx]
+        sub r6, r0
+        .wok:
+        cmp r6, 0
+        jile .next
+        mov r0, r5                   ; dst = winbuf + (py*winw + x)*4
+        mov r1, [winw]
+        umul r0, r1
+        mov r1, [fx]
+        add r0, r1
+        umul r0, 4
+        mov r2, [winbuf]
+        add r0, r2
+        mov r1, [fc]
+        mov r7, r6
+        .cols:
+            mov [r0], r1
+            add r0, 4
+            sub r7, 1
+            cmp r7, 0
+            jne .cols
+        .next:
+        add r4, 1
+        jmp .rows
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Data
+; ==========================
+
+winbuf:
+    d32 0                            ; the sbrk'd pixel buffer
+winw:
+    d32 1                            ; the size we are currently drawing at, until
+winh:                                ; the first resync reports the granted one
+    d32 1
+wantw:
+    d32 0                            ; the size we asked wcreate for
+wanth:
+    d32 0
+lastcfg:
+    d32 0                            ; last config counter we adopted
+lastseq:
+    d32 0                            ; last session change counter we drew
+mode:
+    d32 MODE_PTY                     ; MODE_PTY: our own session and shell
+ptyidx:
+    d32 -1                           ; the session we claimed, -1 if none
+shellpid:
+    d32 0                            ; the shell we started in it, 0 if none
+argcount:
+    d32 0
+argvec:
+    d32 0
+blink:
+    d32 1                            ; cursor phase: 1 = block shown
+dirty:
+    d32 1                            ; redraw pending (the first frame always is)
+ox:
+    d32 0                            ; top-left pixel of the character grid
+oy:
+    d32 0
+firstrow:
+    d32 0                            ; first grid row shown, and how many of them -
+grows:                               ; not the whole grid when the window is short
+    d32 0
+
+memerr:
+    dstr "term: out of memory\n"
+memerr_end:
+winerr:
+    dstr "term: cannot create a window\n"
+winerr_end:
+ptyerr:
+    dstr "term: no free terminal session\n"
+ptyerr_end:
+consolearg:
+    dstr "console\0"
+shpath:
+    dstr "/bin/sh\0"
+ptypath:
+    dstr "/dev/pty0\0"                ; the digit is patched in at startup
+
+; ---- the console font -------------------------------------------------------
+; The same 8x16 blob the kernel console rasterises with, embedded here because a
+; client has no way to ask the kernel to draw text for it - and should not, since
+; drawing is what a client does.
+font:
+    dfile "../../build/font.bin"
+
+; ---- buffers ----------------------------------------------------------------
+cfgbuf:
+    res8 12                          ; wconfig: width, height, config counter
+conbuf:
+    res8 CONBUF_BYTES                ; snapshot header + character grid
+psbuf:
+    res8 PS_REC_MAX * PSREC_BYTES    ; one pslist snapshot, to watch our shell
+
+; ---- draw_glyph inputs ------------------------------------------------------
+gx:
+    d32 0
+gy:
+    d32 0
+gch:
+    d32 0
+gc:
+    d32 0
+gsrc:
+    d32 0                            ; font address of the glyph being drawn
+
+; ---- fill_rect inputs -------------------------------------------------------
+fx:
+    d32 0
+fy:
+    d32 0
+fw:
+    d32 0
+fh:
+    d32 0
+fc:
+    d32 0

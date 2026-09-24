@@ -2,7 +2,7 @@
 ; stdin (fd 0) and writing a response to stdout (fd 1). The tty echoes what you
 ; type; pressing Enter delivers the line. Proves the PPU console does real text
 ; output and keyboard input through the ordinary read/write syscalls.
-#include "sys.cat"
+#include "lib/sys.cat"
 
     sys_write 1, banner, banner_end - banner
 conloop:

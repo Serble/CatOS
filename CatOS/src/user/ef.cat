@@ -10,7 +10,7 @@
 ; The whole file is read into a buffer, so it can only edit files up to EF_INBUF
 ; bytes; larger files are refused rather than truncated. append creates the file
 ; if it does not exist; replace/delete/print require it to exist.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define EF_INBUF, 4096               ; largest file we will load/edit
 #define EF_OUTBUF, 4608              ; room for the rewritten file (+ slack)

@@ -1,0 +1,89 @@
+; This file contains a bunch of string util methods
+
+; get the pos of the next eol, returns the addr of the last character in the line
+; r1 - start addr
+; r2 - last valid addr
+get_eol:
+    .loop:
+        mov r3, [r1]
+        cmp r3, '\n'
+        je .found
+
+        cmp r3, '\0'
+        je .found
+
+        cmp r1, r2
+        je .found         ; end of buffer
+
+        add r1, 1         ; keep going
+        jmp .loop
+
+    .found:
+    mov r0, r1            ; eol is just wherever we are now
+    ret
+
+
+; jump to %2 if %1 is a trimmable char
+#macro jump_if_trimmable, 2
+    cmp %1, ' '
+    je %2
+    
+    cmp %1, '\t'
+    je %2
+    
+    cmp %1, '\n'
+    je %2
+#endmacro
+
+
+; takes a buffer section and specifies the new start and end to trim it
+; new start and end are inclusive
+; r1 - buff start
+; r2 - last valid buff addr (buff end), or more simply the end of the section
+; r3 - ptr to out parameter for the end pos
+; returns the start pos in r0 or -1 if the result is empty
+trim_str_inbuff:
+    .start_loop:
+        mov r0, [r1]       ; grab the char here
+        
+        ; check if it's a trimmable char, if so keep trimming
+        jump_if_trimmable r0, .start_trimmable
+        
+        ; okay this is non trimmable, start is here
+        jmp .start_non_trimmable
+        
+        .start_trimmable:
+        cmp r1, r2         ; are we already at the end
+        jmp .empty_result
+        
+        add r1, 1          ; move the next char
+        jmp .start_loop
+        
+        .empty_result:
+        mov r0, 0
+        ret                ; just early return with our result
+        
+        .start_non_trimmable:
+    
+    ; the start is now finalised in r1
+    mov r0, r1             ; set the result of that
+    
+    .end_loop:
+        mov r1, [r2]
+        
+        ; check if it's trimmable
+        jump_if_trimmable r1, .end_trimmable
+        
+        jmp .end_non_trimmable
+        
+        .end_trimmable:
+        sub r2, 1           ; move one backwards
+        jmp .end_loop
+        
+        .end_non_trimmable:
+    
+    ; we can set the end result now
+    mov [r3], r2
+    
+    ; r0 is already set
+    ret

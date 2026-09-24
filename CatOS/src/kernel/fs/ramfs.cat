@@ -321,6 +321,7 @@ ramfs_ops:
     d32 ramfs_truncate           ; OP_TRUNCATE
     d32 0                        ; OP_STAT
     d32 0                        ; OP_SYNC
+    d32 0                        ; OP_RENAME
 
 ramfs_name:
     dstr "ramfs\0"

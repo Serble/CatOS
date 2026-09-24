@@ -42,6 +42,12 @@
 #define DISP_CLEAR, 8
 #define DISP_PRESENT, 12
 
+#define CON_INTR, 3              ; the interrupt character (Ctrl+C). A *character*,
+                                 ; not a keycode: the keyboard layout says what
+                                 ; CTRL and a letter make (raylibppu.cat), so a line
+                                 ; discipline recognises the interrupt key without
+                                 ; knowing anything about keyboards - and so does a
+                                 ; pty, which has no keyboard in front of it at all.
 #define CON_LINE_MAX, 255        ; longest editable input line
 #define CON_RING_SIZE, 512       ; completed-input byte ring capacity
 #define CON_MAX_COLS, 64         ; mirror capacity - must fit every backend's
@@ -588,8 +594,8 @@ console_ring_push:
 
 ; Feed one input character through the line discipline. Printable characters are
 ; echoed and buffered; backspace edits the line; Enter commits the whole line
-; (with a trailing newline) to the ring and wakes any blocked reader. Called by
-; an input backend (e.g. the keyboard ISR).
+; (with a trailing newline) to the ring and wakes any blocked reader; Ctrl+C
+; interrupts (see below). Called by an input backend (e.g. the keyboard ISR).
 ; r1 - character (ASCII)
 console_input_char:
     push r4
@@ -600,6 +606,12 @@ console_input_char:
     je .enter
     cmp r4, 8                    ; Backspace
     je .backspace
+    cmp r4, CON_INTR             ; Ctrl+C
+    je .intr
+    cmp r4, 32                   ; every other control code - a chord this line
+    jul .ret                     ; discipline has no meaning for, and Tab, which
+                                 ; the shell would only have split a token on -
+                                 ; types nothing rather than a stray glyph
 
     mov r0, [console_linelen]    ; printable: buffer + echo
     cmp r0, CON_LINE_MAX
@@ -648,6 +660,44 @@ console_input_char:
     mov r0, 0
     mov [console_linelen], r0
     mov r1, [console_node]       ; wake anyone blocked reading the console
+    call proc_wakeup
+    jmp .ret
+
+    ; Ctrl+C. Two things can be worth interrupting and which one it is depends on
+    ; what is running, so both are handled: the half-typed line is always thrown
+    ; away, and if this terminal has a foreground job then it is signalled as well.
+    ; proc_tty_intr (proc/proc.cat) decides which processes those are; when it says
+    ; none, the shell is sitting at a prompt and losing the line is the whole of it.
+    ;
+    ; The line goes rather than being committed because it was never a command: what
+    ; you have typed so far is exactly what you have just said you do not want. "^C"
+    ; is echoed the way a real terminal does, so the transcript shows where the
+    ; interruption landed, and the newline puts the next prompt on its own line.
+    ;
+    ; When there was no job to signal, an *empty* line is committed. The reader is
+    ; blocked halfway through a line it is never going to get, and a shell only
+    ; prints a prompt when a read completes - so without this the interruption would
+    ; leave the screen sitting there with no prompt on it until you typed a whole
+    ; command. Nothing is needed in the signalled case: the shell is in wait(), and
+    ; it prompts by itself the moment the job it is waiting for dies.
+    .intr:
+    mov r1, 94                   ; '^'
+    call console_putc
+    mov r1, 67                   ; 'C'
+    call console_putc
+    mov r1, 10
+    call console_putc
+    call disp_present
+    mov r0, 0
+    mov [console_linelen], r0
+    mov r1, consolepath
+    mov r2, [console_node]
+    call proc_tty_intr
+    cmp r0, 0
+    jne .ret                     ; something was signalled: it prompts for itself
+    mov r1, 10                   ; nothing was: hand the reader a blank line
+    call console_ring_push
+    mov r1, [console_node]
     call proc_wakeup
 
     .ret:
@@ -731,6 +781,7 @@ console_ops:
     d32 0                        ; OP_TRUNCATE
     d32 0                        ; OP_STAT
     d32 0                        ; OP_SYNC
+    d32 0                        ; OP_RENAME
 
 consolename:
     dstr "console\0"

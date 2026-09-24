@@ -629,6 +629,61 @@ input_key_h:
     jmp sysret
 
 
+; SYS_CONKEY (r2 = key event word): put a keystroke into the console's line
+; discipline, exactly as the keyboard ISR would have done had nothing grabbed it.
+; Always returns 0 - a key that types nothing is dropped, not an error.
+;
+; This is the other half of SYS_CONREAD, and it exists for the same reason. conread
+; lets a graphical program *see* the console session; without a way back in, that
+; program can only ever be a display, because a window manager holding the keyboard
+; (keygrab(-1)) is precisely what stops the shell hearing anything. A terminal
+; emulator is a window that does both - draws the mirror and feeds the keys posted
+; to it back down - and neither half is useful alone.
+;
+; It lives here rather than in console.cat because it takes a *key event* apart, and
+; the rule this file exists to enforce is that nothing outside it names a bit
+; position. The console still only ever sees a character, from the same layout the
+; keyboard driver's characters come out of, so a bare arrow key - which produces no
+; character by design - simply types nothing, and Ctrl+C arrives as the character 3
+; because that is what the layout says it is. The interrupt key is therefore the
+; line discipline's business (console.cat), not this file's: nothing here has to
+; know that one of those characters means something other than "type this".
+;
+; Any process may call it. That grants nothing: a pid is not a capability here,
+; there are no privilege levels for one shell to have over another, and every
+; process can already *write* to /dev/console. Injecting a keystroke is no more
+; than what the physical keyboard does, and the keyboard is not owned either.
+;
+; The line discipline is bracketed with di/ei because this is the first thing to
+; reach it from outside an interrupt handler. Syscalls run with interrupts on, so a
+; real keypress could otherwise land in console_input_char while an injected one is
+; halfway through it and mangle the line both are editing. That window is usually
+; shut by the window manager holding the keyboard - a grabbed key never reaches the
+; console at all - but it opens for as long as it takes a program to drain a ring
+; the manager filled before releasing the screen, and "usually" is not a basis for
+; shared mutable state.
+sys_conkey_h:
+    mov r0, r2
+    and r0, KEV_UP
+    cmp r0, 0
+    jne .drop                        ; a release types nothing
+    mov r0, r2
+    and r0, KEV_MODKEY
+    cmp r0, 0
+    jne .drop                        ; the shift key itself types nothing
+    mov r1, r2
+    shr r1, KEV_CHAR_SHIFT
+    and r1, KEV_CHAR_MASK
+    cmp r1, 0
+    je .drop                         ; a chord, an arrow, a function key
+    di                               ; see below
+    call console_input_char          ; echoes, edits or commits the line
+    ei
+    .drop:
+    mov r0, 0
+    jmp sysret
+
+
 ; SYS_KEYGRAB (r2 = keycode, r3 = 1 to grab / 0 to release): the screen's owner
 ; declares which keys should come to it instead of to the console. This is how a
 ; window manager gets its shortcuts without the kernel knowing what any key means.

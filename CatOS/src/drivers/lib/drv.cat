@@ -1,0 +1,55 @@
+; ==========================
+;   Driver-side call wrappers
+; ==========================
+; The DRVC_* driver calls as macros, the driver counterpart of user/lib/sys.cat.
+; Include this first in a driver: it pulls in the ABI (drvabi.cat) and emits no
+; code, so the descriptor that has to open the image still comes first.
+;
+; Like the sys_* macros they return in r0, clobber r1-r3 (which carry the call
+; and its arguments) and preserve r4-r7.
+
+#include "drvabi.cat"
+
+; log(string) -> 0 / -1. $1 = address of a NUL-terminated string.
+#macro drv_log, 1
+    mov r2, $1
+    mov r1, DRVC_LOG
+    syscall
+#endmacro
+
+; publish(name, cookie) -> 0 / -1. $1 = address of the name, $2 = cookie.
+#macro drv_publish, 2
+    mov r3, $2
+    mov r2, $1
+    mov r1, DRVC_PUBLISH
+    syscall
+#endmacro
+
+; wakeup(cookie) -> 0. $1 = cookie.
+#macro drv_wakeup, 1
+    mov r2, $1
+    mov r1, DRVC_WAKEUP
+    syscall
+#endmacro
+
+; claimint(vector) -> 0 / -1. $1 = vector.
+#macro drv_claimint, 1
+    mov r2, $1
+    mov r1, DRVC_CLAIMINT
+    syscall
+#endmacro
+
+; physbase() -> physical address of driver address 0.
+#macro drv_physbase, 0
+    mov r1, DRVC_PHYSBASE
+    syscall
+#endmacro
+
+; The descriptor's name field: the string, then zeroes to fill DRV_NAMELEN.
+; $1 = a quoted name with its terminator, e.g. drv_name "hello\0".
+#macro drv_name, 1
+drv_name_start:
+    dstr $1
+drv_name_end:
+    res8 DRV_NAMELEN - (drv_name_end - drv_name_start)
+#endmacro

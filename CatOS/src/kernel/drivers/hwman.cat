@@ -7,6 +7,11 @@
 ; devices and hands each one to the matching driver, which typically publishes
 ; a node under /dev. Devices with no registered driver are skipped.
 ;
+; Each device also records who owns it (HWDEV_OWNER): nobody, the kernel (a
+; built-in driver bound it, or a kernel service such as the scheduler's timer
+; reserved it with hwclaim), or a loaded driver. That is how drvhost.cat knows
+; which devices are left over for the drivers in /drivers.
+;
 ; Enumeration uses the hardware manager's "list devices" command only (it emits
 ; a count followed by a (port, type) pair per device); the write-0 auto-probe
 ; is not used because not every device supports it.
@@ -23,7 +28,11 @@
 ; enumerated device record
 #define HWDEV_PORT, 0
 #define HWDEV_TYPE, 4
-#define HWDEV_STRUCT, 8
+#define HWDEV_OWNER, 8           ; 0 = nobody, HWOWN_KERNEL, or a loaded driver's
+                                 ; record (drvhost.cat)
+#define HWDEV_STRUCT, 12
+
+#define HWOWN_KERNEL, 1          ; owned by a built-in driver or a kernel service
 
 ; driver registry record
 #define HWDRV_TYPE, 0
@@ -63,6 +72,7 @@ hwscan:
         in r2, HWMAN_PORT         ; type
         vstore r6, HWDEV_PORT, r1, r3
         vstore r6, HWDEV_TYPE, r2, r3
+        vstore r6, HWDEV_OWNER, 0, r3
         add r6, HWDEV_STRUCT
         add r5, 1
         jmp .loop
@@ -188,6 +198,8 @@ devscan:
         mov r2, r0                ; unit index
         vload r1, r6, HWDEV_PORT
         call r7                   ; bindfn(port, unit)
+        mov r0, HWOWN_KERNEL      ; a type with a built-in driver is the kernel's,
+        vstore r6, HWDEV_OWNER, r0, r1 ; whatever the bind made of it
         .next:
         add r6, HWDEV_STRUCT
         add r5, 1
@@ -200,6 +212,69 @@ devscan:
     ret
 
 
+; Reserve a device for the kernel without binding a driver to it - for a device
+; a kernel service drives directly, which would otherwise look unowned.
+; r1 - the device's port
+; returns r0 = 0, or -1 if no device is on that port or someone owns it already
+hwclaim:
+    push r4                      ; devices left
+    mov r4, [hwdevcount]
+    mov r2, hwdevs
+    .loop:
+        cmp r4, 0
+        je .fail
+        vload r0, r2, HWDEV_PORT
+        cmp r0, r1
+        je .found
+        add r2, HWDEV_STRUCT
+        sub r4, 1
+        jmp .loop
+    .found:
+    vload r0, r2, HWDEV_OWNER
+    cmp r0, 0
+    jne .fail
+    vstore r2, HWDEV_OWNER, HWOWN_KERNEL, r3
+    mov r0, 0
+    jmp .done
+    .fail:
+    mov r0, -1
+    .done:
+    pop r4
+    ret
+
+
+; Count the devices nobody owns.
+; r1 - a device type to count only that type, or 0 for any
+; returns r0 = the count
+hwunowned:
+    push r4                      ; devices left
+    push r5                      ; cursor
+    mov r4, [hwdevcount]
+    mov r5, hwdevs
+    mov r0, 0
+    .loop:
+        cmp r4, 0
+        je .done
+        vload r2, r5, HWDEV_OWNER
+        cmp r2, 0
+        jne .next
+        cmp r1, 0
+        je .count
+        vload r2, r5, HWDEV_TYPE
+        cmp r2, r1
+        jne .next
+        .count:
+        add r0, 1
+        .next:
+        add r5, HWDEV_STRUCT
+        sub r4, 1
+        jmp .loop
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
 ; Power controls (thin wrappers over the hardware manager).
 hwhalt:
     out HWMAN_PORT, HWMAN_HALT
@@ -207,6 +282,19 @@ hwhalt:
 hwshutdown:
     out HWMAN_PORT, HWMAN_SHUTDOWN
     ret
+
+; Reboot: reset the machine and come back up through the firmware, which wipes
+; memory and reloads us off the disk.
+;
+; Interrupts go on first: the firmware waits on the disk completion interrupt to
+; load us again, the reset leaves the VM's interrupt-enable state as it was, and
+; nothing runs between the reset and the firmware's own setup to turn them on.
+; Stopping the timer only keeps a stray tick from arriving during that window -
+; the firmware ignores it either way, but a reboot should leave as little in
+; flight as it can.
+;
+; Never returns.
 hwreset:
+    call timerstop
+    ei
     out HWMAN_PORT, HWMAN_RESET
-    ret

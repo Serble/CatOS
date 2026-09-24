@@ -1,0 +1,106 @@
+; drvload - load a driver and bind it to the devices it drives.
+;
+;   drvload <path>...
+;
+; The kernel loads the drivers in /drivers by itself at boot, but only the ones
+; with a device waiting for them. drvload is for the rest: a driver just
+; written, one kept somewhere else, one whose device the boot had no use for,
+; or one that drives nothing at all. Like mount it says nothing when it works -
+; a driver usually announces itself, and drvlist shows what it took. Loading is
+; for good (there is no unloading), and a driver of a given name loads once.
+#include "lib/sys.cat"
+
+main:
+    mov r5, r1                       ; argc
+    mov r6, r2                       ; argv
+    cmp r5, 2
+    jul .usage
+    mov r7, 1                        ; argument index
+    mov r4, 0                        ; exit code: 1 once anything fails
+    .next:
+        cmp r7, r5
+        juge .done
+        mov r0, r7
+        shl r0, 2
+        add r0, r6
+        mov r0, [r0]
+        mov [path], r0
+        sys_drvload r0
+        cmp r0, 0
+        jige .loaded
+        call report
+        mov r4, 1
+        .loaded:
+        add r7, 1
+        jmp .next
+    .done:
+    sys_exit r4
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+
+
+; Print "drvload: <path>: <why>" for the DRVE_* error in r0.
+report:
+    push r4                          ; error, then its message
+    mov r4, r0
+    mov r1, prefix
+    call emit_str
+    mov r1, [path]
+    call emit_str
+    mov r1, sep
+    call emit_str
+    mov r0, 0                        ; DRVE_NOFILE (-1) is entry 0, and so on
+    sub r0, r4
+    sub r0, 1
+    cmp r0, DRVE_COUNT
+    jul .known
+    mov r1, eunknown
+    jmp .say
+    .known:
+    shl r0, 2
+    add r0, errors
+    mov r1, [r0]
+    .say:
+    call emit_str
+    call flush
+    pop r4
+    ret
+
+
+path:
+    d32 0                            ; the argument being loaded, for report
+
+#define DRVE_COUNT, 6
+errors:                              ; indexed by -1 - DRVE_*
+    d32 enofile
+    d32 eformat
+    d32 enomem
+    d32 efull
+    d32 einit
+    d32 eloaded
+
+usage:
+    dstr "usage: drvload <path>...\n"
+usage_end:
+prefix:
+    dstr "drvload: \0"
+sep:
+    dstr ": \0"
+enofile:
+    dstr "cannot open it\n\0"
+eformat:
+    dstr "not a driver, or built for another kernel\n\0"
+enomem:
+    dstr "not enough memory\n\0"
+efull:
+    dstr "too many drivers loaded\n\0"
+einit:
+    dstr "its init failed\n\0"
+eloaded:
+    dstr "a driver of that name is already loaded\n\0"
+eunknown:
+    dstr "failed\n\0"
+
+#include "lib/fmt.cat"

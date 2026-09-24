@@ -20,7 +20,7 @@
 ; The pixel buffer is sbrk'd at the largest size the screen could ever grant, so a
 ; resize never needs to reallocate here. It also could not live in the program
 ; image: a screen-sized buffer is far past what CatFS will hold in one file.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define WANT_W, 320                  ; the size we would like
 #define WANT_H, 200

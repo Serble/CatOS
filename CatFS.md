@@ -157,9 +157,21 @@ The **descriptor** block holds `count` little-endian `u32` target block numbers
 — the real (partition-relative) destination of each journalled data block.
 
 A transaction can hold at most `min(128, journal_blocks - 2)` block writes. A
-single high-level operation (create, mkdir, one chunk of a write, unlink) always
-fits; large file writes are split into several transactions (so a big write is
-not globally atomic, but the filesystem is always consistent between them).
+single high-level operation (create, mkdir, one chunk of a write, unlink,
+rename) always fits; large file writes are split into several transactions (so a
+big write is not globally atomic, but the filesystem is always consistent
+between them).
+
+A filesystem may sit inside a file on another CatFS. Nothing in the on-disk format
+changes for that case - the inner image is an ordinary partitioned file - but the driver
+has to keep the two instances' scratch buffers apart, which is what `catfs_bounce` in
+`fs/catfs.cat` is for. The practical limit is the file size cap: 136 blocks.
+
+A rename is one transaction covering both halves — clearing the old directory
+entry and writing the new one — so a crash mid-rename replays both or neither
+and the entry can never be lost or duplicated. Because a directory stores no
+`.` or `..` entry, moving a directory rewrites nothing inside it: only the two
+parent directories' entry tables change, and the inode is untouched.
 
 ### 6.1 Commit protocol
 
@@ -194,9 +206,14 @@ transaction is simply discarded.
 * **`CatOS/tools/catfs_fuse.py`** — a FUSE driver so a CatFS image can be
   mounted on a normal Linux host for creating and inspecting filesystems.
 * **`CatOS/catfs.cat`** — the CatOS driver: a VFS filesystem that can serve as
-  the root `/`.
+  the root `/`. Several instances can be mounted at once, including one inside a
+  file on another.
+* **`CatOS/src/user/catpart.cat`** — `catpart mkfs`, the in-OS formatter. It is
+  the userland twin of `mkfs_catfs.py` and its layout arithmetic mirrors
+  `plan_layout()`, so a partition formatted inside CatOS mounts on the host and
+  vice versa.
 
-All four share this document as their single source of truth for the format.
+All five share this document as their single source of truth for the format.
 
 --------------------------------------------------------------------------------
 

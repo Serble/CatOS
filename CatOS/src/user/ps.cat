@@ -16,7 +16,7 @@
 ; A process shows as "run" only if it is the one asking - anything else was
 ; descheduled to let ps run. "zombie" means it has exited but nothing has waited
 ; on it yet, so it still holds a slot (see the reaping note in the kernel).
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define LINEMAX, 64                  ; comfortably wider than the widest row
 #define PIDCOL, 5                    ; column widths, right-aligned

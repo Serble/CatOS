@@ -7,7 +7,7 @@
 ; compute a deadline = now + <ms> once, then poll uptms and sys_yield until the
 ; deadline is reached. Yielding keeps the sleep cooperative - other processes run
 ; while we wait rather than us hogging a scheduling quantum spinning.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 main:
     mov r5, r1                       ; argc  (r5-r7 survive syscalls)

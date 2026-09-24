@@ -1,0 +1,910 @@
+; ==========================
+;   CatOS pseudo-terminals
+; ==========================
+; A pty is a text session with nobody at either end of it: a character grid, a
+; cursor, a line discipline and an input ring, exactly as io/console.cat has - but
+; with no display hardware behind it and no keyboard in front of it. A program
+; writes to it and the characters land in the grid; something else snapshots that
+; grid and draws it, and pushes keystrokes back in. That something else is a
+; terminal emulator, and it is an ordinary user program (src/user/term.cat).
+;
+; This is what makes several terminals a real thing rather than several views of
+; one. The console is a *machine* resource - there is one screen and one keyboard,
+; so there is one line discipline and one shell reading it, and a second window
+; showing it is a second head on the same session. A pty is a *process* resource:
+; claim one, point your stdio at it, spawn a shell, and that shell is reading your
+; ring and writing your grid while every other terminal does the same in its own.
+; Two shells can then be busy with different things at once, which is the entire
+; point.
+;
+; The grid a snapshot hands back is byte-for-byte the layout SYS_CONREAD uses -
+; a PTY_HDR header of columns, rows, cursor column, cursor row and a change
+; counter, then the cells row-major. That is deliberate: a terminal emulator
+; rasterises a pty and the console with the same code, and only the two calls that
+; fetch and feed differ.
+;
+;
+; -- What is NOT here ---------------------------------------------------------
+;
+; No reflow. The console reflows because its geometry is imposed on it from
+; outside (whatever display or window manager owns the screen); a pty's geometry is
+; chosen by the program that created it, at creation, so there is nothing to
+; reflow *to*. A terminal whose window is resized shows more or less of its grid -
+; that is its business, not the kernel's.
+;
+; No hardware. The console's display vtable, its scroll-the-backend call and its
+; repaint-on-attach all exist to drive a screen. A pty has no screen; the grid is
+; the whole of its output.
+;
+;
+; -- Lifetime -----------------------------------------------------------------
+;
+; The /dev/ptyN nodes are all published at boot and never removed - devfs can add
+; a node but not take one away, and more importantly a node that vanished while a
+; shell held it open would leave that shell reading a dangling handle. So the node
+; is permanent and the *session* is what gets claimed and released: reading or
+; writing an unclaimed pty fails, which is what a shell whose terminal has gone
+; sees. pty_reap frees whatever a dying process owned, so a terminal emulator that
+; crashes does not take its slot with it.
+
+#define PTY_MAX, 4               ; sessions, and therefore /dev/ptyN nodes
+#define PTY_COLS_MAX, 64         ; the largest grid one can be created with -
+#define PTY_ROWS_MAX, 24         ; 64x24 is the console mirror's capacity too
+#define PTY_LINE_MAX, 255        ; longest editable input line
+#define PTY_RING_SIZE, 512       ; completed-input byte ring capacity
+#define PTY_HDR, 20              ; snapshot header: cols, rows, col, row, seq
+#define PTY_NAME_MAX, 12         ; "/dev/ptyN" and room to grow
+
+; One session. Laid out so the three buffers sit at the end, since only the head
+; is ever touched a field at a time.
+#define PTY_INUSE, 0             ; 0 = free
+#define PTY_PID, 4               ; the process that claimed it
+#define PTY_NODE, 8              ; its /dev/ptyN node, and the wake channel
+#define PTY_COLS, 12
+#define PTY_ROWS, 16
+#define PTY_COL, 20              ; cursor
+#define PTY_ROW, 24
+#define PTY_SEQ, 28              ; bumped whenever the grid or the cursor moves
+#define PTY_LINELEN, 32          ; characters in the line being edited
+#define PTY_RHEAD, 36            ; input ring, single reader / single writer
+#define PTY_RTAIL, 40
+#define PTY_LINE, 44             ; PTY_LINE_MAX + 1
+#define PTY_RING, 300            ; PTY_LINE + 256
+#define PTY_CELLS, 812           ; PTY_RING + PTY_RING_SIZE
+#define PTY_STRUCT, 2348         ; PTY_CELLS + PTY_COLS_MAX * PTY_ROWS_MAX
+
+
+; ==========================
+;   State
+; ==========================
+
+pty_table:
+    res8 PTY_MAX * PTY_STRUCT
+
+pty_namebuf:
+    res8 PTY_NAME_MAX            ; "/dev/ptyN" is built here at boot
+
+pty_devname:
+    dstr "ptyN\0"                ; the devfs name, digit patched per slot
+pty_pathpfx:
+    dstr "/dev/\0"
+
+
+; ==========================
+;   Slot helpers
+; ==========================
+
+; Address of session r1. No bounds check - callers that take an index from user
+; mode go through pty_lookup instead.
+pty_slot:
+    mov r0, r1
+    umul r0, PTY_STRUCT
+    add r0, pty_table
+    ret
+
+
+; Resolve a user-supplied index to a live session owned by the caller.
+; r1 = index -> r0 = slot address, or 0.
+;
+; Ownership is checked because a session index is a slot number, not a capability,
+; and the two calls that use it - reading the grid and typing into it - are exactly
+; the terminal emulator's side of the session. (Writing goes through the node and
+; is not restricted: that is a program's stdout, and /dev/console has never been
+; privileged either.)
+pty_lookup:
+    push r4                      ; slot
+    push r5                      ; the calling process
+    cmp r1, 0
+    jil .none
+    cmp r1, PTY_MAX
+    juge .none
+    call pty_slot
+    mov r4, r0
+    vload r0, r4, PTY_INUSE
+    cmp r0, 0
+    je .none
+    mov r5, [curproc]
+    cmp r5, 0
+    je .none
+    vload r0, r4, PTY_PID
+    vload r1, r5, PCB_PID
+    cmp r0, r1
+    jne .none                    ; somebody else's terminal
+    mov r0, r4
+    pop r5
+    pop r4
+    ret
+    .none:
+    mov r0, 0
+    pop r5
+    pop r4
+    ret
+
+
+; Find the session a /dev/ptyN node belongs to. r1 = node -> r0 = slot, or 0 if
+; the node's session has been released.
+pty_from_node:
+    push r4
+    vload r4, r1, NODE_FSDATA    ; the index, stashed when the node was published
+    mov r1, r4
+    call pty_slot
+    mov r4, r0
+    vload r0, r4, PTY_INUSE
+    cmp r0, 0
+    je .none
+    mov r0, r4
+    pop r4
+    ret
+    .none:
+    mov r0, 0
+    pop r4
+    ret
+
+
+; Blank a session's whole grid - the full capacity, not just the live geometry, so
+; a slot handed out again never shows the last tenant's characters. r1 = slot.
+pty_clear:
+    push r4                      ; cells cursor
+    push r5                      ; remaining
+    mov r4, r1
+    add r4, PTY_CELLS
+    mov r5, PTY_COLS_MAX
+    umul r5, PTY_ROWS_MAX
+    .loop:
+        cmp r5, 0
+        je .done
+        mov8 [r4], 0
+        add r4, 1
+        sub r5, 1
+        jmp .loop
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Output
+; ==========================
+
+; Record one glyph in the grid, dropping a cell outside the live geometry rather
+; than scribbling past it. r1 = slot, r2 = column, r3 = row, r0 = character.
+pty_cell_put:
+    push r4                      ; the character, read before anything clobbers r0
+    push r5                      ; columns
+    push r6                      ; cell address
+    mov r4, r0
+    vload r5, r1, PTY_COLS
+    cmp r2, r5
+    juge .done
+    vload r6, r1, PTY_ROWS
+    cmp r3, r6
+    juge .done
+    mov r6, r3                   ; cells + row*cols + col
+    umul r6, r5
+    add r6, r2
+    add r6, r1
+    add r6, PTY_CELLS
+    mov8 [r6], r4
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Shift the grid up one row and blank the last. Copied row by row so the source
+; and destination of each `cpy` never overlap. r1 = slot.
+pty_scroll:
+    push r4                      ; row
+    push r5                      ; columns
+    push r6                      ; slot
+    push r7                      ; rows
+    mov r6, r1
+    vload r5, r6, PTY_COLS
+    vload r7, r6, PTY_ROWS
+    mov r4, 0
+    .rows:
+        mov r0, r7
+        sub r0, 1
+        cmp r4, r0
+        juge .last
+        mov r0, r4               ; dst = cells + row*cols
+        umul r0, r5
+        add r0, r6
+        add r0, PTY_CELLS
+        mov r1, r0               ; src = the row below it
+        add r1, r5
+        cpy r1, r5
+        add r4, 1
+        jmp .rows
+    .last:
+    mov r0, r7                   ; blank the row that scrolled in
+    sub r0, 1
+    umul r0, r5
+    add r0, r6
+    add r0, PTY_CELLS
+    mov r1, r5
+    .blank:
+        cmp r1, 0
+        je .done
+        mov8 [r0], 0
+        add r0, 1
+        sub r1, 1
+        jmp .blank
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Emit one character at the cursor, handling newline, carriage return, backspace
+; and wrapping/scrolling - the same rules console_putc applies, with the display
+; calls left out because there is no display. r1 = slot, r2 = character.
+pty_putc:
+    push r4                      ; slot
+    push r5                      ; character
+    push r6                      ; scratch
+    mov r4, r1
+    mov r5, r2
+    vload r0, r4, PTY_SEQ        ; the grid or the cursor is about to move; bumping
+    add r0, 1                    ; here also catches a bare newline
+    vstore r4, PTY_SEQ, r0, r6
+    cmp r5, 10                   ; \n
+    je .newline
+    cmp r5, 13                   ; \r -> ignore
+    je .done
+    cmp r5, 8                    ; backspace
+    je .backspace
+
+    mov r1, r4                   ; the glyph goes at the cursor
+    vload r2, r4, PTY_COL
+    vload r3, r4, PTY_ROW
+    mov r0, r5
+    call pty_cell_put
+    vload r0, r4, PTY_COL
+    add r0, 1
+    vstore r4, PTY_COL, r0, r6
+    vload r6, r4, PTY_COLS
+    cmp r0, r6
+    jul .done
+    jmp .newline                 ; wrapped past the last column
+
+    .backspace:
+    vload r0, r4, PTY_COL
+    cmp r0, 0
+    je .done                     ; already at column 0
+    sub r0, 1
+    vstore r4, PTY_COL, r0, r6
+    mov r1, r4                   ; erase by writing a space over it
+    mov r2, r0
+    vload r3, r4, PTY_ROW
+    mov r0, 32
+    call pty_cell_put
+    jmp .done
+
+    .newline:
+    mov r0, 0
+    vstore r4, PTY_COL, r0, r6
+    vload r0, r4, PTY_ROW
+    add r0, 1
+    vload r6, r4, PTY_ROWS
+    cmp r0, r6
+    jul .setrow
+    mov r1, r4                   ; off the bottom -> scroll, stay on the last row
+    call pty_scroll
+    vload r0, r4, PTY_ROWS
+    sub r0, 1
+    .setrow:
+    vstore r4, PTY_ROW, r0, r6
+
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; /dev/ptyN write(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes written, or -1
+; if the session behind this node has been released. buf is a physical address.
+pty_write:
+    push r4                      ; buffer
+    push r5                      ; remaining
+    push r6                      ; slot
+    push r7                      ; len slot
+    call pty_from_node
+    cmp r0, 0
+    je .gone
+    mov r6, r0
+    mov r4, r3
+    mov r7, sp
+    add r7, 20
+    mov r5, [r7]
+    mov r7, r5                   ; the count to report back
+    .loop:
+        cmp r5, 0
+        je .done
+        mov r1, r6
+        mov8 r2, [r4]
+        call pty_putc
+        add r4, 1
+        sub r5, 1
+        jmp .loop
+    .done:
+    mov r0, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+    .gone:
+    mov r0, -1
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Input
+; ==========================
+
+; Push one byte into the completed-input ring, dropping it if the ring is full.
+; r1 = slot, r2 = byte.
+pty_ring_push:
+    push r4                      ; slot
+    push r5                      ; next tail
+    push r6                      ; scratch
+    mov r4, r1
+    vload r0, r4, PTY_RTAIL
+    mov r5, r0
+    add r5, 1
+    cmp r5, PTY_RING_SIZE
+    jul .nowrap
+    mov r5, 0
+    .nowrap:
+    vload r6, r4, PTY_RHEAD
+    cmp r5, r6
+    je .full                     ; would collide with the reader -> drop
+    mov r6, r4
+    add r6, PTY_RING
+    add r6, r0
+    mov8 [r6], r2
+    vstore r4, PTY_RTAIL, r5, r6
+    .full:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Feed one character through the line discipline: printable characters are echoed
+; into the grid and buffered, backspace edits, Enter commits the whole line to the
+; ring and wakes whoever is blocked reading it, and Ctrl+C interrupts - the same
+; rules console_input_char applies, for the same reasons. r1 = slot, r2 = character.
+pty_input_char:
+    push r4                      ; slot
+    push r5                      ; character
+    push r6                      ; scratch / loop cursor
+    push r7                      ; line length
+    mov r4, r1
+    mov r5, r2
+    cmp r5, 10                   ; Enter
+    je .enter
+    cmp r5, 13                   ; CR counts as Enter
+    je .enter
+    cmp r5, 8                    ; Backspace
+    je .backspace
+    cmp r5, CON_INTR             ; Ctrl+C
+    je .intr
+    cmp r5, 32                   ; any other control code types nothing
+    jul .done
+
+    vload r7, r4, PTY_LINELEN    ; printable: buffer it and echo it
+    cmp r7, PTY_LINE_MAX
+    juge .done
+    mov r6, r4
+    add r6, PTY_LINE
+    add r6, r7
+    mov8 [r6], r5
+    add r7, 1
+    vstore r4, PTY_LINELEN, r7, r6
+    mov r1, r4
+    mov r2, r5
+    call pty_putc
+    jmp .done
+
+    .backspace:
+    vload r7, r4, PTY_LINELEN
+    cmp r7, 0
+    je .done
+    sub r7, 1
+    vstore r4, PTY_LINELEN, r7, r6
+    mov r1, r4
+    mov r2, 8
+    call pty_putc
+    jmp .done
+
+    .enter:
+    mov r1, r4                   ; echo the newline
+    mov r2, 10
+    call pty_putc
+    mov r6, 0                    ; copy the line into the ring
+    .commit:
+        vload r7, r4, PTY_LINELEN
+        cmp r6, r7
+        juge .commitnl
+        mov r1, r4
+        add r1, PTY_LINE
+        add r1, r6
+        mov8 r2, [r1]
+        mov r1, r4
+        call pty_ring_push
+        add r6, 1
+        jmp .commit
+    .commitnl:
+    mov r1, r4                   ; terminate the line with a newline
+    mov r2, 10
+    call pty_ring_push
+    mov r0, 0
+    vstore r4, PTY_LINELEN, r0, r6
+    vload r1, r4, PTY_NODE       ; wake anyone blocked reading this pty
+    call proc_wakeup
+    jmp .done
+
+    ; Ctrl+C: throw the half-typed line away, echo "^C", and signal whatever this
+    ; session's foreground job is - see the banner over proc_tty_intr. A pty reaches
+    ; it with its own path and its own node, so two terminals interrupt two shells
+    ; independently, which is the entire point of there being more than one.
+    .intr:
+    mov r1, r4                   ; '^'
+    mov r2, 94
+    call pty_putc
+    mov r1, r4                   ; 'C'
+    mov r2, 67
+    call pty_putc
+    mov r1, r4
+    mov r2, 10
+    call pty_putc
+    mov r0, 0
+    vstore r4, PTY_LINELEN, r0, r6
+    vload r6, r4, PTY_NODE
+    vload r1, r6, NODE_FSDATA    ; our own index, to name "/dev/ptyN"
+    call pty_path
+    mov r1, r0
+    mov r2, r6
+    call proc_tty_intr
+    cmp r0, 0
+    jne .done                    ; something was signalled: it prompts for itself
+    mov r1, r4                   ; nothing was: hand the reader a blank line so that
+    mov r2, 10                   ; a shell blocked mid-line prints a fresh prompt
+    call pty_ring_push
+    vload r1, r4, PTY_NODE
+    call proc_wakeup
+
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; /dev/ptyN read(r1=node, r2=off, r3=buf, [sp]=len) -> r0 = bytes read, PTY_EAGAIN
+; if no whole line is ready yet (the syscall layer turns that into a block on this
+; node), or -1 if the session has been released - which is what a shell whose
+; terminal window has closed sees.
+pty_read:
+    push r4                      ; buffer
+    push r5                      ; capacity
+    push r6                      ; count
+    push r7                      ; slot
+    call pty_from_node
+    cmp r0, 0
+    je .gone
+    mov r7, r0
+    mov r4, r3
+    mov r5, sp
+    add r5, 20
+    mov r5, [r5]
+
+    vload r0, r7, PTY_RHEAD
+    vload r1, r7, PTY_RTAIL
+    cmp r0, r1
+    je .empty                    ; nothing buffered -> ask the caller to block
+
+    mov r6, 0
+    .loop:
+        cmp r6, r5
+        juge .done
+        vload r0, r7, PTY_RHEAD
+        vload r1, r7, PTY_RTAIL
+        cmp r0, r1
+        je .done                 ; ring drained
+        mov r1, r7
+        add r1, PTY_RING
+        add r1, r0
+        mov8 r1, [r1]
+        mov r2, r4
+        add r2, r6
+        mov8 [r2], r1
+        add r0, 1
+        cmp r0, PTY_RING_SIZE
+        jul .nowrap
+        mov r0, 0
+        .nowrap:
+        vstore r7, PTY_RHEAD, r0, r1
+        add r6, 1
+        jmp .loop
+    .done:
+    mov r0, r6
+    jmp .ret
+    .empty:
+    mov r0, -2                   ; the VFS's "would block"
+    jmp .ret
+    .gone:
+    mov r0, -1
+    .ret:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Syscalls
+; ==========================
+
+; SYS_PTYNEW (r2 = columns, r3 = rows) -> a session index, or -1 if the geometry
+; is out of range or every session is taken. The caller owns it, and its children
+; reach it by inheriting the caller's controlling terminal (SYS_SETTTY).
+sys_ptynew_h:
+    push r4                      ; slot
+    push r5                      ; index
+    push r6                      ; scratch
+    cmp r2, 1
+    jil .fail
+    cmp r2, PTY_COLS_MAX
+    jug .fail
+    cmp r3, 1
+    jil .fail
+    cmp r3, PTY_ROWS_MAX
+    jug .fail
+    mov r5, 0
+    .find:
+        cmp r5, PTY_MAX
+        juge .fail
+        mov r1, r5
+        call pty_slot
+        mov r4, r0
+        vload r0, r4, PTY_INUSE
+        cmp r0, 0
+        je .got
+        add r5, 1
+        jmp .find
+    .got:
+    vstore r4, PTY_COLS, r2, r6
+    vstore r4, PTY_ROWS, r3, r6
+    mov r0, 0                    ; a recycled slot starts empty in every respect
+    vstore r4, PTY_COL, r0, r6
+    vstore r4, PTY_ROW, r0, r6
+    vstore r4, PTY_LINELEN, r0, r6
+    vstore r4, PTY_RHEAD, r0, r6
+    vstore r4, PTY_RTAIL, r0, r6
+    vload r0, r4, PTY_SEQ        ; ... except the counter, which only ever climbs,
+    add r0, 1                    ; so a reader cannot see a value it already has
+    vstore r4, PTY_SEQ, r0, r6
+    mov r1, r4
+    call pty_clear
+    mov r1, [curproc]
+    vload r0, r1, PCB_PID
+    vstore r4, PTY_PID, r0, r6
+    mov r0, 1
+    vstore r4, PTY_INUSE, r0, r6
+    mov r0, r5
+    pop r6
+    pop r5
+    pop r4
+    jmp sysret
+    .fail:
+    mov r0, -1
+    pop r6
+    pop r5
+    pop r4
+    jmp sysret
+
+
+; SYS_PTYGRID (r2 = index, r3 = dst, r4 = capacity) -> bytes written, or -1.
+; Snapshot a session you own into the caller's buffer, in exactly the layout
+; SYS_CONREAD produces: a PTY_HDR header of columns, rows, cursor column, cursor
+; row and change counter, then columns*rows characters row-major. A reader that
+; has seen the same counter before knows nothing has moved.
+sys_ptygrid_h:
+    push r4                      ; user destination
+    push r5                      ; grid bytes
+    push r6                      ; slot
+    push r7                      ; capacity
+    mov r7, r4                   ; the third argument arrives live in r4
+    mov r5, r3                   ; ... and the destination must survive the lookup,
+    mov r1, r2                   ; which is an ordinary call and clobbers r0-r3
+    call pty_lookup
+    cmp r0, 0
+    je .fail
+    mov r6, r0
+    mov r4, r5
+    vload r5, r6, PTY_ROWS
+    vload r0, r6, PTY_COLS
+    umul r5, r0                  ; rows * cols
+    mov r0, r5
+    add r0, PTY_HDR              ; total bytes the caller must have room for
+    cmp r7, r0
+    jul .fail
+    mov r1, r4                   ; validate the whole destination range
+    mov r2, r0
+    call uaddr
+    cmp r0, 0
+    je .fail
+    mov r1, r0                   ; the header
+    vload r0, r6, PTY_COLS
+    mov [r1], r0
+    add r1, 4
+    vload r0, r6, PTY_ROWS
+    mov [r1], r0
+    add r1, 4
+    vload r0, r6, PTY_COL
+    mov [r1], r0
+    add r1, 4
+    vload r0, r6, PTY_ROW
+    mov [r1], r0
+    add r1, 4
+    vload r0, r6, PTY_SEQ
+    mov [r1], r0
+    add r1, 4
+    mov r0, r1                   ; then the grid itself
+    mov r1, r6
+    add r1, PTY_CELLS
+    mov r2, r5
+    cpy r1, r2
+    mov r0, r5
+    add r0, PTY_HDR
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    jmp sysret
+    .fail:
+    mov r0, -1
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    jmp sysret
+
+
+; SYS_PTYKEY (r2 = index, r3 = key event) -> 0, or -1 if that is not your session.
+; The pty half of SYS_CONKEY, and it takes the event apart the same way: a release,
+; a modifier key and anything else that types nothing are dropped, so a terminal
+; emulator can pass on whatever wkey handed it without sorting it first. That is
+; also all it takes for Ctrl+C to work in a terminal window: the chord carries the
+; character 3 like any other, and the line discipline at the far end knows what to
+; do with it.
+;
+; Unlike SYS_CONKEY there is no interrupt to race with here - nothing but this
+; syscall ever feeds a pty's line discipline - so no masking is needed.
+sys_ptykey_h:
+    push r4                      ; the event
+    mov r4, r3
+    mov r1, r2
+    call pty_lookup
+    cmp r0, 0
+    je .fail
+    mov r1, r0
+    mov r0, r4
+    and r0, KEV_UP
+    cmp r0, 0
+    jne .drop                    ; a release types nothing
+    mov r0, r4
+    and r0, KEV_MODKEY
+    cmp r0, 0
+    jne .drop                    ; the shift key itself types nothing
+    mov r2, r4
+    shr r2, KEV_CHAR_SHIFT
+    and r2, KEV_CHAR_MASK
+    cmp r2, 0
+    je .drop                     ; a chord, an arrow, a function key
+    call pty_input_char
+    .drop:
+    mov r0, 0
+    pop r4
+    jmp sysret
+    .fail:
+    mov r0, -1
+    pop r4
+    jmp sysret
+
+
+; SYS_PTYCLOSE (r2 = index) -> 0/-1. Release a session you own. Anything still
+; reading or writing the node gets -1 from then on.
+sys_ptyclose_h:
+    mov r1, r2
+    call pty_lookup
+    cmp r0, 0
+    je .fail
+    mov r1, r0
+    call pty_release
+    mov r0, 0
+    jmp sysret
+    .fail:
+    mov r0, -1
+    jmp sysret
+
+
+; Free a session and wake anything blocked on it, so a shell waiting for input on
+; a terminal that has just gone away runs again and sees the read fail rather than
+; sleeping for ever. r1 = slot.
+pty_release:
+    push r4
+    mov r4, r1
+    mov r0, 0
+    vstore r4, PTY_INUSE, r0, r1
+    vstore r4, PTY_PID, r0, r1
+    vload r1, r4, PTY_NODE
+    call proc_wakeup
+    pop r4
+    ret
+
+
+; Release every session owned by a process. Called from process teardown, exactly
+; as gfx_reap is, so a terminal emulator that dies or is killed does not take its
+; slot to the grave with it. r1 = pid.
+pty_reap:
+    push r4                      ; pid
+    push r5                      ; index
+    push r6                      ; slot
+    mov r4, r1
+    mov r5, 0
+    .loop:
+        cmp r5, PTY_MAX
+        juge .done
+        mov r1, r5
+        call pty_slot
+        mov r6, r0
+        vload r0, r6, PTY_INUSE
+        cmp r0, 0
+        je .next
+        vload r0, r6, PTY_PID
+        cmp r0, r4
+        jne .next
+        mov r1, r6
+        call pty_release
+        .next:
+        add r5, 1
+        jmp .loop
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ==========================
+;   Bring-up
+; ==========================
+
+; Publish /dev/pty0 .. /dev/ptyN-1. Call after devfs is mounted. Each node records
+; its session index in NODE_FSDATA, which is how the read and write ops find their
+; session. The nodes are permanent; only the sessions come and go.
+pty_init:
+    push r4                      ; index
+    push r5                      ; slot
+    mov r4, 0
+    .loop:
+        cmp r4, PTY_MAX
+        juge .done
+        mov r1, r4
+        call pty_slot
+        mov r5, r0
+        mov r0, 0                ; every session starts free and blank
+        vstore r5, PTY_INUSE, r0, r1
+        vstore r5, PTY_PID, r0, r1
+        vstore r5, PTY_SEQ, r0, r1
+        mov r0, PTY_COLS_MAX     ; a geometry until one is claimed, so a stray read
+        vstore r5, PTY_COLS, r0, r1
+        mov r0, PTY_ROWS_MAX
+        vstore r5, PTY_ROWS, r0, r1
+
+        mov r0, pty_devname      ; "ptyN" with the digit patched in
+        add r0, 3
+        mov r1, r4
+        add r1, 48
+        mov8 [r0], r1
+        mov r1, pty_devname
+        mov r2, NODE_CHARDEV
+        mov r3, pty_ops
+        push r4                  ; fsdata: the session index
+        call devfs_add
+        add sp, 4
+        cmp r0, 0
+        je .next
+        vstore r5, PTY_NODE, r0, r1
+        .next:
+        add r4, 1
+        jmp .loop
+    .done:
+    pop r5
+    pop r4
+    ret
+
+
+; Write "/dev/ptyN" for session r1 into pty_namebuf, and return it in r0. The
+; kernel needs this to open a pty as a process's controlling terminal, and a user
+; program needs the same string to reach it - see SYS_SETTTY.
+pty_path:
+    push r4                      ; write cursor
+    push r5                      ; read cursor
+    push r6                      ; index
+    mov r6, r1
+    mov r4, pty_namebuf
+    mov r5, pty_pathpfx
+    .pre:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .predone
+        mov8 [r4], r0
+        add r4, 1
+        add r5, 1
+        jmp .pre
+    .predone:
+    mov8 [r4], 112               ; 'p'
+    add r4, 1
+    mov8 [r4], 116               ; 't'
+    add r4, 1
+    mov8 [r4], 121               ; 'y'
+    add r4, 1
+    mov r0, r6
+    add r0, 48
+    mov8 [r4], r0
+    add r4, 1
+    mov8 [r4], 0
+    mov r0, pty_namebuf
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+pty_ops:
+    d32 0                        ; OP_LOOKUP
+    d32 pty_read                 ; OP_READ
+    d32 pty_write                ; OP_WRITE
+    d32 0                        ; OP_CREATE
+    d32 0                        ; OP_REMOVE
+    d32 0                        ; OP_READDIR
+    d32 0                        ; OP_TRUNCATE
+    d32 0                        ; OP_STAT
+    d32 0                        ; OP_SYNC
+    d32 0                        ; OP_RENAME

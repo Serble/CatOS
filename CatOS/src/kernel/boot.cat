@@ -28,9 +28,11 @@ jmp main
 #include "proc/exec.cat"
 #include "fs/fdio.cat"
 #include "io/console.cat"
+#include "io/pty.cat"
 #include "gfx/display.cat"
 #include "gfx/surface.cat"
 #include "drivers/raylibppu.cat"
+#include "drivers/drvhost.cat"
 
 ; to start let's work out how much memory we have
 main:
@@ -143,6 +145,12 @@ kpanic PANIC_MOUNT_FAILED
 ; backend would register with the console the same way.
 call console_init
 
+; ... and /dev/pty0.. alongside it. These are the sessions a terminal emulator
+; claims, so that a window can have a shell of its own rather than a second view
+; of the one console. The nodes exist from here on; the sessions behind them are
+; claimed and released at runtime (see io/pty.cat).
+call pty_init
+
 mov r1, DISK_TYPE
 mov r2, disk_bind
 call drvregister
@@ -157,6 +165,11 @@ mov r2, rppu_mouse_bind
 call drvregister
 call hwscan
 call devscan
+
+; Whatever the built-in drivers left unowned may have a driver on the disk:
+; drv_autoload loads each one in /drivers whose descriptor names such a device
+; (see drivers/drvhost.cat). A device nothing claims is simply left alone.
+call drv_autoload
 
 ; ==========================
 ;   Process system bring-up

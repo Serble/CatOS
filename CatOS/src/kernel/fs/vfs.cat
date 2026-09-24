@@ -180,6 +180,12 @@
 
 
 ; ---- Node layout ----
+;
+; NODE_FSDATA and NODE_FSCTX are both driver-private, and the split matters for a
+; driver that can be mounted more than once: FSDATA identifies the *object* (for
+; CatFS, its inode number) while FSCTX identifies the *mount* the object lives in.
+; An op is handed only a node, so without FSCTX a driver holding per-mount state
+; would have no way to tell which of its mounts a node came from.
 #define NODE_TYPE, 0        ; NODE_* type tag
 #define NODE_FLAGS, 4       ; bitfield: read-only, hidden, dirty, ...
 #define NODE_SIZE, 8        ; bytes (files) / entry count (dirs)
@@ -190,7 +196,8 @@
 #define NODE_PARENT, 28     ; parent directory node
 #define NODE_NAME, 32       ; owned name string pointer
 #define NODE_CNEXT, 36      ; VFS-private: next node in the cache list
-#define NODE_STRUCT, 40     ; total node size
+#define NODE_FSCTX, 40      ; driver-private mount context, 0 if none
+#define NODE_STRUCT, 44     ; total node size
 
 ; ---- Node types ----
 #define NODE_FILE, 1
@@ -210,6 +217,22 @@
 #define OP_TRUNCATE, 24
 #define OP_STAT, 28
 #define OP_SYNC, 32
+#define OP_RENAME, 36       ; re-link an entry under another name / directory
+
+; ---- Why a mount failed ----
+; A mount can fail in ways that call for completely different fixes - a typo in a
+; path, a filesystem name nothing has registered, a partition index that points at
+; something which is not a filesystem - and "it failed" leaves the user to guess
+; which. So vfsmount records a reason in `vfsmounterr` and the mount syscall hands
+; it back, negated, as its return value. Keep this list in sync with the MNTE_* in
+; user/sys.cat, as with the syscall numbers.
+#define MNTE_BADREQ, 1      ; the request struct or one of its strings is unreadable
+#define MNTE_SOURCE, 2      ; the source path does not resolve
+#define MNTE_RANGE, 3       ; the block range is empty, or starts past the source's end
+#define MNTE_NOMEM, 4       ; out of kernel memory
+#define MNTE_FSTYPE, 5      ; no filesystem driver is registered under that name
+#define MNTE_TARGET, 6      ; the target is missing, or is not a directory
+#define MNTE_FORMAT, 7      ; the driver did not recognise what is in that region
 
 ; ---- Mount struct ----
 #define MNT_ROOT, 0         ; root node of the mounted filesystem
@@ -309,6 +332,9 @@ vfscompbuf:
 
 vfsparentbuf:
     res8 VFS_PATH_MAX        ; scratch: parent path during create/remove
+
+vfsmounterr:
+    d32 0                    ; MNTE_* reason the last vfsmount returned 0
 
 
 ; ==========================
@@ -650,70 +676,140 @@ vfsfinddriver:
 
 ; Mount a registered driver at a path. The first successful mount becomes the
 ; root filesystem "/"; later mounts attach onto an existing directory node.
+;
+; The target is checked before the driver is asked for anything. That ordering is
+; not cosmetic: a driver's mount routine reads a superblock off the disk and hands
+; back a root node, and there is no "give this root back" op to undo it with - so
+; validating the target afterwards meant a bad target leaked a root node, and left
+; a half-built record linked into the mount list still naming the caller's
+; descriptor, which the caller then freed.
+;
 ; r1 - mount path
 ; r2 - driver name
 ; r3 - backing device handle (opaque, may be 0)
-; returns r0 = mount record, or 0 on failure
+; returns r0 = mount record, or 0 on failure - with vfsmounterr set to the MNTE_*
+;         saying which step failed, because the mount syscall has to tell a user
+;         *why* rather than just that it did not work
 vfsmount:
-    push r4                  ; path
+    push r4                  ; mount path, later the mount record
     push r5                  ; device
-    push r6                  ; root node / scratch
-    push r7                  ; mount record
+    push r6                  ; the driver's mount routine, later the root node
+    push r7                  ; the directory being covered, 0 for the first mount
     mov r4, r1
     mov r5, r3
 
     mov r1, r2
     call vfsfinddriver       ; r0 = driver
     cmp r0, 0
-    je .fail
+    je .nodriver
+    vload r6, r0, DRV_MOUNT
 
-    vload r2, r0, DRV_MOUNT  ; call the driver's mount routine
-    mov r1, r5
-    call r2                  ; r0 = fresh root node
+    mov r7, 0                ; the first mount becomes "/" and covers nothing
+    mov r0, [vfsroot]
     cmp r0, 0
-    je .fail
+    je .targetok
+    mov r1, r4
+    call vfsresolve          ; r0 = the directory to cover (ref taken)
+    cmp r0, 0
+    je .notarget
+    mov r7, r0
+    vload r0, r7, NODE_TYPE
+    cmp r0, NODE_DIR
+    jne .badtarget           ; a file cannot have a filesystem laid over it
+    .targetok:
+
+    mov r1, r5               ; now the expensive part: the driver reads its
+    call r6                  ; superblock and builds a root node
+    cmp r0, 0
+    je .badformat
     mov r6, r0
 
     mov r1, MNT_STRUCT       ; build the mount record
     call heapalloc
     cmp r0, 0
-    je .fail
-    mov r7, r0
+    je .nomem
+    mov r4, r0
 
-    vstore r7, MNT_ROOT, r6, r1
+    vstore r4, MNT_ROOT, r6, r1
     vload r0, r6, NODE_OPS
-    vstore r7, MNT_OPS, r0, r1
-    vstore r7, MNT_DEV, r5, r1
-    vstore r7, MNT_FSDATA, 0, r1
+    vstore r4, MNT_OPS, r0, r1
+    vstore r4, MNT_DEV, r5, r1
+    vstore r4, MNT_FSDATA, 0, r1
+    vstore r4, MNT_NODE, r7, r1
 
     mov r0, [vfsmounts]      ; link into the mount list
-    vstore r7, MNT_NEXT, r0, r1
-    mov [vfsmounts], r7
+    vstore r4, MNT_NEXT, r0, r1
+    mov [vfsmounts], r4
 
-    mov r0, [vfsroot]        ; first mount is the root filesystem
-    cmp r0, 0
-    jne .notroot
-    mov [vfsroot], r6
-    vstore r7, MNT_NODE, 0, r1
+    cmp r7, 0
+    jne .overlay
+    mov [vfsroot], r6        ; the first mount *is* the root
     jmp .ok
-
-    .notroot:
-    mov r1, r4               ; resolve the directory to cover
-    call vfsresolve          ; r0 = mountpoint node (ref taken)
-    cmp r0, 0
-    je .fail                 ; leaves the record + root allocated; caller aborts
-    vstore r7, MNT_NODE, r0, r1
-    mov r1, r0               ; overlay the mount on the covered node
-    vstore r1, NODE_MOUNT, r7, r2
-
+    .overlay:
+    vstore r7, NODE_MOUNT, r4, r1
     .ok:
-    mov r0, r7
+    mov r0, r4
     jmp .done
-    .fail:
+
+    .nomem:
+    mov r1, r6               ; hand the driver's root back. Its per-mount context
+    call vfsnodeunref        ; (CatFS's instance) is only released through umount,
+    mov r0, MNTE_NOMEM       ; which needs a record we could not allocate
+    jmp .failtarget
+    .badformat:
+    mov r0, MNTE_FORMAT
+    jmp .failtarget
+    .badtarget:
+    mov r0, MNTE_TARGET
+    .failtarget:
+    mov [vfsmounterr], r0
+    mov r1, r7
+    call vfsnodeunref        ; 0 is a no-op, so the root mount falls through
+    jmp .bad
+    .notarget:
+    mov r0, MNTE_TARGET
+    jmp .seterr
+    .nodriver:
+    mov r0, MNTE_FSTYPE
+    .seterr:
+    mov [vfsmounterr], r0
+    .bad:
     mov r0, 0
     .done:
     pop r7
     pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Find the mount whose root is the node at `path`. umount needs this: the backing
+; descriptor and the driver's mount context belong to whoever called vfsmount, not
+; to the VFS, so they have to be recovered before vfsunmount frees the record.
+; r1 - path
+; returns r0 = mount record, or 0 if that path is not a mount root
+vfsmountat:
+    push r4                  ; the node the path names
+    push r5                  ; cursor
+    call vfsresolve
+    cmp r0, 0
+    je .none
+    mov r4, r0
+    mov r1, r4               ; we only needed it to identify the mount
+    call vfsnodeunref
+    mov r5, [vfsmounts]
+    .find:
+        cmp r5, 0
+        je .none
+        vload r0, r5, MNT_ROOT
+        cmp r0, r4
+        je .done
+        vload r5, r5, MNT_NEXT
+        jmp .find
+    .none:
+    mov r5, 0
+    .done:
+    mov r0, r5
     pop r5
     pop r4
     ret
@@ -1090,7 +1186,8 @@ vfsopen:
     mov r1, r4
     mov r2, 0
     call r0
-    .notrunc:
+    vstore r4, NODE_SIZE, 0, r0  ; the driver only knows about its own on-disk
+    .notrunc:                    ; length; the node's copy is what stat reads
 
     mov r1, 0                ; find a free handle slot
     .findslot:
@@ -1416,11 +1513,21 @@ vfsmkdir:
 
 
 ; Remove (unlink) a file or empty directory.
+;
+; "Empty" is enforced here rather than left to the drivers, because a driver's
+; remove frees the child outright: handed a populated directory, CatFS would free
+; its inode and its data blocks - the blocks holding the entries - and every file
+; underneath would become unreachable with its own blocks still marked in use. So
+; the check has to happen before the driver is asked, and doing it once here means
+; no driver has to remember to. A recursive delete is a userland loop over this,
+; which is what rm does.
+;
 ; r1 - path
 ; returns r0 = driver status (0 ok), or -1 on failure
 vfsremove:
     push r4                  ; final name
     push r5                  ; parent dir
+    push r6                  ; the entry being removed
     call vfssplitpath        ; r0 = final name; parent path -> vfsparentbuf
     mov r4, r0
 
@@ -1429,6 +1536,38 @@ vfsremove:
     cmp r0, 0
     je .fail
     mov r5, r0
+
+    mov r1, r5               ; look the entry up without crossing into a mount:
+    mov r2, r4               ; what we may remove is the directory's own child,
+    call vfslookup           ; never the root of something mounted over it
+    cmp r0, 0
+    je .failunref            ; nothing by that name
+    mov r6, r0
+
+    vload r0, r6, NODE_MOUNT ; a mount point would leave the mount naming a
+    cmp r0, 0                ; directory that no longer exists
+    jne .failchild
+
+    vload r0, r6, NODE_TYPE
+    cmp r0, NODE_DIR
+    jne .childok
+    vload r0, r6, NODE_OPS   ; a directory has to be empty: ask its driver for
+    cmp r0, 0                ; the first entry and refuse if there is one
+    je .childok
+    vload r0, r0, OP_READDIR
+    cmp r0, 0
+    je .childok
+    mov r1, r6
+    mov r2, 0
+    call r0                  ; r0 = first child (ref taken), or 0 if empty
+    cmp r0, 0
+    je .childok
+    mov r1, r0               ; it only had to exist; let it go again
+    call vfsnodeunref
+    jmp .failchild
+    .childok:
+    mov r1, r6               ; the driver works from the parent and the name, so
+    call vfsnodeunref        ; the entry's own reference has done its job
 
     vload r0, r5, NODE_OPS
     cmp r0, 0
@@ -1448,12 +1587,158 @@ vfsremove:
     call vfsnodeunref
     pop r0
     jmp .done
+    .failchild:
+    mov r1, r6
+    call vfsnodeunref
     .failunref:
     mov r1, r5
     call vfsnodeunref
     .fail:
     mov r0, -1
     .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Move an entry to another name, another directory, or both.
+;
+; This only ever re-links an inode that already exists, which is exactly why it
+; is confined to one filesystem: nothing can link an inode into a driver that has
+; never heard of it, and two mounts of the same driver do not share an inode space
+; either. A move that crosses a mount is therefore a copy followed by a delete -
+; real work on real data, and so userland's job (mv falls back to it), not a
+; kernel operation pretending to be cheap.
+;
+; The entry is checked here before any driver sees it: the destination must be
+; free (a rename never silently destroys a file), the source must exist and not be
+; a mount point, and a directory must not be moved inside its own subtree - that
+; would strand the whole subtree, unreachable from the root and still holding a
+; reference on its own new parent.
+;
+; r1 - old path
+; r2 - new path
+; returns r0 = 0 on success, -1 on failure
+vfsrename:
+    push r4                  ; final component of the old path
+    push r5                  ; old parent directory
+    push r6                  ; final component of the new path / driver status
+    push r7                  ; new parent directory
+    push r2                  ; the new path, across the first split
+
+    call vfssplitpath        ; r1 = the old path
+    mov r4, r0
+    mov r1, vfsparentbuf
+    call vfsresolve
+    cmp r0, 0
+    je .failpath
+    mov r5, r0
+
+    mov r1, sp               ; the new path, which the first split left alone
+    mov r1, [r1]
+    call vfssplitpath        ; overwrites vfsparentbuf, so the old parent is
+    mov r6, r0               ; already resolved by now
+    mov r1, vfsparentbuf
+    call vfsresolve
+    cmp r0, 0
+    je .failold
+    mov r7, r0
+    add sp, 4                ; the paths are split; only the names matter now
+
+    vload r0, r5, NODE_OPS   ; one driver ...
+    vload r1, r7, NODE_OPS
+    cmp r0, r1
+    jne .failboth
+    vload r0, r5, NODE_FSCTX ; ... and one mount of it
+    vload r1, r7, NODE_FSCTX
+    cmp r0, r1
+    jne .failboth
+
+    mov r1, r7               ; refuse to clobber an existing destination
+    mov r2, r6
+    call vfslookup
+    cmp r0, 0
+    je .destfree
+    mov r1, r0
+    call vfsnodeunref
+    jmp .failboth
+    .destfree:
+
+    mov r1, r5               ; the entry being moved has to exist
+    mov r2, r4
+    call vfslookup
+    cmp r0, 0
+    je .failboth
+    push r0                  ; the entry, referenced
+
+    vload r0, r0, NODE_MOUNT
+    cmp r0, 0
+    jne .failchild           ; moving a mount point would orphan the mount
+
+    mov r1, sp
+    mov r1, [r1]
+    vload r0, r1, NODE_TYPE
+    cmp r0, NODE_DIR
+    jne .checked
+    mov r0, r7               ; walk the destination's ancestors: reaching the
+    .ancestors:              ; directory we are moving means moving it into
+        cmp r0, 0            ; itself
+        je .checked
+        cmp r0, r1
+        je .failchild
+        vload r0, r0, NODE_PARENT
+        jmp .ancestors
+    .checked:
+
+    vload r0, r5, NODE_OPS
+    vload r0, r0, OP_RENAME
+    cmp r0, 0
+    je .failchild            ; a driver that cannot re-link (ramfs, devfs, ...)
+    mov r1, r5
+    mov r2, r4
+    mov r3, r7
+    push r6                  ; four arguments, so the new name goes on the stack
+    call r0
+    add sp, 4
+    mov r6, r0               ; the driver's status; the new name is finished with
+
+    mov r1, r5               ; the cached entry now has the wrong name and parent,
+    mov r2, r4               ; so detach it - the next lookup builds a fresh one
+    call vfsinvalidate
+
+    mov r1, sp
+    mov r1, [r1]
+    call vfsnodeunref
+    add sp, 4
+    mov r1, r7
+    call vfsnodeunref
+    mov r1, r5
+    call vfsnodeunref
+    mov r0, r6
+    jmp .done
+
+    .failchild:
+    mov r1, sp
+    mov r1, [r1]
+    call vfsnodeunref
+    add sp, 4
+    .failboth:
+    mov r1, r7
+    call vfsnodeunref
+    mov r1, r5
+    call vfsnodeunref
+    jmp .bad
+    .failold:
+    mov r1, r5
+    call vfsnodeunref
+    .failpath:
+    add sp, 4                ; the new path never made it off the stack
+    .bad:
+    mov r0, -1
+    .done:
+    pop r7
+    pop r6
     pop r5
     pop r4
     ret
@@ -1483,8 +1768,10 @@ vfsinvalidate:
         call vfsstreq
         cmp r0, 0
         je .next
-        vstore r6, NODE_PARENT, 0, r0   ; detach it
-        .next:
+        vstore r6, NODE_PARENT, 0, r0   ; detach it, and give back the reference
+        mov r1, r4                      ; it held on the parent - vfsnodefree
+        call vfsnodeunref               ; releases that through NODE_PARENT, which
+        .next:                          ; is about to be 0, so it must happen here
         vload r6, r6, NODE_CNEXT
         jmp .loop
     .done:

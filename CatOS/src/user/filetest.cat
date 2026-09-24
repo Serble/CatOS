@@ -1,7 +1,7 @@
 ; Proves the file-descriptor syscalls end to end, all in user mode: create a
 ; file on the (on-disk, journaled) root fs, write to it, seek back, read it, then
 ; list a directory. r6/r7 hold state because they survive syscalls; r1-r4 do not.
-#include "sys.cat"
+#include "lib/sys.cat"
 
     ; create + open /data.txt for read/write
     sys_open ftpath, O_RDWR + O_CREATE

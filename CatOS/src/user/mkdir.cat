@@ -1,0 +1,72 @@
+; mkdir - create directories.
+;
+;   mkdir <dir> [dir ...]
+;
+; Each argument is created in turn; a failure is reported against the name that
+; caused it and the rest are still attempted, so one bad name in a list does not
+; silently swallow the others. The exit code is 1 if any of them failed.
+;
+; There is no -p: a create goes to the parent directory's driver, so the parent
+; has to exist already. Making the whole chain is a loop over this program, and
+; keeping it out of here keeps the failure honest - "no such directory" means the
+; parent really is missing rather than about to be invented.
+#include "lib/sys.cat"
+
+main:
+    mov r5, r1                       ; argc
+    mov r6, r2                       ; argv
+    cmp r5, 2
+    jul .usage
+    mov r7, 0                        ; failures so far
+    mov r4, 1                        ; argument index
+
+.loop:
+    cmp r4, r5
+    juge .done
+    mov r1, r4                       ; argv[r4]
+    shl r1, 2
+    add r1, r6
+    mov r1, [r1]
+    sys_create r1, T_DIR
+    cmp r0, 0
+    je .next
+    mov r1, r4                       ; report which name it was
+    shl r1, 2
+    add r1, r6
+    mov r1, [r1]
+    call report
+    mov r7, 1
+    .next:
+    add r4, 1
+    jmp .loop
+
+.done:
+    sys_exit r7
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+
+
+; report(r1 = path) - "mkdir: cannot create <path>".
+report:
+    push r4
+    mov r4, r1
+    mov r1, epre
+    call emit_str
+    mov r1, r4
+    call emit_str
+    mov r1, 10                       ; '\n'
+    call emit_char
+    call flush
+    pop r4
+    ret
+
+
+usage:
+    dstr "usage: mkdir <dir> [dir ...]\n"
+usage_end:
+epre:
+    dstr "mkdir: cannot create \0"
+
+#include "lib/fmt.cat"

@@ -1,0 +1,496 @@
+; ==========================
+;   Userland heap allocator
+; ==========================
+; malloc/free/realloc for user programs, built on SYS_SBRK.
+;
+; A process starts with no heap at all: proc_create sizes its segment as exactly
+; the program image plus USER_STACK_BYTES of stack, so the only memory a program
+; has beyond its own image is the 4 KiB the stack sits in. Anything larger has to
+; come from sbrk, and until now every program that wanted some (the compositors,
+; gdemo, editor) called sbrk once for a worst-case arena and carved it up by hand.
+; That works when you know the size up front and never give any of it back. This
+; is the general case.
+;
+; Include it AFTER the program's main body, for the reason fmt.cat gives: a
+; program is loaded at user vaddr 0 and starts at its first instruction, so an
+; include placed first would run instead of main.
+;
+;
+; -- Why sbrk shapes the design -----------------------------------------------
+;
+; Two properties of sbrk decide almost everything here.
+;
+; It is *expensive*. sys_sbrk_h allocates a whole new segment, copies the old one
+; into it and frees the old one, so growing costs a copy of everything the process
+; owns. Asking for 16 bytes a hundred times would copy the world a hundred times.
+; So the heap grows in HEAP_CHUNK-sized steps and hands the caller a slice.
+;
+; It is *contiguous and one-way*. The new region always begins at the old segment
+; length, which is exactly where the previous one ended, so successive grows form
+; one unbroken arena and a block from an early grow can merge with a block from a
+; later one. There is no counterpart that shrinks a segment, so memory reaching
+; this allocator never goes back to the kernel; it is reused until the process
+; exits, at which point proc teardown frees the whole segment anyway.
+;
+; The stack is not a problem, incidentally: sp starts at the *original* segment
+; length and grows down into the 4 KiB below it, while the heap only ever appears
+; above that point. They cannot meet.
+;
+;
+; -- Block layout --------------------------------------------------------------
+;
+; Every block, free or in use, carries a one-word header holding its total size
+; (header included), and the pointer handed out is the word after it. There is no
+; in-use flag and no footer, because the free list is kept sorted by address:
+; inserting a freed block walks to its position, which is precisely between the
+; two blocks it might merge with, so both neighbours are in hand without asking
+; any block whether it is free. The price is an O(n) free, which is the right
+; trade at these sizes - a program with a thousand live blocks is not what this
+; machine is for.
+;
+; A free block borrows its first payload word for the list link, which is why the
+; smallest block is 8 bytes and why a request is never split so finely that the
+; remainder could not hold one.
+;
+; Clobbers r0-r3 like any other procedure and preserves r4-r7.
+
+#define HEAP_ALIGN, 4                    ; payloads are word-aligned
+#define HEAP_MASK, 0xFFFFFFFC            ; ... by rounding down with this
+#define HEAP_HDR, 4                      ; the size word in front of every block
+#define HEAP_MINBLK, 8                   ; header plus a free block's link word
+#define HEAP_PAGE, 512                   ; sbrk's page granularity (alloc.cat)
+#define HEAP_PAGEMASK, 0xFFFFFE00
+#define HEAP_CHUNK, 8192                 ; the least we ever ask sbrk for
+
+; block header fields
+#define BLK_SIZE, 0                      ; total bytes, header included
+#define BLK_NEXT, 4                      ; free blocks only: next in address order
+
+
+; halloc(r1 = bytes) -> r0 = a pointer to that many usable bytes, or 0.
+; Zero bytes, or a size so large that rounding it wraps, gives 0 - there is no
+; address 0 in a heap (it sits above the image and the stack), so 0 is a safe
+; "nothing" the way a null pointer is anywhere else.
+;
+; First fit. A best-fit search would pack better, but every block on this list is
+; a block some program is about to reuse for something of a similar size, and the
+; scan is the cost that actually shows up.
+halloc:
+    push r4                              ; total block bytes wanted
+    push r5                              ; the candidate being examined
+    push r6                              ; the cell holding the link to r5
+    push r7                              ; set once we have already grown
+
+    cmp r1, 0
+    je .null
+    mov r4, r1
+    add r4, HEAP_HDR + HEAP_ALIGN - 1
+    cmp r4, r1
+    jul .null                            ; the rounding wrapped: absurd request
+    and r4, HEAP_MASK
+    cmp r4, HEAP_MINBLK
+    juge .sized
+    mov r4, HEAP_MINBLK                  ; keep it big enough to be freed later
+    .sized:
+    mov r7, 0
+
+    .search:
+    mov r6, heap_free                    ; the head *cell*, so unlinking the first
+    .walk:                               ; block needs no special case
+        mov r5, [r6]
+        cmp r5, 0
+        je .grow
+        mov r0, [r5]                     ; BLK_SIZE
+        cmp r0, r4
+        juge .take
+        mov r6, r5
+        add r6, BLK_NEXT
+        jmp .walk
+
+    .take:                               ; r5 fits; r0 = its size
+    mov r1, r0
+    sub r1, r4                           ; what would be left over
+    cmp r1, HEAP_MINBLK
+    jul .whole                           ; too small to stand alone: keep it all
+    mov r2, r5                           ; the tail becomes a free block ...
+    add r2, r4
+    mov [r2], r1
+    mov r3, r5                           ; ... inheriting r5's place in the list
+    add r3, BLK_NEXT
+    mov r3, [r3]
+    mov r0, r2
+    add r0, BLK_NEXT
+    mov [r0], r3
+    mov [r6], r2
+    mov [r5], r4                         ; and r5 shrinks to what was asked for
+    jmp .out
+
+    .whole:                              ; take the block entire, slack included -
+    mov r3, r5                           ; the header still says how big it really
+    add r3, BLK_NEXT                     ; is, so free gives all of it back
+    mov r3, [r3]
+    mov [r6], r3
+
+    .out:
+    mov r0, r5
+    add r0, HEAP_HDR
+    jmp .done
+
+    .grow:
+    cmp r7, 0
+    jne .null                            ; grew once and still no fit: give up
+    mov r7, 1
+    mov r1, r4
+    call heap_grow
+    cmp r0, 0
+    je .null
+    jmp .search                          ; the new space is on the list now
+
+    .null:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; hfree(r1 = pointer) - release a block obtained from halloc or hrealloc.
+; Freeing 0 does nothing, so a cleanup path does not have to test first.
+;
+; The pointer is trusted: nothing checks that it came from here, because the only
+; way to find out would be to walk every block, and a program that frees a bogus
+; pointer has already lost.
+hfree:
+    cmp r1, 0
+    je .done
+    sub r1, HEAP_HDR
+    call heap_insert
+    .done:
+    ret
+
+
+; hrealloc(r1 = pointer, r2 = bytes) -> r0 = a pointer to a block of that size
+; holding as much of the old contents as still fits, or 0 on failure.
+;
+; On failure the original block is untouched and still valid, which is the whole
+; reason realloc is worth having as a primitive: the caller can keep what it had.
+; A null pointer means "allocate", a zero size means "free, answer 0".
+hrealloc:
+    push r4                              ; the caller's pointer
+    push r5                              ; its block
+    push r6                              ; total block bytes wanted
+    push r7                              ; the request, then the new pointer
+
+    cmp r1, 0
+    je .fresh
+    cmp r2, 0
+    je .drop
+    mov r4, r1
+    mov r7, r2
+    mov r5, r1
+    sub r5, HEAP_HDR
+
+    mov r6, r2                           ; round exactly as halloc would
+    add r6, HEAP_HDR + HEAP_ALIGN - 1
+    cmp r6, r2
+    jul .fail
+    and r6, HEAP_MASK
+    cmp r6, HEAP_MINBLK
+    juge .sized
+    mov r6, HEAP_MINBLK
+    .sized:
+
+    mov r0, [r5]
+    cmp r0, r6
+    jug .shrink
+    je .keep
+    mov r1, r5                           ; growing: try to swallow the free block
+    mov r2, r6                           ; immediately above us first, which is
+    call heap_extend                     ; the common case for the youngest
+    cmp r0, 0                            ; allocation on the heap
+    jne .keep
+
+    mov r1, r7                           ; otherwise move it
+    call halloc
+    cmp r0, 0
+    je .fail
+    mov r3, r0
+    mov r1, [r5]                         ; copy min(old payload, new request)
+    sub r1, HEAP_HDR
+    cmp r1, r7
+    jule .cplen
+    mov r1, r7
+    .cplen:
+    mov r2, r1
+    mov r0, r3                           ; cpy takes its destination from r0
+    mov r1, r4
+    cpy r1, r2
+    mov r7, r3
+    mov r1, r4
+    call hfree
+    mov r0, r7
+    jmp .out
+
+    .shrink:                             ; hand the tail back if it is worth a
+    mov r1, r0                           ; block of its own
+    sub r1, r6
+    cmp r1, HEAP_MINBLK
+    jul .keep
+    mov [r5], r6
+    mov r0, r5
+    add r0, r6
+    mov [r0], r1
+    mov r1, r0
+    call heap_insert
+    .keep:
+    mov r0, r4
+    jmp .out
+
+    .fresh:
+    mov r1, r2
+    call halloc
+    jmp .out
+    .drop:
+    call hfree
+    mov r0, 0
+    jmp .out
+    .fail:
+    mov r0, 0
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; hheapsize() -> r0 = every byte the heap has ever taken from the kernel.
+hheapsize:
+    mov r0, [heap_end]
+    mov r1, [heap_base]
+    sub r0, r1
+    ret
+
+
+; hfreebytes() -> r0 = the bytes currently on the free list, headers included.
+; Equal to hheapsize() exactly when nothing is allocated and the arena has
+; coalesced back into one block, which makes the pair a leak check.
+hfreebytes:
+    push r4                              ; cursor
+    mov r0, 0
+    mov r4, [heap_free]
+    .loop:
+        cmp r4, 0
+        je .done
+        mov r1, [r4]
+        add r0, r1
+        add r4, BLK_NEXT
+        mov r4, [r4]
+        jmp .loop
+    .done:
+    pop r4
+    ret
+
+
+; ==========================
+;   Internals
+; ==========================
+
+; heap_grow(r1 = the block size that must fit) -> r0 = 1 if the heap got bigger,
+; 0 if sbrk refused. The new region is offered to the free list as a freshly
+; freed block, so if the heap already ended in free space the two merge and the
+; caller sees one large block rather than two adjacent ones.
+;
+; The request is rounded up to a whole number of pages before it goes to sbrk,
+; which rounds up to pages itself. Handing it an exact multiple means the region
+; we get is exactly the size we asked for, so heap_end is right without having to
+; guess how much sbrk rounded away.
+heap_grow:
+    push r4                              ; bytes to ask for
+    push r5                              ; base of the new region
+    mov r4, r1
+    cmp r4, HEAP_CHUNK
+    juge .round
+    mov r4, HEAP_CHUNK
+    .round:
+    add r4, HEAP_PAGE - 1
+    cmp r4, r1
+    jul .fail                            ; wrapped
+    and r4, HEAP_PAGEMASK
+
+    sys_sbrk r4
+    cmp r0, -1
+    je .fail
+    mov r5, r0
+
+    mov r1, [heap_base]                  ; the first grow fixes where the heap
+    cmp r1, 0                            ; starts; later ones continue from it
+    jne .known
+    mov [heap_base], r5
+    .known:
+    mov r0, r5
+    add r0, r4
+    mov [heap_end], r0
+
+    mov [r5], r4
+    mov r1, r5
+    call heap_insert
+    mov r0, 1
+    jmp .out
+    .fail:
+    mov r0, 0
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; heap_insert(r1 = block, with BLK_SIZE already set) - put a block on the free
+; list in address order, merging it with whichever of its two neighbours it
+; physically touches.
+;
+; Both merges are needed. Forward-only would leave a heap that fragments in one
+; direction and never recovers: free a, then free the block before it, and
+; without the backward merge the pair stays two blocks forever.
+heap_insert:
+    push r4                              ; the block being inserted
+    push r5                              ; the free block above it, or 0
+    push r6                              ; the cell that must point at r4
+    push r7                              ; scratch
+    mov r4, r1
+
+    mov r6, heap_free
+    .find:
+        mov r5, [r6]
+        cmp r5, 0
+        je .place
+        cmp r5, r4
+        jug .place                       ; r5 is the first block past us
+        mov r6, r5
+        add r6, BLK_NEXT
+        jmp .find
+
+    .place:
+    mov r7, r4
+    add r7, BLK_NEXT
+    mov [r7], r5
+    mov [r6], r4
+
+    cmp r5, 0                            ; merge forward?
+    je .back
+    mov r0, [r4]
+    add r0, r4                           ; where we end
+    cmp r0, r5
+    jne .back
+    mov r0, [r4]
+    mov r1, [r5]
+    add r0, r1
+    mov [r4], r0
+    mov r1, r5
+    add r1, BLK_NEXT
+    mov r1, [r1]                         ; r5's successor becomes ours
+    mov r0, r4
+    add r0, BLK_NEXT
+    mov [r0], r1
+
+    .back:                               ; merge backward? r6 is the link cell,
+    cmp r6, heap_free                    ; so unless it is the list head it is
+    je .done                             ; prev + BLK_NEXT and prev is r6 - 4
+    mov r7, r6
+    sub r7, BLK_NEXT
+    mov r0, [r7]
+    add r0, r7                           ; where the predecessor ends
+    cmp r0, r4
+    jne .done
+    mov r0, [r7]
+    mov r1, [r4]
+    add r0, r1
+    mov [r7], r0
+    mov r0, r4
+    add r0, BLK_NEXT
+    mov r0, [r0]
+    mov r1, r7
+    add r1, BLK_NEXT
+    mov [r1], r0
+
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; heap_extend(r1 = block, r2 = total bytes wanted) -> r0 = 1 if the block now has
+; them, 0 if it could not be done in place. Absorbs the free block that starts
+; exactly where this one ends, if there is one and it is large enough, then
+; returns any excess to the list.
+;
+; This is what keeps a growing buffer - a vector doubling, say - from copying
+; itself every time: whatever it grew into last is usually still the top of the
+; heap, so the space above it is free and it simply reaches into it.
+heap_extend:
+    push r4                              ; the block
+    push r5                              ; the free neighbour
+    push r6                              ; the cell holding the link to r5
+    push r7                              ; bytes wanted
+    mov r4, r1
+    mov r7, r2
+
+    mov r0, [r4]
+    add r0, r4                           ; the address a neighbour must start at
+    mov r6, heap_free
+    .find:
+        mov r5, [r6]
+        cmp r5, 0
+        je .no
+        cmp r5, r0
+        je .found
+        jug .no                          ; sorted: past it, so there is none
+        mov r6, r5
+        add r6, BLK_NEXT
+        jmp .find
+
+    .found:
+    mov r1, [r4]
+    mov r2, [r5]
+    add r1, r2                           ; what the two would come to together
+    cmp r1, r7
+    jul .no
+    mov r2, r5                           ; unlink the neighbour and take it
+    add r2, BLK_NEXT
+    mov r2, [r2]
+    mov [r6], r2
+    mov [r4], r1
+
+    mov r2, r1                           ; give back what we did not need
+    sub r2, r7
+    cmp r2, HEAP_MINBLK
+    jul .whole
+    mov [r4], r7
+    mov r0, r4
+    add r0, r7
+    mov [r0], r2
+    mov r1, r0
+    call heap_insert
+    .whole:
+    mov r0, 1
+    jmp .out
+    .no:
+    mov r0, 0
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+heap_free:
+    d32 0                                ; head of the address-ordered free list
+heap_base:
+    d32 0                                ; where the heap starts, 0 until it exists
+heap_end:
+    d32 0                                ; one past the last byte it owns

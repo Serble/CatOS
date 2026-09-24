@@ -23,7 +23,7 @@
 ; Pixels are only committed when the drawn result would actually differ - the
 ; displayed time, the button labels or the size - so a stopped stopwatch costs the
 ; window manager nothing to show.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define WANT_W, 260                  ; the size we would like
 #define WANT_H, 132

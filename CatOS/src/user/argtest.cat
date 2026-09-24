@@ -1,7 +1,7 @@
 ; Proves argv passing: the kernel starts a process with r1 = argc and r2 = argv
 ; (a pointer, in this process's own address space, to an array of string
 ; pointers). Print argc, then the first character of argv[1].
-#include "sys.cat"
+#include "lib/sys.cat"
 
     mov r5, r1                    ; argc   (r5-r7 survive syscalls)
     mov r6, r2                    ; argv

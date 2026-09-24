@@ -2,7 +2,7 @@
 ; spins forever without a single syscall. If other processes still make progress
 ; after this starts, the timer is preempting it - proving spawn coexists with
 ; preemptive scheduling.
-#include "sys.cat"
+#include "lib/sys.cat"
 
     sys_print 0xF1
 spin:

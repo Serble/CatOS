@@ -33,12 +33,68 @@ sys_bf:
     d32 0                        ; block-backed-file descriptor for /sys
 catfs_bf:
     d32 0                        ; block-backed-file descriptor for the CatFS root
-disk_extent_blocks:
-    d32 0                        ; highest start+count seen (whole-disk size guess)
+
+
+; Fallback sizing for a device that does not implement DISK_GETSIZE: read its
+; partition table and take the highest start+count. A VM predating that command
+; ignores it and leaves its reply queue empty, which reads back as 0xFFFFFFFF, so
+; disk_bind needs something to fall back to. This only sees space that the table
+; accounts for - which is exactly why asking the device is preferred.
+; r1 - disk port
+; returns r0 = extent in blocks, or 0 if the disk has no usable table
+disk_probe_extent:
+    push r4                      ; port
+    push r5                      ; entries remaining
+    push r6                      ; entry cursor
+    push r7                      ; highest extent seen
+    mov r4, r1
+
+    mov r1, r4                   ; the table is always block 0
+    mov r2, ptbuf
+    mov r3, 0
+    call disk_readblock
+
+    mov r0, [ptbuf]              ; magic is a 64-bit 51
+    cmp r0, PT_MAGIC
+    jne .none
+    mov r6, ptbuf
+    add r6, 4
+    mov r0, [r6]
+    cmp r0, 0
+    jne .none
+
+    mov r6, ptbuf
+    add r6, PT_COUNT_OFF
+    mov r5, [r6]
+    mov r6, ptbuf
+    add r6, PT_ENTRIES_OFF
+    mov r7, 0
+    .loop:
+        cmp r5, 0
+        je .done
+        vload r0, r6, PE_START
+        vload r1, r6, PE_COUNT
+        add r0, r1
+        cmp r0, r7
+        jule .next
+        mov r7, r0
+        .next:
+        add r6, PT_ENTRY_SIZE
+        sub r5, 1
+        jmp .loop
+    .none:
+    mov r7, 0
+    .done:
+    mov r0, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
 
 
 ; Read the boot disk's partition table and locate the kernel partition.
-; returns r0 = 0 on success (sys_bf + disk_extent_blocks filled), -1 on failure
+; returns r0 = 0 on success (sys_bf filled), -1 on failure
 bootdev_probe:
     push r4                      ; port
     push r5                      ; partitions remaining
@@ -74,7 +130,7 @@ bootdev_probe:
         cmp r0, PART_TYPE_RAW
         jne .chkcatfs
         cmp r7, 0
-        jne .track               ; only take the first raw partition
+        jne .next                ; only take the first raw partition
         vload r2, r6, PE_START   ; build the /sys descriptor
         vload r3, r6, PE_COUNT
         mov r1, r4
@@ -83,27 +139,19 @@ bootdev_probe:
         je .bad
         mov [sys_bf], r0
         mov r7, 1
-        jmp .track
+        jmp .next
         .chkcatfs:
         cmp r0, PART_TYPE_CATFS  ; first CatFS partition -> the root device
-        jne .track
+        jne .next
         mov r0, [catfs_bf]
         cmp r0, 0
-        jne .track
+        jne .next
         vload r2, r6, PE_START
         vload r3, r6, PE_COUNT
         mov r1, r4
         call bf_new
         mov [catfs_bf], r0
-        .track:
-        vload r0, r6, PE_START   ; extend the whole-disk size estimate
-        vload r1, r6, PE_COUNT
-        add r0, r1
-        mov r2, [disk_extent_blocks]
-        cmp r0, r2
-        jule .noext
-        mov [disk_extent_blocks], r0
-        .noext:
+        .next:
         add r6, PT_ENTRY_SIZE
         sub r5, 1
         jmp .loop

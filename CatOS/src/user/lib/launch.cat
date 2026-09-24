@@ -1,0 +1,872 @@
+; launch.cat - running a program without a shell.
+;
+; A window manager that never shows the console has a bootstrapping problem: the
+; only way to start a program is to type at a shell, and the shell is exactly what
+; you cannot see. So both managers grow a one-line prompt, and this is the half of
+; it that is not a matter of policy.
+;
+; What stays in each manager is everything a *user* can tell apart: which key opens
+; the prompt, whether it takes the keyboard while it is up, where the box is drawn
+; and what it looks like. desktop.cat and tile.cat deliberately share no code about
+; how a screen should work, and none of that changes here. What they share is the
+; machinery below, which has one right answer and is not worth two copies - the same
+; reason fileutil.cat exists for the file utilities.
+;
+; Include it AFTER main, like fmt.cat: a program starts at its first instruction.
+;
+;
+; -- Two modes: applications, and a raw command line -------------------------
+;
+; The prompt opens in one of two modes, and the manager decides which key means
+; which (both bind CTRL+` to applications and CTRL+SHIFT+` to raw):
+;
+;   LMODE_APPS   what you type filters the applications found in /apps, the
+;                matches are listed, and Enter runs the selected one.
+;   LMODE_RAW    what you type IS the command line, resolved against /bin, as it
+;                has always been.
+;
+; Applications exist because "type the name of the binary" is a poor answer to
+; "what can this machine do" - it is only usable by someone who already knows.
+; /apps is the list of what is worth starting, written down where a user can read
+; it, and it is deliberately *data*: a file per application, so adding one is
+; adding a file and no program is rebuilt. The raw mode stays because the list can
+; never be complete, and typing a command with arguments has to remain possible.
+;
+;
+; -- What an application entry is ---------------------------------------------
+;
+; One file in /apps, "key=value" per line, blank lines and lines starting with '#'
+; ignored. Three keys, all that a launcher can honestly use:
+;
+;   name=   what the launcher lists it as
+;   exec=   the command line to run, resolved against /bin exactly the way the raw
+;           mode and the shell resolve one, so arguments are allowed
+;   desc=   one line of what it is, shown beside the name
+;
+; An entry with no name or no exec is skipped rather than listed as something that
+; cannot be started. Unknown keys are ignored, so the format can grow without
+; breaking a manager built before it did.
+;
+; The list is read once, at startup: /apps changes when somebody installs
+; something, which is not something a compositor should be polling a filesystem
+; for every frame.
+;
+;
+; -- Why this reaps -----------------------------------------------------------
+;
+; Spawning without waiting leaks: sys_exit turns a process into a ZOMBIE and only a
+; wait() on its pid frees the slot, so a manager that launches programs all session
+; would eat all MAX_PROCS of them and then be unable to start anything at all. The
+; shell has always had this bug with "&" and gets away with it by being short-lived.
+; A manager is not, so launch_reap looks for a child of ours that has already
+; exited - pslist reports the state, so we only ever call wait() on a process that
+; is certain not to block - and frees one per call.
+
+#define LAUNCH_MAX, 63               ; longest command line, terminator excluded
+#define LAUNCH_ARGS, 8               ; most tokens on one line (argv slots)
+#define LAUNCH_PATHBUF, 72           ; "/bin/" + a command name, and "/apps/" + a
+                                     ; directory entry, which is the longer of the two
+
+#define LMODE_APPS, 0                ; the prompt filters /apps
+#define LMODE_RAW, 1                 ; the prompt is a command line
+
+#define LAUNCH_APPS_MAX, 12          ; applications we will hold
+#define APP_NAME_MAX, 24
+#define APP_EXEC_MAX, 40
+#define APP_DESC_MAX, 64
+#define APP_NAME, 0                  ; fields within one record
+#define APP_EXEC, 24
+#define APP_DESC, 64
+#define APP_REC, 128                 ; APP_DESC + APP_DESC_MAX
+#define APPFILE_MAX, 512             ; the most of one entry file we will read -
+                                     ; a whole block, so an entry can carry a comment
+                                     ; header and still have its fields read
+
+
+; Empty the line and enter a mode. Call when the prompt opens, so it never comes up
+; holding the last thing that was typed at it. r1 = LMODE_*
+launch_open:
+    mov [launch_mode], r1
+    mov r0, 0
+    mov [launch_len], r0
+    mov [launch_sel], r0
+    mov8 [launch_line], r0
+    call launch_refilter
+    ret
+
+
+; Change mode without losing what has been typed - which is the point: a name that
+; matched no application is exactly the thing you then want to run as a command.
+; r1 = LMODE_*
+launch_setmode:
+    mov [launch_mode], r1
+    mov r0, 0
+    mov [launch_sel], r0
+    call launch_refilter
+    ret
+
+
+; Append one character, if it is one and there is room. r1 = the character a key
+; event produced, which is 0 for everything that types nothing - the arrows, the
+; function keys - and a control code for a control chord, so the caller can hand
+; over whatever it got without sorting it first.
+launch_putc:
+    push r4                          ; length
+    cmp r1, 32                       ; space is the lowest thing worth keeping
+    jul .done
+    cmp r1, 126
+    jug .done
+    mov r4, [launch_len]
+    cmp r4, LAUNCH_MAX
+    juge .done                       ; full: drop it rather than scroll
+    mov r0, launch_line
+    add r0, r4
+    mov8 [r0], r1
+    add r4, 1
+    mov [launch_len], r4
+    mov r0, launch_line
+    add r0, r4
+    mov8 [r0], 0
+    call launch_refilter             ; editing the line is editing the search
+    .done:
+    pop r4
+    ret
+
+
+; Delete the last character, if there is one.
+launch_erase:
+    mov r0, [launch_len]
+    cmp r0, 0
+    je .done
+    sub r0, 1
+    mov [launch_len], r0
+    mov r1, launch_line
+    add r1, r0
+    mov8 [r1], 0
+    call launch_refilter
+    .done:
+    ret
+
+
+; Move the selection through the match list, clamped at both ends rather than
+; wrapping. r1 = -1 or +1. A no-op with nothing matched, and in raw mode, where
+; there are no matches by definition.
+launch_move:
+    push r4                          ; the new selection
+    mov r4, [launch_sel]
+    add r4, r1
+    cmp r4, 0
+    jige .top
+    mov r4, 0
+    .top:
+    mov r0, [launch_nmatch]
+    cmp r0, 0
+    je .none
+    sub r0, 1
+    cmp r4, r0
+    jule .set
+    mov r4, r0
+    .set:
+    mov [launch_sel], r4
+    pop r4
+    ret
+    .none:
+    mov r0, 0
+    mov [launch_sel], r0
+    pop r4
+    ret
+
+
+; Start whatever the prompt is currently pointing at, in the background.
+; -> r0 = the new pid, or -1 if there is nothing to run.
+launch_commit:
+    mov r0, [launch_mode]
+    cmp r0, LMODE_RAW
+    je launch_run
+    mov r1, [launch_sel]             ; the selected match, if there is one
+    call launch_match_rec
+    cmp r0, 0
+    je .fail
+    mov r1, r0
+    add r1, APP_EXEC
+    mov r2, APP_EXEC_MAX
+    jmp launch_spawn_line
+    .fail:
+    mov r0, -1
+    ret
+
+
+; Run what has been typed, in the background. -> r0 = the new pid, or -1 if the
+; line was blank or there is no such program in /bin.
+launch_run:
+    mov r1, launch_line
+    mov r2, LAUNCH_MAX + 1
+    jmp launch_spawn_line
+
+
+; Spawn a command line without waiting for it. r1 = the line, r2 = how many bytes
+; of it there are to copy. -> r0 = pid, or -1 if it was blank or no such program.
+;
+; The line is copied before it is split, because tokenising writes terminators over
+; the spaces - doing that in place would silently rewrite what the prompt is
+; displaying (or an application's own exec line), which matters precisely when the
+; spawn fails and the box stays up for the typo to be corrected.
+launch_spawn_line:
+    mov r0, launch_scratch
+    cpy r1, r2
+    mov r0, launch_scratch           ; whatever the count was, stop at the end of it
+    add r0, r2
+    mov8 [r0], 0
+    mov r1, launch_scratch
+    call launch_tokenize
+    cmp r0, 0
+    je .fail                         ; nothing but spaces
+    call launch_buildpath
+    mov r3, launch_argv
+    mov r2, launch_path
+    mov r1, SYS_SPAWN
+    syscall                          ; and no wait: that is what "in the background"
+    ret                              ; means, and launch_reap cleans up after it
+    .fail:
+    mov r0, -1
+    ret
+
+
+; ==========================
+;   The application list
+; ==========================
+
+; Read /apps into the table. Call once at startup. A missing or unreadable
+; directory is not an error - it means no applications, and the raw mode still
+; works, which is the whole reason it is still there.
+launch_apps_init:
+    push r4                          ; the directory fd
+    mov r0, 0
+    mov [launch_napps], r0
+    sys_open launch_appsdir, O_READ
+    cmp r0, -1
+    je .done
+    mov r4, r0
+    .next:
+        mov r0, [launch_napps]
+        cmp r0, LAUNCH_APPS_MAX
+        juge .close                  ; full: the rest of the directory is ignored
+        sys_readdir r4, launch_namebuf, APP_NAME_MAX + 8
+        cmp r0, 1
+        jne .close                   ; 0 = end of directory, -1 = gone
+        call launch_app_read
+        jmp .next
+    .close:
+    sys_close r4
+    .done:
+    call launch_refilter
+    pop r4
+    ret
+
+
+; Read and parse the entry named by launch_namebuf into the next free slot,
+; committing it only if it turned out to name something runnable.
+launch_app_read:
+    push r4                          ; the record being filled
+    push r5                          ; the file's fd
+    push r6                          ; bytes read - kept across the close, which
+                                     ; returns a value of its own in r0
+    mov r1, launch_appspfx           ; "/apps/" + the directory entry
+    mov r2, launch_namebuf
+    call launch_joinpath
+    sys_open launch_path, O_READ
+    cmp r0, -1
+    je .done
+    mov r5, r0
+    sys_read r5, launch_filebuf, APPFILE_MAX - 1
+    mov r6, r0
+    sys_close r5
+    cmp r6, 0
+    jile .done
+    mov r1, launch_filebuf           ; terminate whatever we got
+    add r1, r6
+    mov8 [r1], 0
+
+    mov r4, [launch_napps]           ; the slot it would go in
+    umul r4, APP_REC
+    add r4, launch_apps
+    mov r1, r4
+    call launch_app_blank
+    mov r1, r4
+    call launch_app_parse
+    mov r0, r4                       ; a nameless entry, or one that runs nothing,
+    mov8 r0, [r0]                    ; is not an application - leave the slot free
+    cmp r0, 0
+    je .done
+    mov r0, r4
+    add r0, APP_EXEC
+    mov8 r0, [r0]
+    cmp r0, 0
+    je .done
+    mov r0, [launch_napps]
+    add r0, 1
+    mov [launch_napps], r0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Blank one record, so a field the file never mentions is empty rather than
+; whatever the last tenant of these bytes left. r1 = record
+launch_app_blank:
+    push r4
+    mov r4, APP_REC
+    .loop:
+        mov8 [r1], 0
+        add r1, 1
+        sub r4, 1
+        cmp r4, 0
+        jne .loop
+    pop r4
+    ret
+
+
+; Parse launch_filebuf into the record at r1: "key=value" a line at a time, '#'
+; and blank lines skipped, unknown keys ignored.
+launch_app_parse:
+    push r4                          ; the record
+    push r5                          ; cursor: the start of the line
+    push r6                          ; the '=' in this line, or 0
+    push r7                          ; the end of the line
+    mov r4, r1
+    mov r5, launch_filebuf
+    .line:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .done                     ; end of the file
+        mov r6, 0                    ; find the end of the line and the first '='
+        mov r7, r5
+        .scan:
+            mov8 r0, [r7]
+            cmp r0, 0
+            je .haveline
+            cmp r0, 10               ; \n
+            je .haveline
+            cmp r0, 61               ; '='
+            jne .scannext
+            cmp r6, 0
+            jne .scannext            ; a later '=' is part of the value
+            mov r6, r7
+            .scannext:
+            add r7, 1
+            jmp .scan
+        .haveline:
+        mov8 r0, [r5]
+        cmp r0, 35                   ; '#': a comment
+        je .nextline
+        cmp r6, 0
+        je .nextline                 ; no '=': not a field, and not our business
+
+        mov r1, r5                   ; which key is it?
+        mov r2, r6
+        mov r3, launch_key_name
+        call launch_keyis
+        cmp r0, 0
+        je .notname
+        mov r0, r4
+        mov [launch_fdest], r0
+        mov [launch_fmax], APP_NAME_MAX
+        jmp .store
+        .notname:
+        mov r1, r5
+        mov r2, r6
+        mov r3, launch_key_exec
+        call launch_keyis
+        cmp r0, 0
+        je .notexec
+        mov r0, r4
+        add r0, APP_EXEC
+        mov [launch_fdest], r0
+        mov [launch_fmax], APP_EXEC_MAX
+        jmp .store
+        .notexec:
+        mov r1, r5
+        mov r2, r6
+        mov r3, launch_key_desc
+        call launch_keyis
+        cmp r0, 0
+        je .nextline                 ; a key we do not know: skip it, do not fail
+        mov r0, r4
+        add r0, APP_DESC
+        mov [launch_fdest], r0
+        mov [launch_fmax], APP_DESC_MAX
+
+        .store:
+        mov r1, r6                   ; the value: just past the '=' to the line end
+        add r1, 1
+        mov r2, r7
+        call launch_copyfield
+
+        .nextline:
+        mov r5, r7                   ; past the newline, or stop at the terminator
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .done
+        add r5, 1
+        jmp .line
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Is the text between r1 and r2 exactly the null-terminated key at r3? -> r0 = 1/0
+launch_keyis:
+    push r4                          ; cursor into the line
+    push r5                          ; end of the key part of the line
+    push r6                          ; cursor into the literal
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+    .loop:
+        mov8 r0, [r6]
+        cmp r0, 0
+        je .keyend
+        cmp r4, r5
+        juge .no                     ; the line's key ran out first
+        mov8 r1, [r4]
+        cmp r0, r1
+        jne .no
+        add r4, 1
+        add r6, 1
+        jmp .loop
+    .keyend:
+    cmp r4, r5
+    jne .no                          ; the line's key is longer: "names" is not "name"
+    mov r0, 1
+    jmp .done
+    .no:
+    mov r0, 0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Copy the text between r1 and r2 into the field at [launch_fdest], truncated to
+; that field's size and always null-terminated. Trailing whitespace goes, so a file
+; written with CRLF or a stray space does not put one in the name.
+launch_copyfield:
+    push r4                          ; write cursor
+    push r5                          ; bytes left in the field
+    push r6                          ; read cursor
+    push r7                          ; end
+    mov r6, r1
+    mov r7, r2
+    .trim:
+        cmp r7, r6
+        jule .trimmed
+        mov r0, r7                   ; the byte before the end
+        sub r0, 1
+        mov8 r0, [r0]
+        cmp r0, 32
+        jug .trimmed
+        sub r7, 1                    ; a space, a tab or a \r: not part of the value
+        jmp .trim
+    .trimmed:
+    mov r4, [launch_fdest]
+    mov r5, [launch_fmax]
+    sub r5, 1                        ; room for the terminator
+    .copy:
+        cmp r6, r7
+        juge .done
+        cmp r5, 0
+        jule .done
+        mov8 r0, [r6]
+        mov8 [r4], r0
+        add r4, 1
+        add r6, 1
+        sub r5, 1
+        jmp .copy
+    .done:
+    mov8 [r4], 0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Build launch_path = r1 followed by r2, both null-terminated.
+launch_joinpath:
+    push r4                          ; write cursor
+    push r5                          ; read cursor
+    push r6                          ; the second string
+    mov r6, r2
+    mov r4, launch_path
+    mov r5, r1
+    .pre:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .predone
+        mov8 [r4], r0
+        add r4, 1
+        add r5, 1
+        jmp .pre
+    .predone:
+    mov r5, r6
+    .tail:
+        mov8 r0, [r5]
+        mov8 [r4], r0
+        cmp r0, 0
+        je .done
+        add r4, 1
+        add r5, 1
+        jmp .tail
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Rebuild the match list from what has been typed. Every application matches an
+; empty query, so opening the prompt shows the whole list - which is the answer to
+; "what can this machine do".
+launch_refilter:
+    push r4                          ; index
+    push r5                          ; matches so far
+    push r6                          ; the record
+    mov r5, 0
+    mov r0, [launch_mode]
+    cmp r0, LMODE_RAW
+    je .store                        ; a command line has no matches by definition
+    mov r4, 0
+    .each:
+        mov r0, [launch_napps]
+        cmp r4, r0
+        juge .store
+        mov r6, r4
+        umul r6, APP_REC
+        add r6, launch_apps
+        mov r0, [launch_len]
+        cmp r0, 0
+        je .take                     ; nothing typed: everything matches
+        mov r1, r6                   ; the name, then the command it runs, so that
+        mov r2, launch_line          ; both what it is called and what it is can be
+        call launch_contains         ; searched for
+        cmp r0, 0
+        jne .take
+        mov r1, r6
+        add r1, APP_EXEC
+        mov r2, launch_line
+        call launch_contains
+        cmp r0, 0
+        je .next
+        .take:
+        mov r0, r5
+        shl r0, 2
+        add r0, launch_match
+        mov [r0], r4
+        add r5, 1
+        .next:
+        add r4, 1
+        jmp .each
+    .store:
+    mov [launch_nmatch], r5
+    mov r0, [launch_sel]             ; keep the selection inside the new list
+    cmp r0, r5
+    jul .done
+    mov r0, r5
+    cmp r0, 0
+    je .zero
+    sub r0, 1
+    .zero:
+    mov [launch_sel], r0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Does the string at r1 contain the string at r2, ignoring case? -> r0 = 1/0.
+; Case-insensitive because a launcher that will not find "Terminal" when you type
+; "term" is a launcher you have to already know the answer to use.
+launch_contains:
+    push r4                          ; where this attempt starts
+    push r5                          ; haystack cursor
+    push r6                          ; needle cursor
+    push r7                          ; scratch
+    mov r4, r1
+    .attempt:
+        mov r5, r4
+        mov r6, r2
+        .compare:
+            mov8 r0, [r6]
+            cmp r0, 0
+            je .yes                  ; the needle ran out: every byte matched
+            mov8 r7, [r5]
+            cmp r7, 0
+            je .no                   ; the haystack ran out first
+            call launch_lower        ; r0 = lower(needle byte)
+            mov r1, r0
+            mov r0, r7
+            call launch_lower
+            cmp r0, r1
+            jne .advance
+            add r5, 1
+            add r6, 1
+            jmp .compare
+        .advance:
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .no
+        add r4, 1
+        jmp .attempt
+    .yes:
+    mov r0, 1
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+    .no:
+    mov r0, 0
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; r0 = the lower-case form of the character in r0.
+launch_lower:
+    cmp r0, 65                       ; 'A'
+    jul .done
+    cmp r0, 90                       ; 'Z'
+    jug .done
+    add r0, 32
+    .done:
+    ret
+
+
+; The record behind match row r1 -> r0 = its address, or 0 if there is no such row.
+; The one way a manager reaches an application, so nothing outside this file has to
+; know how a record is laid out.
+launch_match_rec:
+    mov r0, [launch_nmatch]
+    cmp r1, r0
+    juge .none
+    cmp r1, 0
+    jil .none
+    mov r0, r1
+    shl r0, 2
+    add r0, launch_match
+    mov r0, [r0]
+    umul r0, APP_REC
+    add r0, launch_apps
+    ret
+    .none:
+    mov r0, 0
+    ret
+
+
+; The name and the description of match row r1 -> r0 = a string, or 0.
+launch_match_name:
+    jmp launch_match_rec             ; the name is the head of the record
+
+launch_match_desc:
+    call launch_match_rec
+    cmp r0, 0
+    je .none
+    add r0, APP_DESC
+    .none:
+    ret
+
+
+; The first match row to draw, given that only r1 of them fit on screen: enough to
+; keep the selected one visible, and 0 whenever the whole list fits. Shared because
+; it is arithmetic, not taste - where the rows go and how many fit is the manager's.
+launch_first:
+    mov r0, [launch_sel]
+    cmp r0, r1
+    jul .top                         ; the selection is inside the first window
+    sub r0, r1
+    add r0, 1
+    ret
+    .top:
+    mov r0, 0
+    ret
+
+
+; Reap one child that has already exited, freeing its process slot. r1 = our own
+; pid (getpid once at startup rather than every frame). Cheap enough to call from a
+; compositor's main loop: one pslist and, at most, one wait that cannot block.
+launch_reap:
+    push r4                          ; our pid
+    push r5                          ; the record being examined
+    push r6                          ; index
+    push r7                          ; records returned
+    mov r4, r1
+    sys_pslist launch_ps, PS_MAX
+    cmp r0, 0
+    jile .done
+    mov r7, r0
+    mov r6, 0
+    .each:
+        cmp r6, r7
+        juge .done
+        mov r5, r6
+        umul r5, PSREC_BYTES
+        add r5, launch_ps
+        mov r0, r5
+        add r0, PSREC_STATE
+        mov r0, [r0]
+        cmp r0, PS_ZOMBIE
+        jne .next
+        mov r0, r5
+        add r0, PSREC_PPID
+        mov r0, [r0]
+        cmp r0, r4
+        jne .next                    ; somebody else's problem
+        mov r0, [r5]                 ; its pid; it is already dead, so this returns
+        sys_wait r0                  ; immediately instead of blocking us
+        jmp .done                    ; one a frame is plenty
+        .next:
+        add r6, 1
+        jmp .each
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Split the null-terminated line at r1 into tokens, writing a pointer to each into
+; launch_argv and null-terminating the array. Spaces between tokens are overwritten
+; with 0 so each entry is its own string. -> r0 = argc.
+launch_tokenize:
+    push r4                          ; cursor
+    push r5                          ; argc
+    push r6                          ; scratch
+    mov r4, r1
+    mov r5, 0
+    .skip:                           ; skip leading spaces
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .fin
+        cmp r0, 32
+        jne .tok
+        add r4, 1
+        jmp .skip
+    .tok:                            ; record the start of a token
+        cmp r5, LAUNCH_ARGS
+        juge .fin
+        mov r6, r5
+        shl r6, 2
+        add r6, launch_argv
+        mov [r6], r4
+        add r5, 1
+    .scan:                           ; advance to the end of the token
+        mov8 r0, [r4]
+        cmp r0, 0
+        je .fin
+        cmp r0, 32
+        jne .scannext
+        mov8 [r4], 0                 ; terminate it and resume at the next character
+        add r4, 1
+        jmp .skip
+    .scannext:
+        add r4, 1
+        jmp .scan
+    .fin:
+    mov r6, r5                       ; null-terminate the pointer array
+    shl r6, 2
+    add r6, launch_argv
+    mov [r6], 0
+    mov r0, r5
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Build launch_path = "/bin/" followed by argv[0]. Commands are resolved the same
+; way the shell resolves them, so what works at a prompt works here.
+launch_buildpath:
+    push r4                          ; write cursor
+    push r5                          ; read cursor
+    mov r4, launch_path
+    mov r5, launch_bin
+    .pre:
+        mov8 r0, [r5]
+        cmp r0, 0
+        je .predone
+        mov8 [r4], r0
+        add r4, 1
+        add r5, 1
+        jmp .pre
+    .predone:
+    mov r5, [launch_argv]            ; the command name, terminator included
+    .name:
+        mov8 r0, [r5]
+        mov8 [r4], r0
+        cmp r0, 0
+        je .namedone
+        add r4, 1
+        add r5, 1
+        jmp .name
+    .namedone:
+    pop r5
+    pop r4
+    ret
+
+
+launch_bin:
+    dstr "/bin/\0"
+launch_appsdir:
+    dstr "/apps\0"
+launch_appspfx:
+    dstr "/apps/\0"
+launch_key_name:
+    dstr "name\0"
+launch_key_exec:
+    dstr "exec\0"
+launch_key_desc:
+    dstr "desc\0"
+launch_mode:
+    d32 LMODE_APPS                   ; LMODE_*: what the line means
+launch_len:
+    d32 0                            ; characters in launch_line
+launch_line:
+    res8 LAUNCH_MAX + 1              ; what is on screen, always null-terminated
+launch_scratch:
+    res8 LAUNCH_MAX + 2              ; the copy that tokenising is allowed to chew up,
+                                     ; with room to terminate a full-length line
+launch_argv:
+    res8 LAUNCH_ARGS * 4 + 4         ; the pointer array, null-terminated
+launch_path:
+    res8 LAUNCH_PATHBUF
+launch_ps:
+    res8 PS_MAX * PSREC_BYTES        ; one pslist snapshot, for launch_reap
+; ---- the application list ----
+launch_apps:
+    res8 LAUNCH_APPS_MAX * APP_REC   ; every entry read out of /apps
+launch_napps:
+    d32 0
+launch_match:
+    res8 LAUNCH_APPS_MAX * 4         ; indices into launch_apps, filtered by the line
+launch_nmatch:
+    d32 0
+launch_sel:
+    d32 0                            ; which match Enter would run
+launch_namebuf:
+    res8 APP_NAME_MAX + 8            ; one directory entry while /apps is being read
+launch_filebuf:
+    res8 APPFILE_MAX                 ; one entry file while it is being parsed
+launch_fdest:
+    d32 0                            ; launch_copyfield's destination field and its
+launch_fmax:
+    d32 0                            ; size, set by the caller like fill_rect's inputs

@@ -1,0 +1,214 @@
+; rm - delete files and directories.
+;
+;   rm [-r] <path> [path ...]
+;
+; Without -r this removes a file, or a directory that is already empty. The
+; kernel refuses a populated one outright, because a filesystem's remove frees
+; the child's blocks - handed a directory with entries in it, CatFS would free
+; the very blocks holding those entries and everything underneath would be lost
+; and still marked in use. So a tree has to be taken apart from the leaves up,
+; and -r is that loop, in userland, where it belongs: the kernel keeps its one
+; safe operation and the recursion happens somewhere it can be interrupted.
+;
+; The walk deletes the *first* entry of a directory over and over, reopening it
+; each time, until there is nothing left. Reopening is what lets it close the
+; directory before descending, so only one file descriptor is ever in use no
+; matter how deep the tree goes - and after the entry is gone, its successor is
+; the first entry again, so the cursor never has to be remembered either.
+;
+; Each argument is attempted even if an earlier one failed; the exit code is 1 if
+; any of them did.
+#include "lib/sys.cat"
+
+; A directory entry name. CatFS caps one at 27 bytes; this is the buffer readdir
+; fills, and it has to be a constant this file knows at its first pass, which is
+; why it is here rather than in fileutil.cat.
+#define NAME_MAX, 64
+
+main:
+    mov r5, r1                       ; argc
+    mov r6, r2                       ; argv
+    cmp r5, 2
+    jul .usage
+
+    mov r4, 1                        ; first path argument
+    mov r1, r6                       ; a leading "-r" turns on the tree walk
+    add r1, 4
+    mov r1, [r1]
+    mov r2, dashr
+    call fstreq
+    cmp r0, 0
+    je .noflag
+    mov r0, 1
+    mov [recursive], r0
+    mov r4, 2
+    .noflag:
+    cmp r4, r5
+    juge .usage                      ; "-r" on its own is not a request
+
+    mov r7, 0                        ; failures so far
+.loop:
+    cmp r4, r5
+    juge .done
+    mov r1, r4                       ; argv[r4]
+    shl r1, 2
+    add r1, r6
+    mov r1, [r1]
+    call kill_path
+    cmp r0, 0
+    je .next
+    mov r7, 1
+    .next:
+    add r4, 1
+    jmp .loop
+
+.done:
+    sys_exit r7
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+
+
+; kill_path(r1 = path) -> r0 = 0 on success, -1 on failure (already reported).
+; Loads the path into the shared buffer and hands it to the right remover.
+kill_path:
+    push r4                          ; path length
+    mov r2, path_buf
+    call pathset
+    cmp r0, -1
+    je .toolong
+    mov r4, r0
+    mov r0, [recursive]
+    cmp r0, 0
+    je .plain
+    mov r1, r4
+    call rmtree
+    jmp .out
+    .plain:
+    sys_remove path_buf
+    cmp r0, 0
+    je .out
+    mov r1, eplain
+    call report
+    mov r0, -1
+    jmp .out
+    .toolong:
+    mov r1, elong
+    call report
+    mov r0, -1
+    .out:
+    pop r4
+    ret
+
+
+; rmtree(r1 = the length of the path in path_buf) -> r0 = 0 / -1.
+;
+; Recursive, and deliberately re-entrant on one buffer: it appends "/child"
+; before descending and truncates back to its own length on the way out, so the
+; buffer always holds the path of the level currently running.
+rmtree:
+    push r5                          ; our path length
+    push r6                          ; the open directory, then the entry count
+    push r7                          ; the child's length
+    mov r5, r1
+
+    sys_stat path_buf, rm_st
+    cmp r0, 0
+    jne .missing
+    mov r0, [rm_st + ST_TYPE]
+    cmp r0, T_DIR
+    jne .leaf
+
+    .drain:
+        sys_open path_buf, O_READ    ; reopen each round: the entry we just
+        mov r6, r0                   ; deleted is gone, so the one that follows
+        cmp r6, -1                   ; it has become the first again
+        je .unreadable
+        sys_readdir r6, namebuf, NAME_MAX
+        mov r7, r0
+        sys_close r6
+        cmp r7, 1
+        jne .empty                   ; 0 = nothing left, -1 = not readable
+
+        mov r1, r5                   ; descend into path_buf + "/" + name
+        mov r2, namebuf
+        mov r3, path_buf
+        call pathpush
+        cmp r0, -1
+        je .childtoolong
+        mov r1, r0
+        call rmtree
+        push r0                      ; truncate back to our own path either way
+        mov r1, path_buf
+        add r1, r5
+        mov8 [r1], 0
+        pop r0
+        cmp r0, 0
+        jne .failed                  ; the child reported it; do not pile on
+        jmp .drain
+    .empty:
+
+    .leaf:
+    sys_remove path_buf
+    cmp r0, 0
+    jne .stubborn
+    mov r0, 0
+    jmp .out
+
+    .missing:
+    mov r1, emissing
+    jmp .complain
+    .unreadable:
+    mov r1, eopen
+    jmp .complain
+    .childtoolong:
+    mov r1, elong
+    jmp .complain
+    .stubborn:
+    mov r1, eplain
+    .complain:
+    call report
+    .failed:
+    mov r0, -1
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    ret
+
+
+; report(r1 = message) - the message followed by the path the walk is on.
+report:
+    call emit_str
+    mov r1, path_buf
+    call emit_str
+    mov r1, 10                       ; '\n'
+    call emit_char
+    call flush
+    ret
+
+
+recursive:
+    d32 0
+dashr:
+    dstr "-r\0"
+usage:
+    dstr "usage: rm [-r] <path> [path ...]\n"
+usage_end:
+eplain:
+    dstr "rm: cannot remove \0"
+emissing:
+    dstr "rm: no such path: \0"
+eopen:
+    dstr "rm: cannot read directory \0"
+elong:
+    dstr "rm: path too long: \0"
+
+rm_st:
+    res8 ST_STRUCT
+namebuf:
+    res8 NAME_MAX
+
+#include "lib/fmt.cat"
+#include "lib/fileutil.cat"

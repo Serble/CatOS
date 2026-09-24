@@ -137,3 +137,30 @@ intregister:
     pop r5
     pop r4
     ret
+
+
+; The handler registered for an interrupt code - what intregister would replace.
+; r1 - interrupt code
+; returns r0 = the handler address, or 0 if none is registered
+intlookup:
+    push r4                      ; entries left
+    mov8 r4, [int_table]
+    mov r2, int_table_entries
+    .scan:
+        cmp r4, 0
+        je .none
+        mov8 r0, [r2]
+        cmp r0, r1
+        je .found
+        add r2, INT_ENTRY_SIZE
+        sub r4, 1
+        jmp .scan
+    .found:
+    add r2, 1
+    mov r0, [r2]
+    jmp .done
+    .none:
+    mov r0, 0
+    .done:
+    pop r4
+    ret

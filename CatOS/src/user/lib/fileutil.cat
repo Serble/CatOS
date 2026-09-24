@@ -1,0 +1,271 @@
+; ==========================
+;   Shared file and path helpers
+; ==========================
+; The parts cp, mv and rm would otherwise each own a copy of: string basics, a
+; path buffer you can push a component onto and pop it back off, and the read/
+; write loop that actually moves a file's bytes.
+;
+; Include it AFTER the program's main body, for the same reason fmt.cat says so:
+; a program is loaded at user vaddr 0 and starts at its first instruction, so an
+; include placed first would run instead of main.
+;
+; The path buffer is a single global rather than something the caller supplies,
+; because the one thing that needs it recursively - rm's tree walk - wants it
+; that way: it appends a component before descending and truncates back on the
+; way out, so every level shares one buffer and the "current path" is always just
+; path_buf plus a length. A second buffer (path_alt) is there for the programs
+; that have to hold a source and a destination at the same time.
+;
+; Clobbers r0-r3 like any other procedure and preserves r4-r7.
+
+#define PATH_MAX, 256                    ; matches the kernel's VFS_PATH_MAX
+#define COPY_BUFSZ, 512                  ; one block per read/write round trip
+
+
+; fstreq(r1, r2 = strings) -> r0 = 1 if identical, else 0.
+fstreq:
+    .loop:
+        mov8 r0, [r1]
+        mov8 r3, [r2]
+        cmp r0, r3
+        jne .differ
+        cmp r0, 0
+        je .same
+        add r1, 1
+        add r2, 1
+        jmp .loop
+    .same:
+    mov r0, 1
+    ret
+    .differ:
+    mov r0, 0
+    ret
+
+
+; fbasename(r1 = path) -> r0 = the final component, pointing into the same
+; string. "/a/b" gives "b", "b" gives "b", and a trailing slash gives the empty
+; string - which every caller here treats as "no name", the right answer for a
+; path that names a directory rather than a thing inside one.
+fbasename:
+    mov r0, r1
+    .loop:
+        mov8 r2, [r1]
+        cmp r2, 0
+        je .done
+        cmp r2, 47                       ; '/'
+        jne .next
+        mov r0, r1
+        add r0, 1
+        .next:
+        add r1, 1
+        jmp .loop
+    .done:
+    ret
+
+
+; pathset(r1 = string, r2 = destination buffer) -> r0 = the length copied, or -1
+; if it does not fit. The buffer is PATH_MAX bytes.
+pathset:
+    push r4                              ; remaining capacity
+    push r5                              ; length so far
+    mov r4, PATH_MAX - 1
+    mov r5, 0
+    .loop:
+        mov8 r0, [r1]
+        cmp r0, 0
+        je .done
+        cmp r4, 0
+        je .toolong
+        mov8 [r2], r0
+        add r1, 1
+        add r2, 1
+        add r5, 1
+        sub r4, 1
+        jmp .loop
+    .done:
+    mov8 [r2], 0
+    mov r0, r5
+    jmp .out
+    .toolong:
+    mov r0, -1
+    .out:
+    pop r5
+    pop r4
+    ret
+
+
+; pathpush(r1 = current length, r2 = component, r3 = buffer) -> r0 = the new
+; length, or -1 if it does not fit. Appends "/component", skipping the separator
+; when the buffer already ends in one so that a path rooted at "/" does not come
+; out as "//name".
+pathpush:
+    push r4                              ; write cursor
+    push r5                              ; length
+    push r6                              ; component
+    push r7                              ; buffer
+    mov r5, r1
+    mov r6, r2
+    mov r7, r3
+    mov r4, r7
+    add r4, r5
+
+    cmp r5, 0                            ; an empty buffer needs no separator
+    je .nosep
+    mov r0, r4
+    sub r0, 1
+    mov8 r0, [r0]
+    cmp r0, 47                           ; already ends in '/'
+    je .nosep
+    cmp r5, PATH_MAX - 2
+    juge .toolong
+    mov8 [r4], 47
+    add r4, 1
+    add r5, 1
+    .nosep:
+
+    .loop:
+        mov8 r0, [r6]
+        cmp r0, 0
+        je .done
+        cmp r5, PATH_MAX - 1
+        juge .toolong
+        mov8 [r4], r0
+        add r4, 1
+        add r5, 1
+        add r6, 1
+        jmp .loop
+    .done:
+    mov8 [r4], 0
+    mov r0, r5
+    jmp .out
+    .toolong:
+    mov r0, -1
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; dstpath(r1 = source path, r2 = destination path) -> r0 = the path to write to,
+; or -1 if it does not fit. Resolves the "copy it *into* that directory" form:
+; when the destination names an existing directory the answer is that directory
+; plus the source's final component, built in path_alt; otherwise the
+; destination is taken literally and handed straight back.
+;
+; This is why cp and mv need stat at all - "cp f d" and "cp f g" are the same two
+; strings, and only the type of what is already on disk tells them apart.
+dstpath:
+    push r4                              ; source
+    push r5                              ; destination
+    push r6                              ; length
+    mov r4, r1
+    mov r5, r2
+
+    sys_stat r5, fu_st
+    cmp r0, 0
+    jne .literal                         ; nothing there: a plain new name
+    mov r0, [fu_st + ST_TYPE]
+    cmp r0, T_DIR
+    jne .literal
+
+    mov r1, r5                           ; the directory ...
+    mov r2, path_alt
+    call pathset
+    cmp r0, -1
+    je .toolong
+    mov r6, r0
+    mov r1, r4                           ; ... plus the source's own name
+    call fbasename
+    mov r2, r0
+    mov8 r0, [r2]
+    cmp r0, 0
+    je .toolong                          ; a source ending in '/' names nothing
+    mov r1, r6
+    mov r3, path_alt
+    call pathpush
+    cmp r0, -1
+    je .toolong
+    mov r0, path_alt
+    jmp .out
+
+    .literal:
+    mov r0, r5
+    jmp .out
+    .toolong:
+    mov r0, -1
+    .out:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; copyfile(r1 = source path, r2 = destination path) -> r0 = 0 on success, or one
+; of the CPE_* codes below. The destination is created if missing and truncated
+; if not, so a copy leaves exactly the source's bytes and nothing of whatever was
+; there before.
+;
+; A short write is an error rather than a silent partial copy: CatFS caps a file
+; at 69632 bytes and a full partition stops accepting blocks, and in both cases
+; the useful thing to say is that the copy did not happen.
+#define CPE_SRC, 1                       ; cannot open the source
+#define CPE_DST, 2                       ; cannot create the destination
+#define CPE_WRITE, 3                     ; the destination would not take it all
+
+copyfile:
+    push r5                              ; source fd
+    push r6                              ; destination fd
+    push r7                              ; destination path, then bytes in hand
+    mov r7, r2
+    sys_open r1, O_READ
+    mov r5, r0
+    cmp r5, -1
+    je .nosrc
+    sys_open r7, O_WRITE + O_CREATE + O_TRUNC
+    mov r6, r0
+    cmp r6, -1
+    je .nodst
+
+    .loop:
+        sys_read r5, copy_buf, COPY_BUFSZ
+        mov r7, r0
+        cmp r7, 0
+        jile .done                       ; 0 = end of file, < 0 = read error
+        sys_write r6, copy_buf, r7
+        cmp r0, r7
+        jne .shortwrite
+        jmp .loop
+    .done:
+    sys_close r6
+    sys_close r5
+    mov r0, 0
+    jmp .out
+
+    .shortwrite:
+    sys_close r6
+    sys_close r5
+    mov r0, CPE_WRITE
+    jmp .out
+    .nodst:
+    sys_close r5
+    mov r0, CPE_DST
+    jmp .out
+    .nosrc:
+    mov r0, CPE_SRC
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    ret
+
+
+fu_st:
+    res8 ST_STRUCT
+path_buf:
+    res8 PATH_MAX
+path_alt:
+    res8 PATH_MAX
+copy_buf:
+    res8 COPY_BUFSZ

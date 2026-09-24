@@ -1,0 +1,164 @@
+; stat - report what a path is.
+;
+;   stat <path> [path ...]
+;
+; One row per name: its size, what kind of node it is, and the path itself. A
+; name that does not resolve says so and the exit code becomes 1, which makes
+; this the way a script asks "does this exist?" as well as "how big is it?".
+;
+; The stat struct also carries a flag word, which is not shown: nothing in the
+; kernel ever sets one, so it would be a column of zeroes - and at 32 columns the
+; console has none to spare. sys.cat documents the field for whatever eventually
+; fills it in.
+;
+; The size of a directory is the size its filesystem gives it, not an entry count
+; - on CatFS that is the byte length of its entry table, 32 bytes per slot,
+; including slots freed by a remove. Use ls to count what is actually in one.
+#include "lib/sys.cat"
+
+main:
+    mov r5, r1                       ; argc
+    mov r6, r2                       ; argv
+    cmp r5, 2
+    jul .usage
+    mov r7, 0                        ; failures so far
+
+    mov r1, header                   ; the columns are worth naming: "3" under
+    call emit_str                    ; a bare number could be anything
+    call endline
+
+    mov r4, 1                        ; argument index
+.loop:
+    cmp r4, r5
+    juge .done
+    mov r1, r4                       ; argv[r4]
+    shl r1, 2
+    add r1, r6
+    mov r1, [r1]
+    call show
+    cmp r0, 0
+    je .next
+    mov r7, 1
+    .next:
+    add r4, 1
+    jmp .loop
+
+.done:
+    sys_exit r7
+
+.usage:
+    sys_write 1, usage, usage_end - usage
+    sys_exit 1
+
+
+; show(r1 = path) -> r0 = 0 on success, -1 if the path does not resolve.
+; Writes one row.
+show:
+    push r4                          ; path
+    mov r4, r1
+    sys_stat r4, st
+    cmp r0, 0
+    jne .missing
+
+    mov r1, [st + ST_SIZE]
+    mov r2, 8
+    call emit_dec
+    mov r1, 2
+    call emit_spaces
+    mov r1, [st + ST_TYPE]           ; the type names carry their own padding, so
+    call typename                    ; the name column lines up without a helper
+    mov r1, r0
+    call emit_str
+    mov r1, r4
+    call emit_str
+    call endline
+    mov r0, 0
+    jmp .done
+
+    .missing:
+    mov r1, r4
+    call emit_str
+    mov r1, emissing
+    call emit_str
+    call endline
+    mov r0, -1
+    .done:
+    pop r4
+    ret
+
+
+; endline() - finish the row. flush writes what has been assembled and nothing
+; more, so the newline has to be part of the row.
+endline:
+    mov r1, 10
+    call emit_char
+    call flush
+    ret
+
+
+; typename(r1 = ST_TYPE) -> r0 = a name padded to TYPEW characters.
+typename:
+    cmp r1, T_FILE
+    je .file
+    cmp r1, T_DIR
+    je .dir
+    cmp r1, T_CHARDEV
+    je .chr
+    cmp r1, T_BLOCKDEV
+    je .blk
+    mov r0, tunknown
+    ret
+    .file:
+    mov r0, tfile
+    ret
+    .dir:
+    mov r0, tdir
+    ret
+    .chr:
+    mov r0, tchr
+    ret
+    .blk:
+    mov r0, tblk
+    ret
+
+
+; emit_spaces(r1 = count)
+emit_spaces:
+    push r4
+    mov r4, r1
+    .loop:
+        cmp r4, 0
+        je .done
+        mov r1, 32
+        call emit_char
+        sub r4, 1
+        jmp .loop
+    .done:
+    pop r4
+    ret
+
+
+usage:
+    dstr "usage: stat <path> [path ...]\n"
+usage_end:
+header:
+    dstr "    size  type     name\0"
+emissing:
+    dstr ": no such path\0"
+
+; padded to a common width so the column after them stays put
+tfile:
+    dstr "file     \0"
+tdir:
+    dstr "dir      \0"
+tchr:
+    dstr "chardev  \0"
+tblk:
+    dstr "blockdev \0"
+tunknown:
+    dstr "?        \0"
+
+st:
+    res8 ST_STRUCT
+
+#include "lib/fmt.cat"

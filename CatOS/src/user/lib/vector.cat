@@ -1,0 +1,367 @@
+; ==========================
+;   Growable array
+; ==========================
+; A vector: a contiguous run of fixed-size elements that grows as you push onto
+; it. The thing every program here has been writing by hand as a fixed-size
+; buffer plus a count - tile.cat's window records, ps's process list, the shell's
+; argument array - except that it is not fixed and cannot silently drop the
+; entries past the end of a buffer somebody sized once.
+;
+; **Requires lib/heap.cat**, and the program must include that first: this file
+; calls halloc/hrealloc/hfree and defines none of them. Include both AFTER the
+; program's main body, for the reason fmt.cat gives - but *before* the data block
+; that reserves a descriptor, because res8 resolves its size on the assembler's
+; first pass and VEC_STRUCT has to exist by then.
+;
+; The descriptor is the caller's - res8 VEC_STRUCT wherever you want it, or push
+; one on the stack - and every routine takes a pointer to it. Only the element
+; storage is on the heap. That keeps a vector usable before the heap has ever
+; been touched (an empty one owns nothing and allocates nothing) and lets a
+; program hold a vector in its image without a pointer chase to reach the length.
+;
+; Elements are copied in and out by value, VEC_ESIZE bytes at a time, so a vector
+; of structs stores the structs and not pointers to them. The corollary is that a
+; pointer from vec_at or vec_pop points into the buffer and is only good until
+; the next operation that can move it (anything that grows). Take the value, not
+; the address, if you are about to push.
+;
+; Clobbers r0-r3 like any other procedure and preserves r4-r7.
+
+; The descriptor. Read VEC_LEN directly if you want a count; the routines below
+; are for anything that changes it.
+#define VEC_DATA, 0                      ; the element buffer, 0 when empty
+#define VEC_LEN, 4                       ; elements in use
+#define VEC_CAP, 8                       ; elements the buffer can hold
+#define VEC_ESIZE, 12                    ; bytes per element
+#define VEC_STRUCT, 16
+
+#define VEC_MINCAP, 8                    ; the first allocation's element count
+
+
+; vec_init(r1 = vector, r2 = element size in bytes) -> r0 = 0, or -1 if the
+; element size is zero. Nothing is allocated: an empty vector costs a descriptor.
+; Call this before anything else, and again after vec_free to reuse the slot.
+vec_init:
+    cmp r2, 0
+    je .bad
+    mov r3, r1
+    add r3, VEC_DATA
+    mov [r3], 0
+    mov r3, r1
+    add r3, VEC_LEN
+    mov [r3], 0
+    mov r3, r1
+    add r3, VEC_CAP
+    mov [r3], 0
+    mov r3, r1
+    add r3, VEC_ESIZE
+    mov [r3], r2
+    mov r0, 0
+    ret
+    .bad:
+    mov r0, -1
+    ret
+
+
+; vec_reserve(r1 = vector, r2 = elements) -> r0 = 0 on success, -1 if it could
+; not be allocated. Makes room for at least that many elements up front, for when
+; the size is known: it turns a run of pushes into one allocation.
+vec_reserve:
+    call vec_grow
+    ret
+
+
+; vec_push(r1 = vector, r2 = pointer to the element) -> r0 = 0 on success, -1 if
+; the vector could not grow. Copies VEC_ESIZE bytes from r2 onto the end.
+;
+; A failed push leaves the vector exactly as it was, so a caller that checks can
+; recover; one that does not gets a vector that is short rather than corrupt.
+vec_push:
+    push r4                              ; vector
+    push r5                              ; the element to copy in
+    push r6                              ; length before the push
+    push r7                              ; element size
+    mov r4, r1
+    mov r5, r2
+
+    mov r6, r4
+    add r6, VEC_LEN
+    mov r6, [r6]
+    mov r1, r4
+    mov r2, r6
+    add r2, 1
+    call vec_grow
+    cmp r0, 0
+    jne .fail
+
+    mov r7, r4                           ; slot = data + len * esize, which cannot
+    add r7, VEC_ESIZE                    ; overflow: vec_grow already proved that
+    mov r7, [r7]                         ; cap * esize fits, and len < cap
+    mov r0, r6
+    umul r0, r7
+    mov r1, r4
+    add r1, VEC_DATA
+    mov r1, [r1]
+    add r0, r1                           ; cpy takes its destination from r0
+    mov r1, r5
+    mov r2, r7
+    cpy r1, r2
+
+    mov r1, r4
+    add r1, VEC_LEN
+    mov r0, r6
+    add r0, 1
+    mov [r1], r0
+    mov r0, 0
+    jmp .out
+    .fail:
+    mov r0, -1
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; vec_pushw(r1 = vector, r2 = value) -> r0 = 0 on success, -1 on failure.
+; vec_push for the common case of a vector of words, without the caller having to
+; park the value in memory to have an address to hand over. The element size must
+; be 4; anything else is a mistake and comes back as -1.
+vec_pushw:
+    push r4
+    mov r4, r1
+    add r4, VEC_ESIZE
+    mov r4, [r4]
+    cmp r4, 4
+    jne .bad
+    mov [vec_word], r2
+    mov r2, vec_word
+    call vec_push
+    pop r4
+    ret
+    .bad:
+    mov r0, -1
+    pop r4
+    ret
+
+
+; vec_at(r1 = vector, r2 = index) -> r0 = a pointer to that element, or 0 if the
+; index is past the end. Bounds-checked because the alternative is a program that
+; walks off its buffer and takes a SIGSEGV several routines later.
+vec_at:
+    push r4                              ; vector
+    mov r4, r1
+    mov r0, r4
+    add r0, VEC_LEN
+    mov r0, [r0]
+    cmp r2, r0
+    juge .oob
+    mov r0, r4
+    add r0, VEC_ESIZE
+    mov r0, [r0]
+    umul r0, r2
+    mov r1, r4
+    add r1, VEC_DATA
+    mov r1, [r1]
+    add r0, r1
+    pop r4
+    ret
+    .oob:
+    mov r0, 0
+    pop r4
+    ret
+
+
+; vec_pop(r1 = vector) -> r0 = a pointer to the element removed, or 0 if the
+; vector was empty. The element is still there to be read - shortening the vector
+; does not touch the bytes - but only until the next push overwrites the slot.
+vec_pop:
+    push r4                              ; vector
+    mov r4, r1
+    mov r0, r4
+    add r0, VEC_LEN
+    mov r1, [r0]
+    cmp r1, 0
+    je .empty
+    sub r1, 1
+    mov [r0], r1
+    mov r0, r4
+    add r0, VEC_ESIZE
+    mov r0, [r0]
+    umul r0, r1
+    mov r2, r4
+    add r2, VEC_DATA
+    mov r2, [r2]
+    add r0, r2
+    pop r4
+    ret
+    .empty:
+    mov r0, 0
+    pop r4
+    ret
+
+
+; vec_remove(r1 = vector, r2 = index) -> r0 = 0 on success, -1 if the index is
+; past the end. Shifts everything after it down, so the order is preserved and
+; the cost is the length of the tail. Removing the last element is free.
+vec_remove:
+    push r4                              ; vector
+    push r5                              ; index
+    push r6                              ; length
+    push r7                              ; element size
+    mov r4, r1
+    mov r5, r2
+
+    mov r6, r4
+    add r6, VEC_LEN
+    mov r6, [r6]
+    cmp r5, r6
+    juge .bad
+    mov r7, r4
+    add r7, VEC_ESIZE
+    mov r7, [r7]
+
+    mov r0, r6                           ; elements after the one going away
+    sub r0, r5
+    sub r0, 1
+    cmp r0, 0
+    je .shorten
+    umul r0, r7                          ; bytes to shift
+    mov r2, r0
+    mov r0, r5                           ; the slot being vacated
+    umul r0, r7
+    mov r1, r4
+    add r1, VEC_DATA
+    mov r1, [r1]
+    add r0, r1
+    mov r1, r0
+    add r1, r7                           ; the element after it
+    cpy r1, r2                           ; downward, so an overlap is harmless
+
+    .shorten:
+    mov r1, r4
+    add r1, VEC_LEN
+    mov r0, r6
+    sub r0, 1
+    mov [r1], r0
+    mov r0, 0
+    jmp .out
+    .bad:
+    mov r0, -1
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; vec_clear(r1 = vector) - drop every element but keep the buffer, so refilling
+; it costs no allocation. Use vec_free to actually hand the memory back.
+vec_clear:
+    add r1, VEC_LEN
+    mov [r1], 0
+    ret
+
+
+; vec_free(r1 = vector) - release the buffer and leave the vector empty but still
+; initialised, ready to be used again. Safe on a vector that never allocated.
+vec_free:
+    push r4
+    mov r4, r1
+    mov r1, r4
+    add r1, VEC_DATA
+    mov r1, [r1]
+    call hfree
+    mov r1, r4
+    add r1, VEC_DATA
+    mov [r1], 0
+    mov r1, r4
+    add r1, VEC_LEN
+    mov [r1], 0
+    mov r1, r4
+    add r1, VEC_CAP
+    mov [r1], 0
+    pop r4
+    ret
+
+
+; ==========================
+;   Internals
+; ==========================
+
+; vec_grow(r1 = vector, r2 = the capacity that must fit) -> r0 = 0 / -1.
+; Capacity doubles rather than following the request exactly, so filling a vector
+; one element at a time costs O(n) copying in total instead of one reallocation
+; per push. Since the buffer is usually the youngest thing on the heap, hrealloc
+; will normally absorb the free space above it and not copy at all.
+vec_grow:
+    push r4                              ; vector
+    push r5                              ; the new capacity
+    push r6                              ; the capacity asked for
+    push r7                              ; element size, then the byte count
+    mov r4, r1
+    mov r6, r2
+
+    mov r5, r4
+    add r5, VEC_CAP
+    mov r5, [r5]
+    cmp r5, r6
+    juge .ok                             ; it already fits
+    cmp r5, 0
+    jne .double
+    mov r5, VEC_MINCAP
+    .double:
+    .loop:
+        cmp r5, r6
+        juge .sized
+        mov r7, r5
+        shl r5, 1
+        cmp r5, r7
+        jule .fail                       ; the doubling wrapped
+        jmp .loop
+    .sized:
+
+    mov r7, r4                           ; bytes = cap * esize, rejected if the
+    add r7, VEC_ESIZE                    ; product does not fit in 32 bits -
+    mov r7, [r7]                         ; dividing back is the cheapest way to
+    mov r1, r5                           ; ask, and this runs once per growth
+    mov r2, r7
+    umul r1, r2
+    mov r0, r1
+    mov r2, r7
+    udiv r0, r2
+    cmp r0, r5
+    jne .fail
+    mov r7, r1
+
+    mov r1, r4
+    add r1, VEC_DATA
+    mov r1, [r1]                         ; hrealloc(0, n) allocates, so the first
+    mov r2, r7                           ; growth needs no special case
+    call hrealloc
+    cmp r0, 0
+    je .fail
+    mov r1, r4
+    add r1, VEC_DATA
+    mov [r1], r0
+    mov r1, r4
+    add r1, VEC_CAP
+    mov [r1], r5
+
+    .ok:
+    mov r0, 0
+    jmp .out
+    .fail:
+    mov r0, -1
+    .out:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+vec_word:
+    d32 0                                ; vec_pushw's one-word staging slot

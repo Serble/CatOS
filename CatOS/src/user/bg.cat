@@ -14,7 +14,7 @@
 ;
 ; The shell's own "cmd &" does the same job; bg is the version that works from
 ; anywhere a program can be spawned, and it prints the new pid.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 #define PATHBUF, 64                  ; "/bin/" + command name
 #define NUMBUF, 12                   ; pid in decimal

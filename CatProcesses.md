@@ -111,7 +111,8 @@ for headless/terminal use.
 - **`/dev/console` read side**: `OP_READ` returns buffered input; if none is
   available it **blocks** the calling process (see 2.5) until a line arrives;
   the input ISR wakes blocked readers.
-- fd 0/1/2 of every process map to `/dev/console`.
+- fd 0/1/2 of every process map to its **controlling terminal** (`PCB_TTY`),
+  which is `/dev/console` unless something moved it. See 2.3.
 
 ### 2.3 Process model (`proc.cat`)
 
@@ -132,6 +133,7 @@ for headless/terminal use.
 | `WAITCHAN` | what this proc is blocked on (0 = not blocked) |
 | `FDTABLE[N]` | per-process map of small fd → VFS handle index (−1 free) |
 | `NAME` | program name (its path's last component), stored inline rather than as a pointer so it survives the caller's scratch buffers; `ps` reads it through `SYS_PSLIST` |
+| `TTY` | controlling terminal: the device path fd 0/1/2 were opened from, inherited by children. A path rather than a handle, because each child needs its *own* three handles — inheriting the name is what makes a terminal emulator work at all. `/dev/console` unless `SYS_SETTTY` moved it |
 | `NEXT` | ready-queue / list link |
 
 **Per-process resources:** a user segment via `allocpages` (image + data +
@@ -139,8 +141,16 @@ stack; `MBase` = phys base, `MLen` = size, user `sp` starts at `MLen`) and a
 kernel stack via `allocpage` (`KSP` = top).
 
 **Per-process fd tables** are new: the VFS handle table (`vfshandles`) is
-currently a single global array. The PCB `FDTABLE` indexes into it; `exec`
-inherits/duplicates fd 0/1/2.
+currently a single global array. The PCB `FDTABLE` indexes into it; a new
+process opens its own three handles on the terminal named by `TTY`.
+
+**Controlling terminals.** `TTY` is inherited from the spawning process, so a
+program started from a shell reads and writes whatever that shell does, all the
+way down. `SYS_SETTTY(path)` points it at another character device and reopens
+the caller's own fd 0/1/2 there in the same act — a terminal emulator claims a
+pty, calls it, spawns a shell, and that shell and everything it runs land on the
+right session with nothing else told anything. It refuses a non-character device,
+since every descendant would inherit a stdin that is end-of-file for ever.
 
 ### 2.4 Scheduler + context switch (`sched.cat`)
 
@@ -205,7 +215,8 @@ Initial set (enough for the shell + coreutils):
 | | `SYS_CLOSE` | fd | 0/−1 |
 | | `SYS_READDIR` | fd, index, buf | 1 + name, or 0 at end |
 | | `SYS_CREATE` | path, type | 0/−1 (files & dirs → `touch`, `mkdir`) |
-| | `SYS_REMOVE` | path | 0/−1 (`rm`) |
+| | `SYS_REMOVE` | path | 0/−1 (`rm`); a directory must already be empty |
+| | `SYS_RENAME` | old, new | 0/−1 (`mv`); one filesystem only, never clobbers |
 | | `SYS_SPAWN` | path, argv | child pid or −1 |
 | | `SYS_WAIT` | pid | child exit code (blocks) |
 | | `SYS_STAT` | path, buf | 0/−1 (size/type; for `ls -l`, `cat`) |

@@ -1,0 +1,647 @@
+; heaptest - exercise lib/heap.cat and lib/vector.cat.
+;
+; Every check prints a numbered line to the console, and a failing one also
+; sys_prints its number and the two values on the launcher's stdout, which is the
+; only way to read a result out of the VM without typing at it. The exit code is
+; the number of failures, so init or a script can tell at a glance.
+;
+; The checks that matter most are the leak checks: hfreebytes() equals
+; hheapsize() only when every block has been returned *and* the free list has
+; coalesced back into a single run, so one comparison catches a leak, a lost
+; block and a failure to merge. Test 13 is the interesting one - it frees in two
+; interleaved passes so that blocks are merged onto neighbours in both
+; directions, across the seams between several sbrk regions.
+;
+; The realloc checks deliberately arrange both outcomes: a block with an
+; allocated neighbour above it has to move, and a block at the top of the heap
+; has to grow in place. Which one happens is not a detail - the in-place path is
+; what stops a growing vector from copying itself on every doubling.
+#include "lib/sys.cat"
+
+#define NBLK, 40                         ; enough 1000-byte blocks to force
+#define BLKSZ, 1000                      ; several grows past HEAP_CHUNK
+#define NPUSH, 200                       ; vector elements, several doublings
+#define REC_SIZE, 12                     ; a three-word "struct" element
+
+main:
+    call t_basic
+    call t_reuse
+    call t_grow
+    call t_realloc
+    call t_vector
+    call t_record
+
+    mov r1, sdone
+    call emit_str
+    mov r1, [fails]
+    mov r2, 0
+    call emit_dec
+    mov r1, 10
+    call emit_char
+    call flush
+    sys_print [fails]                    ; 0 = everything passed
+    sys_exit [fails]
+
+
+; ---- the heap comes into existence on demand, and blocks do not overlap ----
+t_basic:
+    call hheapsize
+    mov r1, 1
+    mov r2, r0
+    mov r3, 0                            ; nothing allocated yet: no segment grown
+    call checkeq
+
+    mov r1, 100
+    call halloc
+    mov [pa], r0
+    mov r1, 2
+    mov r2, r0
+    call checknz
+
+    mov r1, 100
+    call halloc
+    mov [pb], r0
+    mov r1, 3
+    mov r2, r0
+    call checknz
+
+    mov r0, [pb]                         ; the second block sits above the first,
+    mov r1, [pa]                         ; past its 100 bytes and its header
+    sub r0, r1
+    mov r1, 4
+    mov r2, 0
+    cmp r0, 104
+    jul .close
+    mov r2, 1
+    .close:
+    mov r3, 1
+    call checkeq
+
+    call hheapsize                       ; one chunk, taken whole
+    mov r1, 5
+    mov r2, r0
+    mov r3, HEAP_CHUNK
+    call checkeq
+
+    mov r1, [pa]                         ; fill both and read the first back: if
+    mov r2, 0xAAAAAAAA                   ; the two overlapped this would show it
+    mov r3, 100
+    call fillw
+    mov r1, [pb]
+    mov r2, 0x55555555
+    mov r3, 100
+    call fillw
+    mov r0, [pa]
+    mov r0, [r0]
+    mov r1, 6
+    mov r2, r0
+    mov r3, 0xAAAAAAAA
+    call checkeq
+    mov r0, [pa]
+    add r0, 96
+    mov r0, [r0]
+    mov r1, 7
+    mov r2, r0
+    mov r3, 0xAAAAAAAA
+    call checkeq
+    ret
+
+
+; ---- a freed block is the one that comes back, and nothing is lost ----
+t_reuse:
+    mov r1, [pb]
+    call hfree
+    mov r1, 100
+    call halloc
+    mov [pc], r0
+    mov r1, 8
+    mov r2, r0
+    mov r3, [pb]                         ; same size, so the same block
+    call checkeq
+
+    mov r1, [pa]
+    call hfree
+    mov r1, [pc]
+    call hfree
+    call leakcheck
+    mov r1, 9
+    mov r2, r0
+    mov r3, 1
+    call checkeq
+    ret
+
+
+; ---- growth past one chunk, and coalescing back across the seams ----
+t_grow:
+    push r4                              ; index
+    push r5                              ; failures found
+    mov r4, 0
+    mov r5, 0
+    .fill:
+        cmp r4, NBLK
+        juge .filled
+        mov r1, BLKSZ
+        call halloc
+        cmp r0, 0
+        je .lost
+        mov r1, r4
+        shl r1, 2
+        add r1, blocks
+        mov [r1], r0
+        mov [r0], r4                     ; stamp the first and last words, so a
+        mov r1, r0                       ; block that overlaps its neighbour
+        add r1, BLKSZ - 4                ; corrupts one of them
+        mov [r1], r4
+        add r4, 1
+        jmp .fill
+        .lost:
+        add r5, 1
+        mov r1, r4                       ; remember it as absent
+        shl r1, 2
+        add r1, blocks
+        mov [r1], 0
+        add r4, 1
+        jmp .fill
+    .filled:
+    mov r1, 10
+    mov r2, r5
+    mov r3, 0                            ; every allocation succeeded
+    call checkeq
+
+    call hheapsize                       ; NBLK * BLKSZ needs several chunks
+    mov r1, 11
+    mov r2, 0
+    cmp r0, HEAP_CHUNK
+    jule .small
+    mov r2, 1
+    .small:
+    mov r3, 1
+    call checkeq
+
+    mov r4, 0
+    mov r5, 0
+    .verify:
+        cmp r4, NBLK
+        juge .verified
+        mov r1, r4
+        shl r1, 2
+        add r1, blocks
+        mov r1, [r1]
+        cmp r1, 0
+        je .vnext
+        mov r0, [r1]
+        cmp r0, r4
+        jne .vbad
+        add r1, BLKSZ - 4
+        mov r0, [r1]
+        cmp r0, r4
+        je .vnext
+        .vbad:
+        add r5, 1
+        .vnext:
+        add r4, 1
+        jmp .verify
+    .verified:
+    mov r1, 12
+    mov r2, r5
+    mov r3, 0                            ; no block trampled another
+    call checkeq
+
+    mov r4, 0                            ; free the even blocks, then the odd
+    .freeeven:                           ; ones, so each of the second pass has
+        cmp r4, NBLK                     ; free neighbours on both sides and has
+        juge .freeodd                    ; to merge in both directions
+        mov r1, r4
+        shl r1, 2
+        add r1, blocks
+        mov r1, [r1]
+        call hfree
+        add r4, 2
+        jmp .freeeven
+    .freeodd:
+    mov r4, 1
+    .oddloop:
+        cmp r4, NBLK
+        juge .allfree
+        mov r1, r4
+        shl r1, 2
+        add r1, blocks
+        mov r1, [r1]
+        call hfree
+        add r4, 2
+        jmp .oddloop
+    .allfree:
+    call leakcheck
+    mov r1, 13
+    mov r2, r0
+    mov r3, 1                            ; back to a single free block
+    call checkeq
+
+    pop r5
+    pop r4
+    ret
+
+
+; ---- realloc, both when it can grow in place and when it cannot ----
+t_realloc:
+    push r4                              ; the buffer under test
+    push r5                              ; the block pinning it in place
+    push r6                              ; its address before the realloc
+
+    mov r1, 64
+    call halloc
+    mov r4, r0
+    mov r1, 64
+    call halloc
+    mov r5, r0                           ; sits immediately above r4, so the
+    mov r6, r4                           ; space above r4 is not free
+    mov r1, r4
+    mov r2, 0x1234
+    mov r3, 64
+    call fillw
+    mov r1, r5
+    mov r2, 0x5678
+    mov r3, 64
+    call fillw
+
+    mov r1, r4
+    mov r2, 4096
+    call hrealloc
+    mov r4, r0
+    mov r1, 14
+    mov r2, r0
+    call checknz
+    mov r1, 15                           ; boxed in, so it had to move
+    mov r2, 0
+    cmp r4, r6
+    je .same
+    mov r2, 1
+    .same:
+    mov r3, 1
+    call checkeq
+    mov r0, [r4]
+    mov r1, 16
+    mov r2, r0
+    mov r3, 0x1234                       ; and brought its contents along
+    call checkeq
+    mov r0, r4
+    add r0, 60
+    mov r0, [r0]
+    mov r1, 17
+    mov r2, r0
+    mov r3, 0x1234
+    call checkeq
+    mov r0, [r5]
+    mov r1, 18
+    mov r2, r0
+    mov r3, 0x5678                       ; the neighbour is untouched
+    call checkeq
+
+    mov r1, r4                           ; shrinking hands the tail back and
+    mov r2, 64                           ; keeps the block where it is
+    call hrealloc
+    mov r1, 19
+    mov r2, r0
+    mov r3, r4
+    call checkeq
+    mov r0, [r4]
+    mov r1, 20
+    mov r2, r0
+    mov r3, 0x1234
+    call checkeq
+
+    mov r1, r4
+    call hfree
+    mov r1, r5
+    call hfree
+    call leakcheck
+    mov r1, 21
+    mov r2, r0
+    mov r3, 1
+    call checkeq
+
+    mov r1, 64                           ; nothing above it now, so the same
+    call halloc                          ; growth costs no copy at all
+    mov r4, r0
+    mov r1, r4
+    mov r2, 4096
+    call hrealloc
+    mov r1, 22
+    mov r2, r0
+    mov r3, r4
+    call checkeq
+    mov r1, r4
+    call hfree
+    call leakcheck
+    mov r1, 23
+    mov r2, r0
+    mov r3, 1
+    call checkeq
+
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; ---- a vector of words ----
+t_vector:
+    push r4                              ; index
+    push r5                              ; failures
+    mov r1, vec
+    mov r2, 4
+    call vec_init
+
+    mov r4, 0
+    mov r5, 0
+    .push:
+        cmp r4, NPUSH
+        juge .pushed
+        mov r1, vec
+        mov r2, r4
+        call vec_pushw
+        cmp r0, 0
+        je .pnext
+        add r5, 1
+        .pnext:
+        add r4, 1
+        jmp .push
+    .pushed:
+    mov r1, 24
+    mov r2, r5
+    mov r3, 0
+    call checkeq
+    mov r1, 25
+    mov r2, [vec + VEC_LEN]
+    mov r3, NPUSH
+    call checkeq
+
+    mov r4, 0                            ; every element survived the doublings
+    mov r5, 0
+    .read:
+        cmp r4, NPUSH
+        juge .readdone
+        mov r1, vec
+        mov r2, r4
+        call vec_at
+        cmp r0, 0
+        je .rbad
+        mov r0, [r0]
+        cmp r0, r4
+        je .rnext
+        .rbad:
+        add r5, 1
+        .rnext:
+        add r4, 1
+        jmp .read
+    .readdone:
+    mov r1, 26
+    mov r2, r5
+    mov r3, 0
+    call checkeq
+
+    mov r1, vec                          ; one past the end is refused
+    mov r2, NPUSH
+    call vec_at
+    mov r1, 27
+    mov r2, r0
+    mov r3, 0
+    call checkeq
+
+    mov r1, vec
+    call vec_pop
+    mov r0, [r0]
+    mov r1, 28
+    mov r2, r0
+    mov r3, NPUSH - 1
+    call checkeq
+    mov r1, 29
+    mov r2, [vec + VEC_LEN]
+    mov r3, NPUSH - 1
+    call checkeq
+
+    mov r1, vec                          ; removing the head shifts the tail down
+    mov r2, 0
+    call vec_remove
+    mov r1, vec
+    mov r2, 0
+    call vec_at
+    mov r0, [r0]
+    mov r1, 30
+    mov r2, r0
+    mov r3, 1
+    call checkeq
+    mov r1, 31
+    mov r2, [vec + VEC_LEN]
+    mov r3, NPUSH - 2
+    call checkeq
+
+    mov r1, vec
+    call vec_clear
+    mov r1, 32
+    mov r2, [vec + VEC_LEN]
+    mov r3, 0
+    call checkeq
+
+    mov r1, vec
+    call vec_free
+    call leakcheck
+    mov r1, 33
+    mov r2, r0
+    mov r3, 1
+    call checkeq
+
+    pop r5
+    pop r4
+    ret
+
+
+; ---- a vector of multi-word elements, copied by value ----
+t_record:
+    push r4                              ; record index
+    mov r1, vec
+    mov r2, REC_SIZE
+    call vec_init
+
+    mov r4, 0                            ; three records, {i, i*10, i*100}
+    .make:
+        mov [rec], r4
+        mov r1, r4
+        umul r1, 10
+        mov [rec + 4], r1
+        mov r1, r4
+        umul r1, 100
+        mov [rec + 8], r1
+        mov r1, vec
+        mov r2, rec
+        call vec_push
+        add r4, 1
+        cmp r4, 3
+        jul .make
+
+    mov r1, 34
+    mov r2, [vec + VEC_LEN]
+    mov r3, 3
+    call checkeq
+
+    mov r1, vec
+    mov r2, 2
+    call vec_at
+    mov r4, r0
+    mov r0, [r4]
+    mov r1, 35
+    mov r2, r0
+    mov r3, 2
+    call checkeq
+    mov r0, r4
+    add r0, 8
+    mov r0, [r0]
+    mov r1, 36
+    mov r2, r0
+    mov r3, 200                          ; the whole element came across, not
+    call checkeq                         ; just its first word
+
+    mov r1, vec
+    call vec_free
+    call leakcheck
+    mov r1, 37
+    mov r2, r0
+    mov r3, 1
+    call checkeq
+    pop r4
+    ret
+
+
+; ==========================
+;   Helpers
+; ==========================
+
+; leakcheck() -> r0 = 1 if every byte the heap owns is free and merged into a
+; single block, 0 otherwise.
+leakcheck:
+    push r4
+    call hfreebytes
+    mov r4, r0
+    call hheapsize
+    cmp r4, r0
+    jne .leak
+    mov r0, 1
+    pop r4
+    ret
+    .leak:
+    mov r0, 0
+    pop r4
+    ret
+
+
+; fillw(r1 = buffer, r2 = value, r3 = bytes) - write the value to every word.
+fillw:
+    push r4                              ; cursor
+    mov r4, r1
+    shr r3, 2
+    .loop:
+        cmp r3, 0
+        je .done
+        mov [r4], r2
+        add r4, 4
+        sub r3, 1
+        jmp .loop
+    .done:
+    pop r4
+    ret
+
+
+; checkeq(r1 = check number, r2 = value, r3 = expected) - one result line.
+checkeq:
+    push r4                              ; number
+    push r5                              ; value
+    push r6                              ; expected
+    mov r4, r1
+    mov r5, r2
+    mov r6, r3
+
+    mov r1, r4
+    mov r2, 3
+    call emit_dec
+    mov r1, 32
+    call emit_char
+    cmp r5, r6
+    jne .bad
+    mov r1, sok
+    call emit_str
+    jmp .line
+
+    .bad:
+    mov r1, sbad
+    call emit_str
+    mov r1, r5
+    mov r2, 0
+    call emit_dec
+    mov r1, swant
+    call emit_str
+    mov r1, r6
+    mov r2, 0
+    call emit_dec
+    mov r0, [fails]
+    add r0, 1
+    mov [fails], r0
+    sys_print r4                         ; number, then the two values, so a
+    sys_print r5                         ; failure is diagnosable from the
+    sys_print r6                         ; launcher's stdout alone
+
+    .line:
+    mov r1, 10
+    call emit_char
+    call flush
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; checknz(r1 = check number, r2 = value) - passes when the value is not zero,
+; for the allocations where the address itself is the answer.
+checknz:
+    cmp r2, 0
+    je .zero
+    mov r2, 1
+    mov r3, 1
+    jmp checkeq
+    .zero:
+    mov r2, 0
+    mov r3, 1
+    jmp checkeq
+
+
+; Above the data below, not at the very end of the file: res8 has to resolve its
+; size on the first pass, so VEC_STRUCT must already be defined by the time the
+; vec descriptor is reserved. Still after every instruction, which is the part
+; that matters - execution starts at the top of the file and must not fall in.
+#include "lib/fmt.cat"
+#include "lib/heap.cat"
+#include "lib/vector.cat"
+
+
+sok:
+    dstr "ok\0"
+sbad:
+    dstr "FAIL got \0"
+swant:
+    dstr " want \0"
+sdone:
+    dstr "failures: \0"
+
+fails:
+    d32 0
+pa:
+    d32 0
+pb:
+    d32 0
+pc:
+    d32 0
+rec:
+    res8 REC_SIZE
+vec:
+    res8 VEC_STRUCT
+blocks:
+    res32 NBLK

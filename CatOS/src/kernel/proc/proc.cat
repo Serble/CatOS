@@ -69,7 +69,16 @@
                                 ; and always terminated. It is a *copy* because a
                                 ; caller's path buffer is scratch that gets reused;
                                 ; a pointer would dangle by the time ps read it
-#define PCB_STRUCT, 488         ; total PCB size (PCB_NAME + PROC_NAME_MAX)
+#define PCB_TTY, 488            ; controlling terminal: the device path this
+                                ; process's stdin/stdout/stderr were opened from,
+                                ; and that its children will open in turn. It is a
+                                ; path rather than a handle because a child needs
+                                ; its *own* three handles, and inheriting is the
+                                ; whole point - a shell started on a pty runs `ls`
+                                ; on the same pty without either of them knowing.
+                                ; "/dev/console" unless SYS_SETTTY moved it
+#define PCB_TTY_MAX, 24         ; enough for "/dev/console" and "/dev/ptyN"
+#define PCB_STRUCT, 512         ; total PCB size (PCB_TTY + PCB_TTY_MAX)
 
 ; ---- SYS_PSLIST record: pid, parent pid, state, then the inline name ----
 #define PSREC_BYTES, 28         ; 3 words + PROC_NAME_MAX (keep in sync with
@@ -370,13 +379,17 @@ proc_create:
         cmp r1, 0
         jne .fdinit
 
-    ; wire stdin/stdout/stderr (fd 0/1/2) to /dev/console if it exists
-    mov r0, [console_node]
-    cmp r0, 0
-    je .noconsole
+    ; Controlling terminal: inherit the parent's, or /dev/console for the first
+    ; processes (curproc == 0 at boot). This is what makes a terminal emulator
+    ; possible - it points its own stdio at a pty, and every shell and every
+    ; program that shell runs lands on the same pty without being told.
+    mov r1, [curproc]
+    mov r2, r4
+    call proc_inherit_tty
+
+    ; wire stdin/stdout/stderr (fd 0/1/2) to that terminal
     mov r1, r4
-    call proc_open_console
-    .noconsole:
+    call proc_open_tty
 
     ; working directory: inherit the parent's (the spawning process is curproc),
     ; or default to the root "/" for the very first process (curproc == 0).
@@ -428,10 +441,52 @@ proc_create:
     ret
 
 
-; Open /dev/console into fd 0, 1 and 2 of a process (stdin/stdout/stderr).
-; Each gets its own handle so closing one does not disturb the others.
+; Copy a process's controlling terminal into a new one, defaulting to
+; /dev/console when there is no parent (the processes the kernel starts itself).
+; r1 - parent PCB or 0, r2 - child PCB
+proc_inherit_tty:
+    push r4                      ; source string
+    push r5                      ; destination
+    push r6                      ; bytes left
+    mov r5, r2
+    add r5, PCB_TTY
+    cmp r1, 0
+    je .default
+    mov r4, r1
+    add r4, PCB_TTY
+    jmp .copy
+    .default:
+    mov r4, consolepath
+    .copy:
+    mov r6, PCB_TTY_MAX
+    .loop:
+        cmp r6, 0
+        je .term
+        mov8 r0, [r4]
+        mov8 [r5], r0
+        cmp r0, 0
+        je .done
+        add r4, 1
+        add r5, 1
+        sub r6, 1
+        jmp .loop
+    .term:
+    sub r5, 1                    ; a path too long to hold is truncated, never
+    mov r0, 0                    ; left unterminated
+    mov8 [r5], r0
+    .done:
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Open a process's controlling terminal into fd 0, 1 and 2 (stdin/stdout/stderr).
+; Each gets its own handle so closing one does not disturb the others - which is
+; also what lets a program replace just one of them with the usual close-then-open
+; (fd_alloc hands back the lowest free slot).
 ; r1 - PCB pointer
-proc_open_console:
+proc_open_tty:
     push r4                      ; pcb
     push r5                      ; fd index
     mov r4, r1
@@ -439,12 +494,13 @@ proc_open_console:
     .loop:
         cmp r5, 3
         juge .done
-        mov r1, consolepath
+        mov r1, r4
+        add r1, PCB_TTY
         mov r2, O_RDWR
         call vfsopen
         cmp r0, -1
-        je .done
-        push r0                  ; handle
+        je .done                 ; no such terminal: the process starts with no
+        push r0                  ; stdio rather than failing to start at all
         mov r1, r4
         mov r2, r5
         mov r3, r0
@@ -750,6 +806,196 @@ sys_pslist_h:
     .fail:
     mov r0, -1
     jmp sysret
+
+
+; ==========================
+;   The foreground job of a terminal
+; ==========================
+; What the interrupt key (Ctrl+C, see console.cat and pty.cat) has to answer: of
+; everything attached to this terminal, which process is the one you are waiting
+; on? There are no process groups here and no controlling-terminal ownership - a
+; PCB records a tty *path* and that is all - so the answer is read out of the wait
+; graph instead, and it is exact enough because a shell's whole relationship with a
+; foreground job is that it is blocked in wait() for it:
+;
+;   * a process nobody on this terminal is waiting for is a background job - a
+;     window manager started with "bg", a "gdemo &". Ctrl+C must not touch those,
+;     and this is what keeps its hands off them;
+;   * a candidate that is itself waiting for another process on this terminal is a
+;     supervisor, not the job: init waits on the shell exactly as the shell waits on
+;     the command it ran, so only the innermost link of that chain is signalled and
+;     the shell (and init) are never it;
+;   * a candidate blocked reading this terminal is sitting at a prompt. There is
+;     nothing running to interrupt, so the caller clears the line it was editing
+;     instead - which is the whole reason this returns a count.
+;
+; That last rule is also the limitation worth being honest about: a foreground
+; program that blocks reading the terminal is indistinguishable from a shell doing
+; the same, so Ctrl+C clears its line rather than killing it. Distinguishing them
+; needs the terminal to be told which job is in the foreground - process groups -
+; and until something asks for that, "the program waiting for you keeps its line,
+; the program ignoring you gets signalled" is the rule, and pkill covers the rest.
+
+; Is this PCB a live process attached to a given terminal?
+; r1 - PCB pointer, r2 - tty path -> r0 = 1 / 0. Clobbers r0-r3.
+proc_tty_match:
+    mov r0, [r1]                 ; PCB_STATE
+    cmp r0, PROC_FREE
+    je .no                       ; an unused slot is not a process
+    cmp r0, PROC_ZOMBIE
+    je .no                       ; nor is a dead one: it runs nothing to interrupt
+    add r1, PCB_TTY
+    call vfsstreq
+    ret
+    .no:
+    mov r0, 0
+    ret
+
+
+; Is some process on this terminal blocked in wait() for pid r1? That is the
+; definition of a foreground job here.
+; r1 - pid, r2 - tty path -> r0 = 1 / 0
+proc_tty_waited:
+    push r4                      ; pid
+    push r5                      ; tty path
+    push r6                      ; PCB cursor
+    push r7                      ; slot index
+    mov r4, r1
+    mov r5, r2
+    mov r6, proctable
+    mov r7, 0
+    .loop:
+        cmp r7, MAX_PROCS
+        juge .no
+        mov r0, [r6]             ; only a blocked process is waiting for anything
+        cmp r0, PROC_BLOCKED
+        jne .next
+        vload r0, r6, PCB_CHAN   ; a waiter blocks on the pid it is waiting for
+        cmp r0, r4
+        jne .next
+        mov r1, r6
+        mov r2, r5
+        call proc_tty_match
+        cmp r0, 0
+        jne .yes
+        .next:
+        add r6, PCB_STRUCT
+        add r7, 1
+        jmp .loop
+    .yes:
+    mov r0, 1
+    jmp .done
+    .no:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Is this process itself waiting for another process on the same terminal - i.e. is
+; it a link in the wait chain rather than the end of it? A read that blocked parks
+; on a *node* address rather than a pid, so it never matches one of these and a
+; process waiting for input is correctly the end of the chain.
+; r1 - PCB pointer, r2 - tty path -> r0 = 1 / 0
+proc_tty_inner:
+    push r4                      ; the pid it is blocked on
+    push r5                      ; tty path
+    push r6                      ; PCB cursor
+    push r7                      ; slot index
+    mov r0, [r1]
+    cmp r0, PROC_BLOCKED
+    jne .no
+    vload r4, r1, PCB_CHAN
+    mov r5, r2
+    mov r6, proctable
+    mov r7, 0
+    .loop:
+        cmp r7, MAX_PROCS
+        juge .no
+        mov r1, r6
+        mov r2, r5
+        call proc_tty_match
+        cmp r0, 0
+        je .next
+        vload r0, r6, PCB_PID
+        cmp r0, r4
+        je .yes
+        .next:
+        add r6, PCB_STRUCT
+        add r7, 1
+        jmp .loop
+    .yes:
+    mov r0, 1
+    jmp .done
+    .no:
+    mov r0, 0
+    .done:
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
+
+
+; Signal every foreground job of a terminal, by the rules in the banner above.
+; Called from a line discipline when the interrupt character arrives, so it must be
+; safe from an interrupt handler: it only sets pending bits and marks processes
+; runnable, and never switches away.
+; r1 - tty path, r2 - the terminal's node (the channel a reader of it blocks on)
+; -> r0 = how many processes were signalled (0 = nothing was running)
+proc_tty_intr:
+    push r4                      ; tty path
+    push r5                      ; tty node
+    push r6                      ; PCB cursor
+    push r7                      ; processes signalled
+    mov r4, r1
+    mov r5, r2
+    mov r6, proctable
+    mov r7, 0
+    .loop:
+        mov r0, proctable        ; the cursor is the loop variable, so that the slot
+        add r0, MAX_PROCS * PCB_STRUCT   ; index does not need a register of its own
+        cmp r6, r0
+        juge .done
+        mov r1, r6
+        mov r2, r4
+        call proc_tty_match
+        cmp r0, 0
+        je .next                 ; not a live process on this terminal
+        vload r1, r6, PCB_PID
+        mov r2, r4
+        call proc_tty_waited
+        cmp r0, 0
+        je .next                 ; nobody is waiting for it: a background job
+        mov r1, r6
+        mov r2, r4
+        call proc_tty_inner
+        cmp r0, 0
+        jne .next                ; a supervisor of something deeper on this terminal
+        mov r0, [r6]
+        cmp r0, PROC_BLOCKED
+        jne .signal
+        vload r0, r6, PCB_CHAN
+        cmp r0, r5
+        je .next                 ; blocked reading this terminal: it is at a prompt
+        .signal:
+        mov r1, r6
+        mov r2, SIGTERM          ; the same polite request a window's close button
+        call sig_raise           ; makes, so a program can catch it and clean up
+        add r7, 1
+        .next:
+        add r6, PCB_STRUCT
+        jmp .loop
+    .done:
+    mov r0, r7
+    pop r7
+    pop r6
+    pop r5
+    pop r4
+    ret
 
 
 ; Wake every process blocked on a channel (mark them READY, clear the channel).

@@ -10,7 +10,7 @@
 ;      handler that returns to a faulting instruction would just re-fault) exiting.
 ;
 ; Numbers are reported with sys_print so the demo works headless (no console).
-#include "sys.cat"
+#include "lib/sys.cat"
 
     ; install handlers for SIGUSR1 and SIGSEGV
     sys_signal SIGUSR1, on_usr1

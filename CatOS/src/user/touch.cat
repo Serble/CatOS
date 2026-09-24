@@ -2,7 +2,7 @@
 ; (and its contents) untouched. There is no cwd, so the path is absolute.
 ; Opening with O_CREATE + O_WRITE (no O_TRUNC) creates the file when missing and
 ; succeeds without modifying it when present; we just close it again.
-#include "sys.cat"
+#include "lib/sys.cat"
 
 main:
     mov r5, r1                       ; argc
