@@ -664,7 +664,7 @@ rppu_mouse_isr:
     int_epilogue
 
 
-; ---- the adapted font (converted from the x86 testos 8x16 font to 1bpp) ----
+; ---- the console font (font.txt packed to 1bpp by tools/mkfont.py) ----
 rppu_font:
     ; the build script generates build/font.bin; this path is relative to this
     ; source file (src/kernel/drivers/) up to the repo's build/ directory

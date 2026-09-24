@@ -1,51 +1,67 @@
 #!/usr/bin/env python3
-"""Convert the x86 testos font (data/font.asm) into a compact 1bpp bitmap.
+"""Pack the text console font (src/kernel/drivers/font.txt) into a 1bpp blob.
 
-The source stores each glyph as a full 8x16 grid of 32-bit pixels (one `dd`
-dword per pixel; non-zero = foreground). That is 512 bytes per glyph, far too
-large to embed. This packs it to 1 bit per pixel, MSB = leftmost column, one
-byte per row, 16 bytes per glyph:
+The source draws each 8x16 glyph as a `glyph <code>` line followed by 16 rows
+of 8 characters, '#' for a set pixel and '.' for a clear one. Lines starting
+with ';' and blank lines are ignored. Glyphs must be listed in order from 0,
+since the code is the glyph's index in the output (and its PPU tile number).
+
+The output is 1 bit per pixel, MSB = leftmost column, one byte per row, 16
+bytes per glyph:
 
     glyph N bytes = font.bin[N*16 .. N*16+16)
     row R of glyph N = font.bin[N*16 + R]; bit (7 - x) is pixel (x, R)
 
-Usage: python mkfont.py <font.asm> <font.bin>
+Usage: python mkfont.py <font.txt> <font.bin>
 """
 
-import re
 import sys
 
 GLYPH_W = 8
 GLYPH_H = 16
-PIXELS_PER_GLYPH = GLYPH_W * GLYPH_H
 
-HEX = re.compile(r"0x[0-9A-Fa-f]+")
+
+def fail(src: str, lineno: int, msg: str) -> None:
+    print(f"{src}:{lineno}: {msg}", file=sys.stderr)
+    sys.exit(1)
 
 
 def main() -> int:
     src, dst = sys.argv[1], sys.argv[2]
-    pixels = []
-    for line in open(src):
-        line = line.split(";", 1)[0]           # strip comments
-        if "dd" not in line:
-            continue
-        for tok in HEX.findall(line):
-            pixels.append(1 if int(tok, 16) != 0 else 0)
-
-    if len(pixels) % PIXELS_PER_GLYPH != 0:
-        print(f"warning: {len(pixels)} pixels is not a whole number of "
-              f"{PIXELS_PER_GLYPH}-pixel glyphs", file=sys.stderr)
-    glyphs = len(pixels) // PIXELS_PER_GLYPH
-
     out = bytearray()
-    for g in range(glyphs):
-        base = g * PIXELS_PER_GLYPH
-        for row in range(GLYPH_H):
-            b = 0
-            for x in range(GLYPH_W):
-                if pixels[base + row * GLYPH_W + x]:
-                    b |= 1 << (7 - x)
-            out.append(b)
+    glyphs = 0
+    rows = GLYPH_H                       # rows still owed by the current glyph
+
+    for lineno, line in enumerate(open(src), 1):
+        line = line.rstrip("\n")
+        if not line.strip() or line.startswith(";"):
+            continue
+        if line.startswith("glyph"):
+            if rows != GLYPH_H:
+                fail(src, lineno, f"glyph {glyphs - 1} has {rows} rows, "
+                                  f"want {GLYPH_H}")
+            parts = line.split()
+            if len(parts) < 2 or not parts[1].isdigit():
+                fail(src, lineno, "expected `glyph <code>`")
+            if int(parts[1]) != glyphs:
+                fail(src, lineno, f"glyph {parts[1]} out of order, "
+                                  f"expected {glyphs}")
+            glyphs += 1
+            rows = 0
+            continue
+        if rows == GLYPH_H:
+            fail(src, lineno, "pixel row outside a glyph")
+        if len(line) != GLYPH_W or set(line) - {"#", "."}:
+            fail(src, lineno, f"row must be {GLYPH_W} of '#' / '.'")
+        b = 0
+        for x, c in enumerate(line):
+            if c == "#":
+                b |= 1 << (7 - x)
+        out.append(b)
+        rows += 1
+
+    if rows != GLYPH_H:
+        fail(src, lineno, f"glyph {glyphs - 1} has {rows} rows, want {GLYPH_H}")
 
     with open(dst, "wb") as f:
         f.write(out)

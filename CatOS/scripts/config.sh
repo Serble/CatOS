@@ -19,6 +19,8 @@ CONF_SRC_DIR="src/conf"              # files installed into the root fs /conf. E
                                      # file here is installed under its own name, so
                                      # a program's settings file is added by adding
                                      # the file - see src/conf/editor.conf.
+FONT_SRC="src/kernel/drivers/font.txt"   # 8x16 console font, drawn as text;
+                                     # packed into FONT_BIN by tools/mkfont.py
 DRIVERS_SRC_DIR="src/drivers"        # loadable drivers installed into /drivers,
                                      # found like the programs (below, .cat only)
 APPS_SRC_DIR="src/apps"              # application entries installed into /apps.
@@ -48,7 +50,6 @@ CATFS_PART="$BUILD_DIR/catfs.part"
 FIRMWARE_SRC="../CatFirmware/build/firmware.out"
 FIRMWARE_BIN="$BUILD_DIR/firm.bin"
 MAKE_DISK="../CatFirmware/make_disk.py"
-FONT_SRC="../../../ASM/testos/data/font.asm"   # x86 testos 8x16 console font
 
 # CatFS lives on partition 1; the kernel raw image on partition 0.
 CATFS_PARTITION=1
